@@ -38,9 +38,11 @@ Setup, installation, and usage documentation will be added as the first prototyp
 
 - [ ] Define the overall architecture  
 - [ ] Select and evaluate baseline detection & Re-ID models  
-- [ ] Develop an initial prototype for image-based re-identification  
+- [ ] Develop an initial prototype for image-based re-identification
+- [ ] start with only one species  
 - [ ] Extend functionality to support video streams  
-- [ ] Implement a GUI for editing IDs and assigning names  
+- [ ] Implement a GUI for editing IDs and assigning names
+- [ ] expand to ID multiple species  
 - [ ] Optimize performance for low-quality and real-world input
 
 ---
