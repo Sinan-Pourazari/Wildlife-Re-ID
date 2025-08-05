@@ -162,87 +162,95 @@ class BackgroundSubtracktor:
 
 
     def analyse_video(self, video_path, frame_densnes):
+        frames_np = self._load_video_frames(video_path)
+        weights = self._init_weights()
+        mask_history = []
+        empty_sequence = []
+        replace_index = 0
+        consecutive_empty = False
+        output_video = []
+
+        if not self.confirmed_background_given:
+            self._init_background_from_frames(frames_np)
+
+        for frame in tqdm(frames_np, desc="Processing Frames", unit="frame"):
+            consensus_mask, boxes = self.detect_motion_from_backgrounds(frame, self.backgrounds, weights)
+            smoothed_mask = self._apply_temporal_smoothing(mask_history, consensus_mask)
+            boxes = self._extract_boxes(smoothed_mask)
+
+            empty_sequence, replace_index, consecutive_empty, weights = self._handle_background_update(
+                frame, boxes, empty_sequence, replace_index, consecutive_empty, weights
+            )
+
+            annotated = self._draw_boxes(frame, boxes)
+            cv.imshow("Live_view", annotated)
+            cv.waitKey(1)
+            output_video.append(annotated)
+
+        cv.destroyAllWindows()
+        array_to_mp4(np.array(output_video))
+
+# --- Helper methods ---
+
+    def _load_video_frames(self, video_path):
+        """read video frames into numpy array"""
         cap = cv.VideoCapture(video_path)
         frames = []
-        count = 0
-
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
             frames.append(frame)
-            count += 1
-
         cap.release()
-        frames_np = np.array(frames)
+        return np.array(frames)
 
-        output_video = []
-        empty_sequence = []
-        replace_index=0
+    def _init_weights(self):
+        """initialize weights for background voting"""
         weights = np.arange(1, self.num_backgrounds + 1)
-        weights = weights / weights.sum()
-        consecutive_empty=False
-        #Initialize mask history For Temporal Smoothing
-        mask_history = []
-        max_history = 3  # Use last 3 frames for smoothing
+        return weights / weights.sum()
 
-        if not self.confirmed_background_given:
-            print(self.num_backgrounds)
-            self.init_background(frames[:self.num_backgrounds]) 
+    def _init_background_from_frames(self, frames_np):
+        """set initial background bases if not given"""
+        print(self.num_backgrounds)
+        self.init_background(frames_np[:self.num_backgrounds])
 
-        for frame in tqdm(frames_np, desc="Processing Frames", unit="frame"):
-            consensus_mask, boxes = self.detect_motion_from_backgrounds(frame, self.backgrounds,weights)
+    def _apply_temporal_smoothing(self, mask_history, mask, max_history=4):
+        """smooth motion masks over recent frames"""
+        mask_history.append(mask)
+        if len(mask_history) > max_history:
+            mask_history.pop(0)
+        smoothed = np.mean(mask_history, axis=0).astype(np.uint8)
+        return (smoothed > 255).astype(np.uint8) * 255
 
-             #  Temporal smoothing
-            mask_history.append(consensus_mask)
-            if len(mask_history) > max_history:
-                mask_history.pop(0)  # keep buffer size fixed
+    def _extract_boxes(self, smoothed_mask):
+        """find bounding boxes from smoothed mask"""
+        contours, _ = cv.findContours(smoothed_mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+        return np.array([cv.boundingRect(cnt) for cnt in contours if cv.contourArea(cnt) > 300])
 
-            smoothed_mask = np.mean(mask_history, axis=0).astype(np.uint8)
-            smoothed_mask = (smoothed_mask > 127).astype(np.uint8) * 255  # re-binarize
+    def _handle_background_update(self, frame, boxes, empty_sequence, replace_index, consecutive_empty, weights):
+        """update backgrounds based on empty frame sequences"""
+        if len(boxes) == 0 and len(empty_sequence) < self.segment_size:
+            if not consecutive_empty:
+                empty_sequence = []
+            empty_sequence.append(frame)
+            consecutive_empty = True
 
-            # Recalculate contours and boxes from smoothed mask
-            contours, _ = cv.findContours(smoothed_mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
-            boxes = np.array([cv.boundingRect(cnt) for cnt in contours if cv.contourArea(cnt) > 300])
-            
-            #TODO box verryfy boxes
-            #if no boxes are detected use it and all following images to create a new background base segment and replace the oldest one
-            if empty_sequence is None:
-                empty_sequence_len = 0
-            else:
-                empty_sequence_len = len(empty_sequence)
-                #limit size of new backgrounds in longer straeches of empty frames
-            if len(boxes) == 0 and empty_sequence_len< self.segment_size:
-                    if consecutive_empty == False:
-                        empty_sequence=[]
-                    empty_sequence.append(frame)                    
-                    consecutive_empty=True
-                    #only use new backgorund bases when 5 cvonsecutive frames are empty to avoid absorbing static animals
-                    if len(empty_sequence) >=1:
-                        new_base_segment=self.build_background_base(np.array(empty_sequence))   
-                        self.backgrounds[replace_index]= new_base_segment
-                    #TODO wheght update for intermitten change
-            else:
-                if consecutive_empty:
-                    new_base_segment=self.build_background_base(np.array(empty_sequence))
-                    
-                    self.backgrounds[replace_index]= new_base_segment
-                    
-                    # Reset weights: oldest frame gets lowest weight, newest gets max
-                    weights = np.arange(1, self.num_backgrounds+1) / np.sum(np.arange(1, self.num_backgrounds+1))
-                    #TODO parameterize mod x value
-                    #print("updated backgournd bas number: ", replace_index)
-                    replace_index =(1 + replace_index) % self.num_backgrounds
-                    empty_sequence =[]
+            if len(empty_sequence) >= 1:
+                new_base_segment = self.build_background_base(np.array(empty_sequence))
+                self.backgrounds[replace_index] = new_base_segment
+        else:
+            if consecutive_empty:
+                new_base_segment = self.build_background_base(np.array(empty_sequence))
+                self.backgrounds[replace_index] = new_base_segment
+                weights = self._init_weights()
+                replace_index = (1 + replace_index) % self.num_backgrounds
+                empty_sequence = []
+            consecutive_empty = False
+        return empty_sequence, replace_index, consecutive_empty, weights
 
-                consecutive_empty = False
-
-            annotated = frame
-            for (x, y, w, h) in boxes:
-                cv.rectangle(annotated, (x, y), (x+w, y+h), (0, 165, 255), 2)
-            cv.imshow("Live_view", annotated)
-            cv.waitKey(1)
-            output_video.append(annotated)
-        
-        cv.destroyAllWindows()
-        array_to_mp4(np.array(output_video))
+    def _draw_boxes(self, frame, boxes):
+        """draw bounding boxes on frame"""
+        annotated = frame.copy()
+        for (x, y, w, h) in boxes:
+            cv.rectangle(annotated, (x, y), (x+w, y+h), (0, 165, 255), 2)
+        return annotated
