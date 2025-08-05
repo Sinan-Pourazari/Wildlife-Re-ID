@@ -1,6 +1,6 @@
 import cv2 as cv
-from yt_dlp import YoutubeDL
-
+#from yt_dlp import YoutubeDL
+"""
 def get_video_stream(video_url,):
     "For later use"
 
@@ -19,7 +19,7 @@ def get_video_stream(video_url,):
             break
         cap.release()
         cv.destroyAllWindows()
-
+"""
 def extract_frame_segments(video_path, segment_size=20, max_frames=None):
         cap = cv.VideoCapture(video_path)
         frames = []
@@ -49,3 +49,10 @@ def extract_frame_segments(video_path, segment_size=20, max_frames=None):
 # TODO write function that gets an video as it plays and returns singular frames as it streames
 # TODO create function to bunlde frames of empty videos into bundels for new background voter members
 #Todo find a way to stich processed images back into video feed or modify videofeed based on gatherd infornamtion (image indictaes animal at xy so se boundingbox at xy in video feat)
+
+def array_to_mp4(array):
+    height, width = array[0].shape[:2]  # auto-detect from first frame
+    out = cv.VideoWriter("output.mp4", cv.VideoWriter_fourcc(*'mp4v'), 30, (width, height))
+    for frame in array:
+        out.write(frame)  # frame must be uint8 (0–255) and BGR format
+    out.release()
