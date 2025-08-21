@@ -2,7 +2,7 @@ import cv2 as cv
 import numpy as np
 from video_tools import array_to_mp4
 from tqdm import tqdm
-
+import roi_tools as rt
 class BackgroundSubtracktor:
     def __init__(self, background_video_path, segment_size, max_frames=None, running_start=True):
         # Initilize with the base backgrounds before doing anything else
@@ -45,18 +45,13 @@ class BackgroundSubtracktor:
         diff = cv.absdiff(new_lab, base_background)
 
         l, a, b = cv.split(diff)
-        _, l_ch = cv.threshold(l, 50, 255, cv.THRESH_BINARY)
-        _, a_ch = cv.threshold(a, 60, 255, cv.THRESH_BINARY)
-        _, b_ch = cv.threshold(b, 60, 255, cv.THRESH_BINARY)
-
-        #l_ch = cv.adaptiveThreshold(l,  10, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY, blockSize=11, C=2)
-        #a_ch = cv.adaptiveThreshold(a,  10, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY, blockSize=11, C=2)
-        #b_ch = cv.adaptiveThreshold(b,  10, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY, blockSize=11, C=2)
-        #mask = cv.adaptiveThreshold(l_channel, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C,cv.THRESH_BINARY, blockSize=11, C=2)
+        _, l_ch = cv.threshold(l, 40, 255, cv.THRESH_BINARY)
+        _, a_ch = cv.threshold(a, 50, 255, cv.THRESH_BINARY)
+        _, b_ch = cv.threshold(b, 50, 255, cv.THRESH_BINARY)
 
         motion_mask = cv.bitwise_or(l_ch, a_ch)
         motion_mask = cv.bitwise_or(motion_mask, b_ch)
-        motion_mask = cv.dilate(motion_mask,(10,10))
+        #motion_mask = cv.dilate(motion_mask,(10,10))
 
         return motion_mask
     #TODO autotuning for thersholds
@@ -115,7 +110,7 @@ class BackgroundSubtracktor:
 
         return frame_segments
 
-    def detect_motion_from_backgrounds(self, input_frame, backgrounds, weights, vote_threshold=1):
+    def detect_motion_from_backgrounds(self, input_frame, backgrounds, weights, vote_threshold=0.95):
         """
         Compares an input frame against a list of background bases to detect motion.
         Returns: (consensus_mask, bounding_boxes)
@@ -146,7 +141,7 @@ class BackgroundSubtracktor:
         contours, _ = cv.findContours(consensus_mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
         #TODO make 250 a parameter 
         #TODO make it self learnable
-        bounding_boxes = np.array([cv.boundingRect(cnt) for cnt in contours if cv.contourArea(cnt) > 300])
+        bounding_boxes = np.array([cv.boundingRect(cnt) for cnt in contours if cv.contourArea(cnt) > 150])
 
 
         return consensus_mask, bounding_boxes
@@ -161,7 +156,7 @@ class BackgroundSubtracktor:
         self.backgrounds = np.array(self.backgrounds)  # Convert list to NumPy array
 
 
-    def analyse_video(self, video_path, frame_densnes):
+    def analyse_video(self, video_path, frame_densnes, verbose= False):
         frames_np = self._load_video_frames(video_path)
         weights = self._init_weights()
         mask_history = []
@@ -169,20 +164,45 @@ class BackgroundSubtracktor:
         replace_index = 0
         consecutive_empty = False
         output_video = []
+        frame_counter=0
+        partial_frames_done =0
 
+        tracker = rt.BBoxTracker()
+        #TODO do not preload all frames
         if not self.confirmed_background_given:
             self._init_background_from_frames(frames_np)
 
+        #itteration over the frames as they come in
         for frame in tqdm(frames_np, desc="Processing Frames", unit="frame"):
             consensus_mask, boxes = self.detect_motion_from_backgrounds(frame, self.backgrounds, weights)
-            smoothed_mask = self._apply_temporal_smoothing(mask_history, consensus_mask)
-            boxes = self._extract_boxes(smoothed_mask)
+            #smoothed_mask = self._apply_temporal_smoothing(mask_history, consensus_mask)
+            boxes = self._extract_boxes(consensus_mask)
 
             empty_sequence, replace_index, consecutive_empty, weights = self._handle_background_update(
                 frame, boxes, empty_sequence, replace_index, consecutive_empty, weights
             )
+            #if motion is detected increment number of frames since last update if no motion is detected reset it
+            if len(boxes) > 0:
+                frame_counter += 1
+            else:
+                frame_counter = 0
+            
+            confirmed_tracks, _ = tracker.update(boxes)        # (list of dicts, list of dicts)
+            print(confirmed_tracks)
+            boxes_to_draw = [t["box"] + [t["tag"]] for t in confirmed_tracks]
+            print(boxes_to_draw)
+            annotated, bounding_boxes = self._draw_boxes(frame, boxes_to_draw)
+            
+            if frame_counter % 40 == 0 and frame_counter != 0:
+                if verbose:
+                    print("Partial Update triggered")
+                
+                self._partial_background_update(bounding_boxes,frame)
+                partial_frames_done +=1
+                if partial_frames_done >=40:
+                    partial_frames_done=0
+                    frame_counter=0
 
-            annotated = self._draw_boxes(frame, boxes)
             cv.imshow("Live_view", annotated)
             cv.waitKey(1)
             output_video.append(annotated)
@@ -191,6 +211,25 @@ class BackgroundSubtracktor:
         array_to_mp4(np.array(output_video))
 
 # --- Helper methods ---
+    def _partial_background_update(self, bounding_boxes, frame ):
+        """
+        boundingboxes: array of arrays
+        """
+        newest_background = self.backgrounds[-1]
+        for box in bounding_boxes:
+            x, y, w, h = box
+            frame[y:y+h, x:x+w] = newest_background[y:y+h, x:x+w]
+                
+        self._replace_background_frame(frame)
+
+    def _replace_background_frame(self, new_frame, index=None):
+        """
+        Replaces a background slot with a new frame.
+        If index is None, replaces the oldest (last) background.
+        """
+        if index is None:
+            index = -1  # default: replace last background
+        self.backgrounds[index] = self.build_background_base([new_frame])
 
     def _load_video_frames(self, video_path):
         """read video frames into numpy array"""
@@ -214,13 +253,13 @@ class BackgroundSubtracktor:
         print(self.num_backgrounds)
         self.init_background(frames_np[:self.num_backgrounds])
 
-    def _apply_temporal_smoothing(self, mask_history, mask, max_history=4):
+    def _apply_temporal_smoothing(self, mask_history, mask, max_history=3):
         """smooth motion masks over recent frames"""
         mask_history.append(mask)
         if len(mask_history) > max_history:
             mask_history.pop(0)
         smoothed = np.mean(mask_history, axis=0).astype(np.uint8)
-        return (smoothed > 255).astype(np.uint8) * 255
+        return (smoothed > 50).astype(np.uint8) * 255
 
     def _extract_boxes(self, smoothed_mask):
         """find bounding boxes from smoothed mask"""
@@ -251,6 +290,9 @@ class BackgroundSubtracktor:
     def _draw_boxes(self, frame, boxes):
         """draw bounding boxes on frame"""
         annotated = frame.copy()
-        for (x, y, w, h) in boxes:
+        bounding_boxes = []
+        for (x, y, w, h, tag) in boxes:
             cv.rectangle(annotated, (x, y), (x+w, y+h), (0, 165, 255), 2)
-        return annotated
+            cv.putText(annotated, tag, (x, y - 10), cv.FONT_HERSHEY_COMPLEX_SMALL,0.5, (0, 255, 0), 1, cv.LINE_AA)
+            bounding_boxes.append([x,y,w,h])
+        return annotated, bounding_boxes
