@@ -10,12 +10,6 @@ def main():
     bg_sub = BackgroundSubtracktor(video_path,10,200)
 
     bg_sub.analyse_video(video_path=animal_video_path, frame_densnes=0)
-    # Show results
-    #cv.imshow("Animal Image", animal_image)
-    #cv.imshow("Consensus Mask", consensus_mask)
-    #cv.imshow("Annotated", annotated)
-    #cv.waitKey(0)
-    #cv.destroyAllWindows()
 
 if __name__ == "__main__":
     main()
