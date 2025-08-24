@@ -6,6 +6,7 @@ import roi_tools as rt
 class BackgroundSubtracktor:
     def __init__(self, background_video_path, segment_size, max_frames=None, running_start=True):
         # Initilize with the base backgrounds before doing anything else
+        self.num_backgrounds = max_frames//segment_size
         # Load background segments
         if not running_start:
             background_frames = self.__extract_frame_segments(background_video_path, segment_size, max_frames)
@@ -15,11 +16,11 @@ class BackgroundSubtracktor:
             self.backgrounds = np.array([self.build_background_base(seg) for seg in background_frames])
         else:
             print('Collecting Initial Background segments during runtime')
+            self.backgrounds = [None] * self.num_backgrounds
         self.segment_size = segment_size
         self.confirmed_background_given = not running_start
-        self.num_backgrounds = max_frames//segment_size
-        #self.num_backgrounds=(len(background_frames))
-        #self.backgrounds
+        
+
     def build_background_base(self, image_series):
         avg_background = None
         frame_count = 0
@@ -157,7 +158,7 @@ class BackgroundSubtracktor:
 
 
     def analyse_video(self, video_path, frame_densnes, verbose= False):
-        frames_np = self._load_video_frames(video_path)
+        #frames_np = self._load_video_frames(video_path)
         weights = self._init_weights()
         mask_history = []
         empty_sequence = []
@@ -166,46 +167,70 @@ class BackgroundSubtracktor:
         output_video = []
         frame_counter=0
         partial_frames_done =0
-
+        curr_frame_number=0
         tracker = rt.BBoxTracker()
-        #TODO do not preload all frames
-        if not self.confirmed_background_given:
-            self._init_background_from_frames(frames_np)
+        
+        #TODO make this functionality work
+        #if self.confirmed_background_given:
+            #self._init_background_from_frames(frames_np)
+            
+        # Try to get total frames from metadata (0 or -1 if unknown)
+        cap = cv.VideoCapture(video_path)
+
+        total_frames = int(cap.get(cv.CAP_PROP_FRAME_COUNT))
+        if total_frames <= 0:
+            total_frames = None  # unknown total (e.g., stream)
 
         #itteration over the frames as they come in
-        for frame in tqdm(frames_np, desc="Processing Frames", unit="frame"):
-            consensus_mask, boxes = self.detect_motion_from_backgrounds(frame, self.backgrounds, weights)
-            #smoothed_mask = self._apply_temporal_smoothing(mask_history, consensus_mask)
-            boxes = self._extract_boxes(consensus_mask)
+       # for frame in tqdm(frames_np, desc="Processing Frames", unit="frame"):
+        with tqdm(total=total_frames, desc="Processing Frames", unit="frame", dynamic_ncols=True) as pbar:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
 
-            empty_sequence, replace_index, consecutive_empty, weights = self._handle_background_update(
-                frame, boxes, empty_sequence, replace_index, consecutive_empty, weights
-            )
-            #if motion is detected increment number of frames since last update if no motion is detected reset it
-            if len(boxes) > 0:
-                frame_counter += 1
-            else:
-                frame_counter = 0
-            
-            confirmed_tracks, _ = tracker.update(boxes)        # (list of dicts, list of dicts)
-            print(confirmed_tracks)
-            boxes_to_draw = [t["box"] + [t["tag"]] for t in confirmed_tracks]
-            print(boxes_to_draw)
-            annotated, bounding_boxes = self._draw_boxes(frame, boxes_to_draw)
-            
-            if frame_counter % 40 == 0 and frame_counter != 0:
-                if verbose:
-                    print("Partial Update triggered")
+                # --- guard: skip detection if no backgrounds yet ---
+                #TODO add option to decide if we start form the verry firtsst frame or the first x frames over an average
+                if len(getattr(self, "backgrounds", [])) == 0 or curr_frame_number<self.num_backgrounds:
+                    output_video.append(frame)   
+                    self._replace_background_frame(frame,index= curr_frame_number)
+                    curr_frame_number +=1
+                    pbar.update(1)
+                    continue
+
+                consensus_mask, boxes = self.detect_motion_from_backgrounds(frame, self.backgrounds, weights)
+                #smoothed_mask = self._apply_temporal_smoothing(mask_history, consensus_mask)
+                boxes = self._extract_boxes(consensus_mask)
+
+                empty_sequence, replace_index, consecutive_empty, weights = self._handle_background_update(
+                    frame, boxes, empty_sequence, replace_index, consecutive_empty, weights
+                )
+                #if motion is detected increment number of frames since last update if no motion is detected reset it
+                if len(boxes) > 0:
+                    frame_counter += 1
+                else:
+                    frame_counter = 0
                 
-                self._partial_background_update(bounding_boxes,frame)
-                partial_frames_done +=1
-                if partial_frames_done >=40:
-                    partial_frames_done=0
-                    frame_counter=0
+                confirmed_tracks, _ = tracker.update(boxes)        # (list of dicts, list of dicts)
+                boxes_to_draw = [t["box"] + [t["tag"]] for t in confirmed_tracks]
+                annotated, bounding_boxes = self._draw_boxes(frame, boxes_to_draw)
+                
+                if frame_counter % 40 == 0 and frame_counter != 0:
+                    if verbose:
+                        print("Partial Update triggered")
+                    
+                    self._partial_background_update(bounding_boxes,frame)
+                    partial_frames_done +=1
+                    if partial_frames_done >=40:
+                        partial_frames_done=0
+                        frame_counter=0
+                        
+                #itterate progressbar counter
+                pbar.update(1)
 
-            cv.imshow("Live_view", annotated)
-            cv.waitKey(1)
-            output_video.append(annotated)
+                cv.imshow("Live_view", annotated)
+                cv.waitKey(1)
+                output_video.append(annotated)
 
         cv.destroyAllWindows()
         array_to_mp4(np.array(output_video))
