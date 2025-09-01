@@ -4,9 +4,16 @@ from video_tools import array_to_mp4
 from tqdm import tqdm
 import roi_tools as rt
 class BackgroundSubtracktor:
-    def __init__(self, background_video_path, segment_size, max_frames=None, running_start=True):
+    def __init__(self, background_video_path, segment_size, max_frames=None, running_start=True, alpha=0.02, num_backgrounds=None):
+        """
+        Alpha should be between 0.005 and 0.05
+        """
         # Initilize with the base backgrounds before doing anything else
-        self.num_backgrounds = max_frames//segment_size
+        if(num_backgrounds is None):
+            self.num_backgrounds = max_frames//segment_size
+        else:
+            self.num_backgrounds = num_backgrounds
+
         # Load background segments
         if not running_start:
             background_frames = self.__extract_frame_segments(background_video_path, segment_size, max_frames)
@@ -19,6 +26,10 @@ class BackgroundSubtracktor:
             self.backgrounds = [None] * self.num_backgrounds
         self.segment_size = segment_size
         self.confirmed_background_given = not running_start
+        self.running_bg_bgr = None
+        self.running_bg_lab = None
+        self.bg_alpha = alpha  # TODO tune 0.005–0.05
+
         
 
     def build_background_base(self, image_series):
@@ -120,17 +131,10 @@ class BackgroundSubtracktor:
 
         # Convert masks to binary (0/1)
         motion_masks_bin = np.array([(mask > 0).astype(np.uint8) for mask in motion_masks])
-        
-        #motion_masks_bin = []
-        #for i in range(len(motion_masks)):
-            #bin_mask = (motion_masks[i] > 0).astype(np.uint8) * weights[i]
-            #motion_masks_bin.append(bin_mask) 
-
-        #motion_masks_bin = np.array(motion_masks_bin)
 
         # Voting: sum up all pixel votes
         vote_map = np.tensordot(weights, motion_masks_bin, axes=(0, 0))
-        #vote_map = np.sum(motion_masks_bin, axis=0)
+
         threshold = vote_threshold #* len(motion_masks)
         consensus_mask = (vote_map >= threshold).astype(np.uint8) * 255
 
@@ -182,7 +186,6 @@ class BackgroundSubtracktor:
             total_frames = None  # unknown total (e.g., stream)
 
         #itteration over the frames as they come in
-       # for frame in tqdm(frames_np, desc="Processing Frames", unit="frame"):
         with tqdm(total=total_frames, desc="Processing Frames", unit="frame", dynamic_ncols=True) as pbar:
             while True:
                 ret, frame = cap.read()
@@ -197,34 +200,62 @@ class BackgroundSubtracktor:
                     curr_frame_number +=1
                     pbar.update(1)
                     continue
+                ##############################
+                
+                 # 1) Update running background via motion-gated mask
+                if self.running_bg_bgr is None:
+                    #self.running_bg_bgr = cv.GaussianBlur(frame, (5,5), 0)
+                    self.running_bg_bgr = frame
+                    self.running_bg_lab = self._ensure_lab(self.running_bg_bgr)
 
-                consensus_mask, boxes = self.detect_motion_from_backgrounds(frame, self.backgrounds, weights)
+                fg_mask_run = self._fg_mask_vs_bg_lab(frame, self.running_bg_lab)
+                self.running_bg_bgr = self._masked_running_update(self.running_bg_bgr, frame, fg_mask_run, self.bg_alpha)
+                self.running_bg_lab = self._ensure_lab(self.running_bg_bgr)
+
+                # 2) Build pool + weights one time
+                bg_pool = self.backgrounds
+                vote_w  = self._init_weights()
+
+                # Append running background (in LAB!) to the pool for voting
+                if self.running_bg_lab is not None:
+                    bg_pool = np.concatenate([bg_pool, self.running_bg_lab[None, ...]], axis=0)
+                    vote_w  = np.append(vote_w, 0.25)  # tune this
+                    vote_w /= vote_w.sum()
+                
+                ######################################
+                consensus_mask, _ = self.detect_motion_from_backgrounds(frame, bg_pool, vote_w)
+                
+                #consensus_mask, boxes = self.detect_motion_from_backgrounds(frame, self.backgrounds, weights)
                 #smoothed_mask = self._apply_temporal_smoothing(mask_history, consensus_mask)
                 boxes = self._extract_boxes(consensus_mask)
 
-                empty_sequence, replace_index, consecutive_empty, weights = self._handle_background_update(
-                    frame, boxes, empty_sequence, replace_index, consecutive_empty, weights
-                )
+                empty_sequence, replace_index, consecutive_empty, weights = self._handle_background_update(frame, boxes, empty_sequence, replace_index, consecutive_empty, weights)
                 #if motion is detected increment number of frames since last update if no motion is detected reset it
-                if len(boxes) > 0:
+
+                
+                confirmed_tracks, uncofirmed_tracks, _ = tracker.update(boxes)        # (list of dicts, list of dicts)
+                confirmed_boxes_to_draw = [t["box"] + [t["tag"]] for t in confirmed_tracks]
+                unconfirmed_boxes_to_draw = [t["box"] + [t["tag"]] for t in uncofirmed_tracks]
+                annotated, bounding_boxes = self._draw_boxes(frame, confirmed_boxes_to_draw,True)
+                annotated,_ = self._draw_boxes(annotated, unconfirmed_boxes_to_draw,False)
+                #annotated,_ = self._draw_boxes_DEPRECATED(annotated, boxes)
+                if len(confirmed_boxes_to_draw) > 0:
                     frame_counter += 1
                 else:
                     frame_counter = 0
-                
-                confirmed_tracks, _ = tracker.update(boxes)        # (list of dicts, list of dicts)
-                boxes_to_draw = [t["box"] + [t["tag"]] for t in confirmed_tracks]
-                annotated, bounding_boxes = self._draw_boxes(frame, boxes_to_draw)
-                
+                    
                 if frame_counter % 40 == 0 and frame_counter != 0:
                     if verbose:
                         print("Partial Update triggered")
                     
                     self._partial_background_update(bounding_boxes,frame)
                     partial_frames_done +=1
+                    #TODO CHECK MALLFUNCTIONING RESET
                     if partial_frames_done >=40:
+                        print("Reset")
                         partial_frames_done=0
                         frame_counter=0
-                        
+
                 #itterate progressbar counter
                 pbar.update(1)
 
@@ -299,7 +330,7 @@ class BackgroundSubtracktor:
             empty_sequence.append(frame)
             consecutive_empty = True
 
-            if len(empty_sequence) >= 1:
+            if len(empty_sequence) >= self.segment_size:
                 new_base_segment = self.build_background_base(np.array(empty_sequence))
                 self.backgrounds[replace_index] = new_base_segment
         else:
@@ -310,14 +341,43 @@ class BackgroundSubtracktor:
                 replace_index = (1 + replace_index) % self.num_backgrounds
                 empty_sequence = []
             consecutive_empty = False
+
         return empty_sequence, replace_index, consecutive_empty, weights
 
-    def _draw_boxes(self, frame, boxes):
+    def _draw_boxes(self, frame, boxes, confirmed):
         """draw bounding boxes on frame"""
         annotated = frame.copy()
         bounding_boxes = []
         for (x, y, w, h, tag) in boxes:
-            cv.rectangle(annotated, (x, y), (x+w, y+h), (0, 165, 255), 2)
+            if confirmed:
+                cv.rectangle(annotated, (x, y), (x+w, y+h), (0, 165, 255), 2)
+            else:
+                cv.rectangle(annotated, (x, y), (x+w, y+h), (0, 0, 255), 2)
             cv.putText(annotated, tag, (x, y - 10), cv.FONT_HERSHEY_COMPLEX_SMALL,0.5, (0, 255, 0), 1, cv.LINE_AA)
+            bounding_boxes.append([x,y,w,h])
+        return annotated, bounding_boxes
+    
+    def _masked_running_update(self, bg_bgr, frame_bgr, fg_mask, alpha):
+        inv = cv.bitwise_not(fg_mask)
+        inv3 = cv.cvtColor(inv, cv.COLOR_GRAY2BGR)
+        bgf  = bg_bgr.astype(np.float32)
+        frf  = frame_bgr.astype(np.float32)
+        upd  = (1.0 - alpha) * bgf + alpha * frf
+        out  = np.where(inv3 == 255, upd, bgf)
+        return cv.convertScaleAbs(out)
+
+    def _fg_mask_vs_bg_lab(self, frame_bgr, bg_lab):
+        # reuse your LAB comparator
+        return self.compare_images(frame_bgr, bg_lab)
+
+    def _ensure_lab(self, bgr_img):
+        return cv.cvtColor(bgr_img, cv.COLOR_BGR2LAB)
+
+    def _draw_boxes_DEPRECATED(self, frame, boxes):
+        """draw bounding boxes on frame"""
+        annotated = frame.copy()
+        bounding_boxes = []
+        for (x, y, w, h) in boxes:
+            cv.rectangle(annotated, (x, y), (x+w, y+h), (255, 0,0), 2)
             bounding_boxes.append([x,y,w,h])
         return annotated, bounding_boxes
