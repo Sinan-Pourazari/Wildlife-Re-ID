@@ -38,26 +38,29 @@ class BBoxTracker:
             x,y,w,h = track["box"]
             nx,ny,nw,nh = qualified_boxes[detec_index]
             #update track position
-            track["box"] =[int(self.alpha *x + (1-self.alpha)*nx),
-                           int(self.alpha *y + (1-self.alpha)*ny),
-                           int(self.alpha *w + (1-self.alpha)*nw),
-                           int(self.alpha *h + (1-self.alpha)*nh)
+            track["box"] =[int(self.alpha *x + (1-self.alpha)*nx) -10,
+                           int(self.alpha *y + (1-self.alpha)*ny) -10,
+                           int(self.alpha *w + (1-self.alpha)*nw) +20,
+                           int(self.alpha *h + (1-self.alpha)*nh)+ 20
                            ]
             track["age"] +=1
             track["misses"]=0
+            if(track["age"]>= self.min_age):
+                track["tag"]= f"Confirmed Track"
         #unmatched previous: known tracks that have been lost, possible occlussion
         for prev_index in unmatched_prev:
             self.tracks[prev_index]["misses"] +=1
         
         #unmatched detections: create new tentative tracks
         for detec_index in unmatched_curr:
+            
             self.tracks.append(
                 {
                 "id":self.next_id,
                 "box":qualified_boxes[detec_index],
                 "age": 1,
                 "misses":0,
-                "tag": f"Confirmed Track {self.next_id}"
+                "tag": f"Unconfirmed Track {self.next_id}"
                 
                 }
             )
@@ -68,7 +71,10 @@ class BBoxTracker:
         # confirmed only (temporal persistence at box level) 
         confirmed = [t for t in self.tracks if t["age"] >= self.min_age and t["misses"] == 0]
 
-        return confirmed, self.tracks
+        # get all unconfiremd tracks
+        unconfirmed = [t for t in self.tracks if t["age"] <= self.min_age and t["misses"] == 0]
+
+        return confirmed, unconfirmed, self.tracks
 
     def iou(self, box1, box2):
         x1, y1, w1, h1 = box1
