@@ -239,7 +239,8 @@ class BackgroundSubtracktor:
                 annotated,_ = self._draw_boxes(annotated, unconfirmed_boxes_to_draw,False)
                 #annotated,_ = self._draw_boxes_DEPRECATED(annotated, boxes)
 
-                #update background Referebces                
+                #update background Referebces
+                                
                 empty_sequence, replace_index, consecutive_empty, weights = self._handle_background_update(frame, bounding_boxes, empty_sequence, replace_index, consecutive_empty, weights)
 
 
@@ -252,11 +253,11 @@ class BackgroundSubtracktor:
                     if verbose:
                         print("Partial Update triggered")
                     
-                    self._partial_background_update(bounding_boxes,frame)
+                    empty_sequence, replace_index, consecutive_empty, weights = self._composite_background_update(boxes, frame, empty_sequence, replace_index, consecutive_empty, weights)
+
                     partial_frames_done +=1
                     #TODO CHECK MALLFUNCTIONING RESET
                     if partial_frames_done >=40:
-                        print("Reset")
                         partial_frames_done=0
                         frame_counter=0
 
@@ -282,28 +283,61 @@ class BackgroundSubtracktor:
                 
         self._replace_background_frame(frame)
 
-    
-    def _handle_background_update_v2(self, frame, boxes, composite_sequence, replace_index, consecutive_composite, weights, bounding_boxes):
-        """update backgrounds based on empty frame sequences"""
-        if len(empty_sequence) < self.segment_size:
-            if not consecutive_empty:
-                empty_sequence = []
-            empty_sequence.append(frame)
-            consecutive_empty = True
+        
+    def _composite_background_update(self, bounding_boxes, frame, empty_sequence, replace_index, consecutive_empty, weights):
+        """
+        boundingboxes: array of arrays
+        Build 'composite' frames by copying the newest background into each box region.
+        Average multiple composites (segment_size) and rotate into backgrounds[replace_index].
+        Returns: empty_sequence, replace_index, consecutive_empty, weights
+        """
+        import numpy as np
 
-            if len(empty_sequence) >= self.segment_size:
-                new_base_segment = self.build_background_base(np.array(empty_sequence))
-                self.backgrounds[replace_index] = new_base_segment
-        else:
-            if consecutive_empty:
-                new_base_segment = self.build_background_base(np.array(empty_sequence))
-                self.backgrounds[replace_index] = new_base_segment
-                weights = self._init_weights()
-                replace_index = (1 + replace_index) % self.num_backgrounds
-                empty_sequence = []
-            consecutive_empty = False
+        # lazy init: buffer for composite frames
+        if not hasattr(self, "composite_sequence"):
+            self.composite_sequence = []
+
+        newest_background = self.backgrounds[-1]
+
+        # build one composite from current frame
+        composite = frame.copy()
+        H, W = composite.shape[:2]
+
+        for box in bounding_boxes:
+            x, y, w, h = map(int, box[:4])
+
+            # clamp to image bounds
+            x0 = max(0, x)
+            y0 = max(0, y)
+            x1 = min(W, x + w)
+            y1 = min(H, y + h)
+            if x0 >= x1 or y0 >= y1:
+                continue
+
+            composite[y0:y1, x0:x1] = newest_background[y0:y1, x0:x1]
+
+        # buffer composite
+        self.composite_sequence.append(composite)
+
+        # if enough composites collected -> average and rotate into backgrounds
+        if len(self.composite_sequence) >= self.segment_size:
+            new_base_segment = self.build_background_base(np.array(self.composite_sequence))
+            self.backgrounds[replace_index] = new_base_segment
+
+            replace_index = (1 + replace_index) % self.num_backgrounds
+            self.composite_sequence = []  # reset batch
+
+            # keep parity with your other updater
+            weights = self._init_weights()
+
+        # reset since composite mode is not an empty-sequence update
+        empty_sequence = []
+        consecutive_empty = False
 
         return empty_sequence, replace_index, consecutive_empty, weights
+
+        
+
 
     def _replace_background_frame(self, new_frame, index=None):
         """
@@ -362,12 +396,13 @@ class BackgroundSubtracktor:
                 new_base_segment = self.build_background_base(np.array(empty_sequence))
                 self.backgrounds[replace_index] = new_base_segment
         else:
-            new_base_segment = self.build_background_base(np.array(empty_sequence))
-            self.backgrounds[replace_index] = new_base_segment
-            weights = self._init_weights()
-            replace_index = (1 + replace_index) % self.num_backgrounds
-            empty_sequence = []
-            consecutive_empty = False
+            if len(empty_sequence)>0:
+                new_base_segment = self.build_background_base(np.array(empty_sequence))
+                self.backgrounds[replace_index] = new_base_segment
+                weights = self._init_weights()
+                replace_index = (1 + replace_index) % self.num_backgrounds
+                empty_sequence = []
+                consecutive_empty = False
 
         return empty_sequence, replace_index, consecutive_empty, weights
 
