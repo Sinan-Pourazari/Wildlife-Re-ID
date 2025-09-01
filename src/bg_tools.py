@@ -229,7 +229,6 @@ class BackgroundSubtracktor:
                 #smoothed_mask = self._apply_temporal_smoothing(mask_history, consensus_mask)
                 boxes = self._extract_boxes(consensus_mask)
 
-                empty_sequence, replace_index, consecutive_empty, weights = self._handle_background_update(frame, boxes, empty_sequence, replace_index, consecutive_empty, weights)
                 #if motion is detected increment number of frames since last update if no motion is detected reset it
 
                 
@@ -239,6 +238,11 @@ class BackgroundSubtracktor:
                 annotated, bounding_boxes = self._draw_boxes(frame, confirmed_boxes_to_draw,True)
                 annotated,_ = self._draw_boxes(annotated, unconfirmed_boxes_to_draw,False)
                 #annotated,_ = self._draw_boxes_DEPRECATED(annotated, boxes)
+
+                #update background Referebces                
+                empty_sequence, replace_index, consecutive_empty, weights = self._handle_background_update(frame, bounding_boxes, empty_sequence, replace_index, consecutive_empty, weights)
+
+
                 if len(confirmed_boxes_to_draw) > 0:
                     frame_counter += 1
                 else:
@@ -277,6 +281,29 @@ class BackgroundSubtracktor:
             frame[y:y+h, x:x+w] = newest_background[y:y+h, x:x+w]
                 
         self._replace_background_frame(frame)
+
+    
+    def _handle_background_update_v2(self, frame, boxes, composite_sequence, replace_index, consecutive_composite, weights, bounding_boxes):
+        """update backgrounds based on empty frame sequences"""
+        if len(empty_sequence) < self.segment_size:
+            if not consecutive_empty:
+                empty_sequence = []
+            empty_sequence.append(frame)
+            consecutive_empty = True
+
+            if len(empty_sequence) >= self.segment_size:
+                new_base_segment = self.build_background_base(np.array(empty_sequence))
+                self.backgrounds[replace_index] = new_base_segment
+        else:
+            if consecutive_empty:
+                new_base_segment = self.build_background_base(np.array(empty_sequence))
+                self.backgrounds[replace_index] = new_base_segment
+                weights = self._init_weights()
+                replace_index = (1 + replace_index) % self.num_backgrounds
+                empty_sequence = []
+            consecutive_empty = False
+
+        return empty_sequence, replace_index, consecutive_empty, weights
 
     def _replace_background_frame(self, new_frame, index=None):
         """
@@ -327,6 +354,7 @@ class BackgroundSubtracktor:
         if len(boxes) == 0 and len(empty_sequence) < self.segment_size:
             if not consecutive_empty:
                 empty_sequence = []
+            
             empty_sequence.append(frame)
             consecutive_empty = True
 
@@ -334,12 +362,11 @@ class BackgroundSubtracktor:
                 new_base_segment = self.build_background_base(np.array(empty_sequence))
                 self.backgrounds[replace_index] = new_base_segment
         else:
-            if consecutive_empty:
-                new_base_segment = self.build_background_base(np.array(empty_sequence))
-                self.backgrounds[replace_index] = new_base_segment
-                weights = self._init_weights()
-                replace_index = (1 + replace_index) % self.num_backgrounds
-                empty_sequence = []
+            new_base_segment = self.build_background_base(np.array(empty_sequence))
+            self.backgrounds[replace_index] = new_base_segment
+            weights = self._init_weights()
+            replace_index = (1 + replace_index) % self.num_backgrounds
+            empty_sequence = []
             consecutive_empty = False
 
         return empty_sequence, replace_index, consecutive_empty, weights
