@@ -14,7 +14,7 @@ class ZoneMarker:
         return img
 
 class BBoxTracker:
-    def __init__(self, min_area:float=0.4, alpha:float=0.4, max_misses:int=10, min_age:int=35):
+    def __init__(self, min_area:float=0.4, alpha:float=0.3, max_misses:int=10, min_age:int=35):
         #contains all active tracks (list of dicts)
         self.tracks = []
         self.min_area=min_area
