@@ -3,6 +3,7 @@ import numpy as np
 from video_tools import array_to_mp4
 from tqdm import tqdm
 import roi_tools as rt
+from utils import Update_tracker
 class BackgroundSubtracktor:
     def __init__(self, background_video_path, segment_size, max_frames=None, running_start=True, alpha=0.02, num_backgrounds=None):
         """
@@ -21,6 +22,7 @@ class BackgroundSubtracktor:
             print(f"Loaded {self.num_backgrounds} Initial background segments.")
             # Build background bases
             self.backgrounds = np.array([self.build_background_base(seg) for seg in background_frames])
+            print(self.backgrounds.shape)
         else:
             print('Collecting Initial Background segments during runtime')
             self.backgrounds = [None] * self.num_backgrounds
@@ -57,9 +59,9 @@ class BackgroundSubtracktor:
         diff = cv.absdiff(new_lab, base_background)
 
         l, a, b = cv.split(diff)
-        _, l_ch = cv.threshold(l, 40, 255, cv.THRESH_BINARY)
-        _, a_ch = cv.threshold(a, 50, 255, cv.THRESH_BINARY)
-        _, b_ch = cv.threshold(b, 50, 255, cv.THRESH_BINARY)
+        _, l_ch = cv.threshold(l, 20, 255, cv.THRESH_BINARY)
+        _, a_ch = cv.threshold(a, 40, 255, cv.THRESH_BINARY)
+        _, b_ch = cv.threshold(b, 40, 255, cv.THRESH_BINARY)
 
         motion_mask = cv.bitwise_or(l_ch, a_ch)
         motion_mask = cv.bitwise_or(motion_mask, b_ch)
@@ -164,15 +166,16 @@ class BackgroundSubtracktor:
     def analyse_video(self, video_path, frame_densnes, verbose= False):
         #frames_np = self._load_video_frames(video_path)
         weights = self._init_weights()
-        mask_history = []
         empty_sequence = []
         replace_index = 0
         consecutive_empty = False
         output_video = []
-        frame_counter=0
-        partial_frames_done =0
         curr_frame_number=0
         tracker = rt.BBoxTracker()
+        composite_update_tracker = Update_tracker(40)
+        full_uppdate_tracker = Update_tracker(40)
+        done = False
+        done_full=False
         
         #TODO make this functionality work
         #if self.confirmed_background_given:
@@ -234,38 +237,49 @@ class BackgroundSubtracktor:
                 
                 confirmed_tracks, uncofirmed_tracks, _ = tracker.update(boxes)        # (list of dicts, list of dicts)
                 confirmed_boxes_to_draw = [t["box"] + [t["tag"]] for t in confirmed_tracks]
-                unconfirmed_boxes_to_draw = [t["box"] + [t["tag"]] for t in uncofirmed_tracks]
+                #unconfirmed_boxes_to_draw = [t["box"] + [t["tag"]] for t in uncofirmed_tracks]
                 annotated, bounding_boxes = self._draw_boxes(frame, confirmed_boxes_to_draw,True)
-                annotated,_ = self._draw_boxes(annotated, unconfirmed_boxes_to_draw,False)
+                #annotated,_ = self._draw_boxes(annotated, unconfirmed_boxes_to_draw,False)
                 #annotated,_ = self._draw_boxes_DEPRECATED(annotated, boxes)
 
                 #update background Referebces
-                                
-                empty_sequence, replace_index, consecutive_empty, weights = self._handle_background_update(frame, bounding_boxes, empty_sequence, replace_index, consecutive_empty, weights)
-
-
-                if len(confirmed_boxes_to_draw) > 0:
-                    frame_counter += 1
-                else:
-                    frame_counter = 0
+                print("full tracker: ", full_uppdate_tracker.curr_counter)
+                if full_uppdate_tracker.get_state():               
+                    empty_sequence, replace_index, consecutive_empty, weights, done_full = self._handle_background_update(frame, bounding_boxes, empty_sequence, replace_index, consecutive_empty, weights, done_full)
                     
-                if frame_counter % 40 == 0 and frame_counter != 0:
+                    if done_full:
+                        full_uppdate_tracker.reset()
+                        done_full=False
+
+                    #reset the counter for the fallback update since we did a full update
+                    composite_update_tracker.reset()
+
+                #todo rewerite _handle_background_update to avoid double checking
+                if len(bounding_boxes )!= 0:
+                    composite_update_tracker.update()
+                    #print("comp state: ", composite_update_tracker.curr_counter)
+                else:    
+                    full_uppdate_tracker.update()
+                if composite_update_tracker.get_state():
                     if verbose:
                         print("Partial Update triggered")
                     
-                    empty_sequence, replace_index, consecutive_empty, weights = self._composite_background_update(boxes, frame, empty_sequence, replace_index, consecutive_empty, weights)
+                    done, replace_index, consecutive_empty, weights = self._composite_background_update(boxes, frame, empty_sequence, replace_index, done, weights)
 
-                    partial_frames_done +=1
-                    #TODO CHECK MALLFUNCTIONING RESET
-                    if partial_frames_done >=40:
-                        partial_frames_done=0
-                        frame_counter=0
+                    #if updaer sends doen signal reset the counter
+                    if done:
+                        composite_update_tracker.reset()
+                        done = False
+
 
                 #itterate progressbar counter
                 pbar.update(1)
 
                 cv.imshow("Live_view", annotated)
                 cv.waitKey(1)
+
+                
+                
                 output_video.append(annotated)
 
         cv.destroyAllWindows()
@@ -283,8 +297,8 @@ class BackgroundSubtracktor:
                 
         self._replace_background_frame(frame)
 
-        
-    def _composite_background_update(self, bounding_boxes, frame, empty_sequence, replace_index, consecutive_empty, weights):
+    # TODO done shouldnot be an input parameter 
+    def _composite_background_update(self, bounding_boxes, frame, done, replace_index, consecutive_empty, weights):
         """
         boundingboxes: array of arrays
         Build 'composite' frames by copying the newest background into each box region.
@@ -293,12 +307,16 @@ class BackgroundSubtracktor:
         """
         import numpy as np
 
+        if replace_index - 1 <0:
+            ref_index = self.num_backgrounds -1
+        else:
+            ref_index = replace_index - 1
         # lazy init: buffer for composite frames
         if not hasattr(self, "composite_sequence"):
             self.composite_sequence = []
 
-        newest_background = self.backgrounds[-1]
-
+        newest_background = self.backgrounds[ref_index]
+        print("frame for update", " " ,len(self.composite_sequence))
         # build one composite from current frame
         composite = frame.copy()
         H, W = composite.shape[:2]
@@ -320,21 +338,23 @@ class BackgroundSubtracktor:
         self.composite_sequence.append(composite)
 
         # if enough composites collected -> average and rotate into backgrounds
+        new_base_segment = self.build_background_base(np.array(self.composite_sequence))
+        self.backgrounds[replace_index] = new_base_segment
+        
         if len(self.composite_sequence) >= self.segment_size:
-            new_base_segment = self.build_background_base(np.array(self.composite_sequence))
-            self.backgrounds[replace_index] = new_base_segment
 
             replace_index = (1 + replace_index) % self.num_backgrounds
             self.composite_sequence = []  # reset batch
 
             # keep parity with your other updater
             weights = self._init_weights()
+            done=True
 
         # reset since composite mode is not an empty-sequence update
         empty_sequence = []
-        consecutive_empty = False
+        
 
-        return empty_sequence, replace_index, consecutive_empty, weights
+        return done, replace_index, consecutive_empty, weights
 
         
 
@@ -383,15 +403,16 @@ class BackgroundSubtracktor:
         contours, _ = cv.findContours(smoothed_mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
         return np.array([cv.boundingRect(cnt) for cnt in contours if cv.contourArea(cnt) > 300])
 
-    def _handle_background_update(self, frame, boxes, empty_sequence, replace_index, consecutive_empty, weights):
+    def _handle_background_update(self, frame, boxes, empty_sequence, replace_index, consecutive_empty, weights, done):
         """update backgrounds based on empty frame sequences"""
-        if len(boxes) == 0 and len(empty_sequence) < self.segment_size:
+        if len(boxes) != 0:
+            done = True
+        elif len(boxes) == 0 and len(empty_sequence) < self.segment_size:
             if not consecutive_empty:
                 empty_sequence = []
-            
             empty_sequence.append(frame)
             consecutive_empty = True
-
+            
             if len(empty_sequence) >= self.segment_size:
                 new_base_segment = self.build_background_base(np.array(empty_sequence))
                 self.backgrounds[replace_index] = new_base_segment
@@ -403,8 +424,10 @@ class BackgroundSubtracktor:
                 replace_index = (1 + replace_index) % self.num_backgrounds
                 empty_sequence = []
                 consecutive_empty = False
+                done = True
+                
 
-        return empty_sequence, replace_index, consecutive_empty, weights
+        return empty_sequence, replace_index, consecutive_empty, weights, done
 
     def _draw_boxes(self, frame, boxes, confirmed):
         """draw bounding boxes on frame"""
