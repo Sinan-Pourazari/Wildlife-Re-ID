@@ -28,23 +28,21 @@ class BackgroundSubtracktor:
             self.backgrounds = [None] * self.num_backgrounds
         self.segment_size = segment_size
         self.confirmed_background_given = not running_start
-        self.running_bg_bgr = None
-        self.running_bg_lab = None
+        self.running_bg = None
         self.bg_alpha = alpha  # TODO tune 0.005–0.05
-
-        
+     
 
     def build_background_base(self, image_series):
         avg_background = None
         frame_count = 0
 
         for image in image_series:
-            lab_image = cv.cvtColor(image, cv.COLOR_BGR2LAB)
-            lab_image = lab_image.astype("float32")
+            #lab_image = cv.cvtColor(image, cv.COLOR_BGR2LAB)
+            image = image.astype("float32")
             if avg_background is None:
-                avg_background = lab_image
+                avg_background = image
             else:
-                avg_background += lab_image
+                avg_background += image
 
             frame_count += 1
 
@@ -52,52 +50,30 @@ class BackgroundSubtracktor:
         background_uint8 = cv.convertScaleAbs(avg_background)
 
         #background_uint8 = cv.dilate(background_uint8, (5, 5), 0)
-        return background_uint8  # Still in LAB space
+        return background_uint8  
 
     def compare_images(self, new_image, base_background):
-        new_lab = cv.cvtColor(new_image, cv.COLOR_BGR2LAB)
-        diff = cv.absdiff(new_lab, base_background)
-
-        l, a, b = cv.split(diff)
-        _, l_ch = cv.threshold(l, 20, 255, cv.THRESH_BINARY)
-        _, a_ch = cv.threshold(a, 40, 255, cv.THRESH_BINARY)
-        _, b_ch = cv.threshold(b, 40, 255, cv.THRESH_BINARY)
-
-        motion_mask = cv.bitwise_or(l_ch, a_ch)
-        motion_mask = cv.bitwise_or(motion_mask, b_ch)
-        #motion_mask = cv.dilate(motion_mask,(10,10))
+        
+        diff = cv.absdiff(new_image, base_background)
+        if len(new_image.shape)==3 and new_image.shape[2] == 3:
+            l, a, b = cv.split(diff)
+            _, l_ch = cv.threshold(l, 40, 255, cv.THRESH_BINARY)
+            _, a_ch = cv.threshold(a, 50, 255, cv.THRESH_BINARY)
+            _, b_ch = cv.threshold(b, 50, 255, cv.THRESH_BINARY)
+        
+            motion_mask = cv.bitwise_or(l_ch, a_ch)
+            motion_mask = cv.bitwise_or(motion_mask, b_ch)
+            #motion_mask = cv.dilate(motion_mask,(10,10))
+        
+        else:
+            diff = cv.absdiff(new_image, base_background)
+            _, motion_mask = cv.threshold(diff, 15, 255, cv.THRESH_BINARY)
+            #motion_mask = cv.dilate(motion_mask,(30,30))
+        
 
         return motion_mask
     #TODO autotuning for thersholds
     #Todo make thesholds parameters
-    def compare_images_rgb(self, new_image, base_background):
-        diff = cv.absdiff(new_image, base_background)
-        b, g, r = cv.split(diff)
-        _, r_ch = cv.threshold(r, 80, 255, cv.THRESH_BINARY)
-        _, g_ch = cv.threshold(g, 80, 255, cv.THRESH_BINARY)
-        _, b_ch = cv.threshold(b, 80, 255, cv.THRESH_BINARY)
-
-        motion_mask = cv.bitwise_or(b_ch, g_ch)
-        motion_mask = cv.bitwise_or(motion_mask, r_ch)
-        return motion_mask
-
-    def build_background_base_rgb(self, image_series):
-        avg_background = None
-        frame_count = 0
-
-        for image in image_series:
-            image = image.astype("float32")
-            if avg_background is None:
-                avg_background = image
-            else:
-                avg_background += image
-            frame_count += 1
-
-        avg_background /= frame_count
-
-        background_uint8 = cv.convertScaleAbs(avg_background)
-        background_uint8 = cv.GaussianBlur(background_uint8, (5, 5), 0)
-        return background_uint8
 
     def __extract_frame_segments(self, video_path, segment_size=20, max_frames=None):
         cap = cv.VideoCapture(video_path)
@@ -189,12 +165,14 @@ class BackgroundSubtracktor:
             total_frames = None  # unknown total (e.g., stream)
 
         #itteration over the frames as they come in
-        with tqdm(total=total_frames, desc="Processing Frames", unit="frame", dynamic_ncols=True) as pbar:
+        with tqdm(total=total_frames, desc="Processing Frames", unit="frames", dynamic_ncols=True) as pbar:
             while True:
                 ret, frame = cap.read()
                 if not ret:
                     break
-
+                frame = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
+                #clahe  = cv.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+                #frame= clahe.apply(frame)
                 # --- guard: skip detection if no backgrounds yet ---
                 #TODO add option to decide if we start form the verry firtsst frame or the first x frames over an average
                 if len(getattr(self, "backgrounds", [])) == 0 or curr_frame_number<self.num_backgrounds:
@@ -206,23 +184,21 @@ class BackgroundSubtracktor:
                 ##############################
                 
                  # 1) Update running background via motion-gated mask
-                if self.running_bg_bgr is None:
+                if self.running_bg is None:
                     #self.running_bg_bgr = cv.GaussianBlur(frame, (5,5), 0)
-                    self.running_bg_bgr = frame
-                    self.running_bg_lab = self._ensure_lab(self.running_bg_bgr)
+                    self.running_bg = frame
 
-                fg_mask_run = self._fg_mask_vs_bg_lab(frame, self.running_bg_lab)
-                self.running_bg_bgr = self._masked_running_update(self.running_bg_bgr, frame, fg_mask_run, self.bg_alpha)
-                self.running_bg_lab = self._ensure_lab(self.running_bg_bgr)
+                fg_mask_run = self._fg_mask_vs_bg_lab(frame, self.running_bg)
+                self.running_bg = self._masked_running_update(self.running_bg, frame, fg_mask_run, self.bg_alpha)
 
                 # 2) Build pool + weights one time
                 bg_pool = self.backgrounds
-                vote_w  = self._init_weights()
+                vote_w  = weights
 
-                # Append running background (in LAB!) to the pool for voting
-                if self.running_bg_lab is not None:
-                    bg_pool = np.concatenate([bg_pool, self.running_bg_lab[None, ...]], axis=0)
-                    vote_w  = np.append(vote_w, 0.25)  # tune this
+                # Append running background to the pool for voting
+                if self.running_bg is not None:
+                    bg_pool = np.concatenate([bg_pool, self.running_bg[None, ...]], axis=0)
+                    vote_w  = np.append(vote_w, 0.10)  # tune this
                     vote_w /= vote_w.sum()
                 
                 ######################################
@@ -237,12 +213,12 @@ class BackgroundSubtracktor:
                 
                 confirmed_tracks, uncofirmed_tracks, _ = tracker.update(boxes)        # (list of dicts, list of dicts)
                 confirmed_boxes_to_draw = [t["box"] + [t["tag"]] for t in confirmed_tracks]
-                #unconfirmed_boxes_to_draw = [t["box"] + [t["tag"]] for t in uncofirmed_tracks]
+                unconfirmed_boxes_to_draw = [t["box"] + [t["tag"]] for t in uncofirmed_tracks]
                 annotated, bounding_boxes = self._draw_boxes(frame, confirmed_boxes_to_draw,True)
-                #annotated,_ = self._draw_boxes(annotated, unconfirmed_boxes_to_draw,False)
-                #annotated,_ = self._draw_boxes_DEPRECATED(annotated, boxes)
+                annotated,_ = self._draw_boxes(annotated, unconfirmed_boxes_to_draw,False)
+                annotated,_ = self._draw_boxes_DEPRECATED(annotated, boxes)
 
-                #update background Referebces
+                #update background References
                 print("full tracker: ", full_uppdate_tracker.curr_counter)
                 if full_uppdate_tracker.get_state():               
                     empty_sequence, replace_index, consecutive_empty, weights, done_full = self._handle_background_update(frame, bounding_boxes, empty_sequence, replace_index, consecutive_empty, weights, done_full)
@@ -274,8 +250,12 @@ class BackgroundSubtracktor:
 
                 #itterate progressbar counter
                 pbar.update(1)
-
+                consensus_mask = cv.resize(consensus_mask, (1280,720))
+                annotated = cv.resize(annotated, (1280,720))
                 cv.imshow("Live_view", annotated)
+                cv.imshow("Live_view2", consensus_mask)
+                cv.imshow("Debug", self.running_bg)
+
                 cv.waitKey(1)
 
                 
@@ -347,7 +327,7 @@ class BackgroundSubtracktor:
             self.composite_sequence = []  # reset batch
 
             # keep parity with your other updater
-            weights = self._init_weights()
+            weights = self._rotate_weights(weights,replace_index)
             done=True
 
         # reset since composite mode is not an empty-sequence update
@@ -382,12 +362,16 @@ class BackgroundSubtracktor:
 
     def _init_weights(self):
         """initialize weights for background voting"""
+        print("weights initillised")
         weights = np.arange(1, self.num_backgrounds + 1)
         return weights / weights.sum()
+    
+    def _rotate_weights(self, weights, shift):
+        """Rotate weights to align with rotated background buffer"""
+        return np.roll(weights, -shift)
 
     def _init_background_from_frames(self, frames_np):
         """set initial background bases if not given"""
-        print(self.num_backgrounds)
         self.init_background(frames_np[:self.num_backgrounds])
 
     def _apply_temporal_smoothing(self, mask_history, mask, max_history=3):
@@ -401,7 +385,7 @@ class BackgroundSubtracktor:
     def _extract_boxes(self, smoothed_mask):
         """find bounding boxes from smoothed mask"""
         contours, _ = cv.findContours(smoothed_mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
-        return np.array([cv.boundingRect(cnt) for cnt in contours if cv.contourArea(cnt) > 300])
+        return np.array([cv.boundingRect(cnt) for cnt in contours if cv.contourArea(cnt) > 100])
 
     def _handle_background_update(self, frame, boxes, empty_sequence, replace_index, consecutive_empty, weights, done):
         """update backgrounds based on empty frame sequences"""
@@ -420,7 +404,7 @@ class BackgroundSubtracktor:
             if len(empty_sequence)>0:
                 new_base_segment = self.build_background_base(np.array(empty_sequence))
                 self.backgrounds[replace_index] = new_base_segment
-                weights = self._init_weights()
+                weights = self._rotate_weights(weights,replace_index)
                 replace_index = (1 + replace_index) % self.num_backgrounds
                 empty_sequence = []
                 consecutive_empty = False
@@ -448,7 +432,8 @@ class BackgroundSubtracktor:
         bgf  = bg_bgr.astype(np.float32)
         frf  = frame_bgr.astype(np.float32)
         upd  = (1.0 - alpha) * bgf + alpha * frf
-        out  = np.where(inv3 == 255, upd, bgf)
+        
+        out  = np.where(inv == 255, upd, bgf)
         return cv.convertScaleAbs(out)
 
     def _fg_mask_vs_bg_lab(self, frame_bgr, bg_lab):
