@@ -1,6 +1,12 @@
 import random
 from torch.utils.data import Dataset
 import cv2 as cv
+import os
+import pandas as pd
+from PIL import Image
+
+
+
 class TripletDataset(Dataset):
     def __init__(self, base_dataset):
         self.base_dataset = base_dataset
@@ -31,12 +37,6 @@ class TripletDataset(Dataset):
     def __len__(self):
         return len(self.base_dataset)
 
-
-import os
-import random
-import pandas as pd
-from torch.utils.data import Dataset
-from PIL import Image
 
 
 class TripletTrainDataset(Dataset):

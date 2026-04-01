@@ -86,25 +86,22 @@ def image_to_superpixel_graph(img, n_segments=300, hog_bins=9, hog_signed=False,
     return data
 
 class GNNEncoder(nn.Module):
-    def __init__(self, in_dim=5, hidden_dim=512, out_dim=256):
+    def __init__(self, in_dim=14, hidden_dim=256, out_dim=256):
         super().__init__()
-        self.conv1 = GCNConv(in_dim, hidden_dim)
-        self.conv2 = GCNConv(hidden_dim, hidden_dim)
+        self.conv1 = GATConv(in_dim, hidden_dim)
+        self.conv2 = GATConv(hidden_dim, hidden_dim)
         self.lin = nn.Linear(hidden_dim, out_dim)
         self.output_dim = out_dim
 
     def forward(self, data):
         
-        x, edge_index = data.x, data.edge_index
+        x, edge_index, batch = data.x, data.edge_index, data.batch
 
         x = F.relu(self.conv1(x, edge_index))
         x = F.relu(self.conv2(x, edge_index))
 
         # Graph-level embedding via global pooling
-        batch = torch.zeros( x.size(0), dtype=torch.long, device=x.device)
-
-        x = global_mean_pool(x, batch=batch)
-
+        x = global_mean_pool(x, batch)
         return self.lin(x)
 """
 if __name__ == "__main__":

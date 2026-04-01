@@ -1,8 +1,7 @@
 import os
 import torch
 from torch import nn
-from torch.utils.data import DataLoader, Dataset
-from torchvision import datasets, transforms
+from torch.utils.data import Dataset as TorchDataset
 import random
 import pandas as pd
 import tqdm
@@ -10,10 +9,17 @@ from sklearn.neighbors import NearestNeighbors
 from sklearn.model_selection import train_test_split
 import embedding_clusterings as ec
 from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
+from loss_mining_tools import batch_hard_triplet_loss, PKBatchSampler, batch_semi_hard_triplet_loss
+from PIL import Image
+from torch_geometric.loader import DataLoader
+from torch_geometric.data import Dataset as PyGDataset
+from gnn.gnn import image_to_superpixel_graph, GNNEncoder
+import torch.nn.functional as F
 
 device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
+
 print(f"Using {device} device")
-class SimpleDataset(Dataset):
+class SimpleDataset(TorchDataset):
     def __init__(self, features, labels):
         self.features = torch.tensor(features, dtype=torch.float32)
         self.labels   = torch.tensor(labels, dtype=torch.long)
@@ -25,7 +31,7 @@ class SimpleDataset(Dataset):
         return self.features[idx], self.labels[idx]
 
 
-class TripletDataset(Dataset):
+class TripletDataset(TorchDataset):
     def __init__(self, features, labels):
         self.features = torch.tensor(features, dtype=torch.float32)
         self.labels   = torch.tensor(labels, dtype=torch.long)
@@ -64,58 +70,67 @@ class TripletDataset(Dataset):
         negative = self.features[neg_idx]
 
         return anchor, positive, negative
-
-
-
-class NeuralNetwork(nn.Module):
-    def __init__(self, input_dim):
+    
+class GraphImageDataset(PyGDataset):
+    def __init__(self, samples, root_dir, n_segments=50):
         super().__init__()
-        self.flatten = nn.Flatten()
-        self.linear_relu_stack = nn.Sequential(
-            nn.Linear(input_dim, 512),
+        self.samples = samples
+        self.root_dir = root_dir
+        self.n_segments = n_segments
+
+    def len(self):
+        return len(self.samples)
+
+    def get(self, idx):
+        filename, label = self.samples[idx]
+        image_path = os.path.join(self.root_dir, filename)
+        img = Image.open(image_path).convert("RGB")
+        #img = img.resize((256, 256))  # or 
+
+        graph = image_to_superpixel_graph(img, n_segments=self.n_segments)
+        graph.y = torch.tensor([int(label)], dtype=torch.long)
+        return graph
+
+class ReIDModel(nn.Module):
+    def __init__(self, gnn_out_dim=256, emb_dim=124):
+        super().__init__()
+        self.encoder = GNNEncoder(in_dim=14, hidden_dim=256, out_dim=gnn_out_dim)
+        self.head = nn.Sequential(
+            nn.Linear(gnn_out_dim, 256),
             nn.ReLU(),
-            nn.Linear(512, 512),
-            nn.ReLU(),
-            nn.Linear(512, 126),
+            nn.Linear(256, emb_dim),
         )
 
-    def forward(self, x):
-        x = self.flatten(x)
-        embeddings = self.linear_relu_stack(x)
-        return embeddings
+    def forward(self, data):
+        z = self.encoder(data)
+        z = self.head(z)
+        z = F.normalize(z, dim=1)
+        return z
     
 
-def train_one_epoch(loader, model, optimizer, loss_fn):
+def train_one_epoch(loader, model, optimizer, margin=1.0):
     model.train()
-    batch_loss = 0.0
-    for anchor, pos, neg in loader:
-        anchor = anchor.to(device)
-        pos    = pos.to(device)
-        neg    = neg.to(device)
-        #forwardpasses to generate embeddings for each triplet datapoint
-        anchor_emb = model(anchor)
-        pos_emb = model(pos)
-        neg_emb = model(neg)
+    total = 0.0
 
-        #normalize embeddings
-        anchor_emb = torch.nn.functional.normalize(anchor_emb, dim=1).to(device)
-        pos_emb    = torch.nn.functional.normalize(pos_emb, dim=1).to(device)
-        neg_emb    = torch.nn.functional.normalize(neg_emb, dim=1).to(device)
+    for data in loader:
+        data = data.to(device)
+        labels = data.y.view(-1).to(device)
 
-        #compute loss
-        loss = loss_fn(anchor_emb,pos_emb,neg_emb)
+        emb = model(data)
+        loss = batch_semi_hard_triplet_loss(emb, labels, margin=margin)
 
-        #backward pass
         optimizer.zero_grad()
-        batch_loss += loss.item()
         loss.backward()
         optimizer.step()
-    
-    return batch_loss/len(loader)
 
-def train(loader, model, optimizer, loss_fn, num_epochs):
+        total += float(loss.item())
+
+    return total / len(loader)
+
+
+def train(loader, model, optimizer, num_epochs):
     for i in range(num_epochs):
-        batchloss = train_one_epoch(loader, model, optimizer, loss_fn)
+        batchloss = train_one_epoch(loader, model, optimizer, margin=0.5)
         print(f"epoch {i} batchloss: {batchloss}")
 
 
@@ -139,25 +154,19 @@ def eval(model, loader, closed_set: bool):
     emb_list = []
     label_list = []
 
-    # --------------------------------------------------
-    # 1. Extract embeddings (shared for both modes)
-    # --------------------------------------------------
     with torch.no_grad():
-        for features, label in loader:
-            features = features.to(device)
-            label = label.to(device)
+        for data in loader:
+            data = data.to(device)
+            labels = data.y.view(-1).to(device)
 
-            emb = torch.nn.functional.normalize(model(features), dim=1)
+            emb = model(data)
 
             emb_list.append(emb)
-            label_list.append(label)
+            label_list.append(labels)
 
-    embeddings = torch.cat(emb_list).cpu()   # (N, D)
-    labels     = torch.cat(label_list).cpu() # (N,)
+    embeddings = torch.cat(emb_list).cpu()
+    labels = torch.cat(label_list).cpu()
 
-    # --------------------------------------------------
-    # 2a. CLOSED-SET evaluation (classic Re-ID style)
-    # --------------------------------------------------
     if closed_set:
         acc = knn_accuracy(
             embeddings.numpy(),
@@ -173,27 +182,19 @@ def eval(model, loader, closed_set: bool):
         )
         return
 
-    # --------------------------------------------------
-    # 2b. OPEN-SET evaluation (identity discovery)
-    # --------------------------------------------------
     memory = ec.IdentityMemory(
-        threshold=0.10,                 # tune later
+        threshold=0.10,
         max_exemplars_per_identity=5
     )
 
     predicted_ids = []
 
-    # IMPORTANT:
-    # embeddings are processed SEQUENTIALLY
     for emb in embeddings:
         identity_id, _, _ = memory.upsert(emb)
         predicted_ids.append(identity_id)
 
     predicted_ids = torch.tensor(predicted_ids)
 
-    # --------------------------------------------------
-    # 3. Open-set evaluation metrics
-    # --------------------------------------------------
     ari = adjusted_rand_score(
         labels.numpy(),
         predicted_ids.numpy()
@@ -226,54 +227,158 @@ def accuracy_to_color(acc_percent: float) -> str:
 
 
 def main(closed_set: bool):
-    df = pd.read_csv("embeddings/amur_train_embeddings.csv")
-    df.drop(columns=["image_path", "split"], inplace=True)
+    train_csv = "src/images/Amur_Tigers/reid_list_train.csv"
+    train_root = "src/images/Amur_Tigers/train_resized"
 
-    # IMPORTANT: split features/labels by column name
-    labels = df["label"].astype(int)
-    features = df.drop(columns=["label"]).astype("float32")
+    df = pd.read_csv(train_csv)
+    df = df.rename(columns={"animal_id": "label"})
+    df["label"] = df["label"].astype(int)
 
-    # Remove singleton IDs (must be done using labels)
-    counts = labels.value_counts()
+    counts = df["label"].value_counts()
     keep_ids = counts[counts > 1].index
-    mask = labels.isin(keep_ids)
+    df = df[df["label"].isin(keep_ids)].reset_index(drop=True)
 
-    features = features[mask]
-    labels   = labels[mask]
-
-    print("After filtering:", len(labels), "samples,", labels.nunique(), "IDs")
+    print("After filtering:", len(df), "samples,", df["label"].nunique(), "IDs")
 
     if not closed_set:
-        animal_ids = labels.unique()
-        train_ids, test_ids = train_test_split(animal_ids, test_size=0.3, random_state=42)
+        animal_ids = df["label"].unique()
+        train_ids, val_ids = train_test_split(animal_ids, test_size=0.4, random_state=42)
 
-        train_mask = labels.isin(train_ids)
-        test_mask  = labels.isin(test_ids)
-
-        X_train, y_train = features[train_mask].values, labels[train_mask].values
-        X_test,  y_test  = features[test_mask].values,  labels[test_mask].values
+        train_df = df[df["label"].isin(train_ids)].reset_index(drop=True)
+        val_df = df[df["label"].isin(val_ids)].reset_index(drop=True)
     else:
-        X = features.values
-        y = labels.values
-        X_train, X_test, y_train, y_test = train_test_split(X, y, random_state=42, test_size=0.3)
+        train_df, val_df = train_test_split(df, test_size=0.4, random_state=42)
+        train_df = train_df.reset_index(drop=True)
+        val_df = val_df.reset_index(drop=True)
 
-    test_dataset = SimpleDataset(X_test, y_test)
-    test_loader  = DataLoader(test_dataset, batch_size=32, shuffle=False)
+    train_samples = list(zip(train_df["filename"].tolist(), train_df["label"].tolist()))
+    val_samples = list(zip(val_df["filename"].tolist(), val_df["label"].tolist()))
 
-    train_dataset = TripletDataset(X_train, y_train)
-    train_loader  = DataLoader(train_dataset, batch_size=32, shuffle=True)
+    train_dataset = GraphImageDataset(train_samples, root_dir=train_root, n_segments=64)
+    val_dataset = GraphImageDataset(val_samples, root_dir=train_root, n_segments=64)
 
-    print("Train dataset length:", len(train_dataset))
-    print("Test dataset length :", len(test_dataset))
+    y_train = train_df["label"].values
+    P, K = 8, 4
+    batch_sampler = PKBatchSampler(y_train, P=P, K=K)
 
-    model = NeuralNetwork(input_dim=X_train.shape[1]).to(device)
-    loss_fn = nn.TripletMarginLoss(margin=1.0)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay= 1e-5)
+    train_loader = DataLoader(train_dataset, batch_sampler=batch_sampler)
+    val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False)
 
-    train(loader=train_loader, model=model, optimizer=optimizer, loss_fn=loss_fn, num_epochs=50)
-    print("Train identities:", len(set(y_train)))
-    print("Test identities :", len(set(y_test)))
-    eval(model, test_loader, closed_set=closed_set)
+    print("Train dataset length :", len(train_dataset))
+    print("Val dataset length   :", len(val_dataset))
+
+    model = ReIDModel(gnn_out_dim=256, emb_dim=124).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
+
+    train(train_loader, model, optimizer, num_epochs=50)
+
+    print("Train identities:", len(set(train_df["label"].tolist())))
+    print("Val identities  :", len(set(val_df["label"].tolist())))
+    eval(model, val_loader, closed_set=closed_set)
 
 
-main(True)
+main(False)
+
+
+
+
+#################
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+
+def reduce_to_2d(
+    embeddings: torch.Tensor,
+    method: str = "tsne",
+    seed: int = 42,
+) -> np.ndarray:
+    """
+    embeddings: torch.Tensor on CPU (N, D)
+    returns: np.ndarray (N, 2)
+    """
+    X = embeddings.numpy()
+    n, d = X.shape
+
+    # If too few points, t-SNE isn't stable/valid -> PCA fallback
+    if method.lower() == "tsne" and n < 10:
+        method = "pca"
+
+    if method.lower() == "pca":
+        return PCA(n_components=2, random_state=seed).fit_transform(X)
+
+    if method.lower() == "tsne":
+        # Standard trick: PCA -> t-SNE for speed/stability
+        pca_dim = min(50, d, max(2, n - 1))
+        Xp = PCA(n_components=pca_dim, random_state=seed).fit_transform(X)
+
+        # perplexity must be < n; choose a safe value
+        # typical range: 5..30
+        perplexity = min(30, max(5, (n - 1) // 3))
+        perplexity = min(perplexity, n - 1)
+
+        tsne = TSNE(
+            n_components=2,
+            init="pca",
+            learning_rate="auto",
+            perplexity=perplexity,
+            random_state=seed,
+        )
+        return tsne.fit_transform(Xp)
+
+    raise ValueError(f"Unknown method='{method}'. Use 'pca' or 'tsne'.")
+
+
+def plot_embedding_2d(
+    xy: np.ndarray,
+    labels: np.ndarray,
+    title: str,
+    *,
+    max_points: int = 5000,
+    alpha: float = 0.75,
+    s: float = 10.0,
+    annotate_top_k: int = 15,
+) -> None:
+    """
+    Scatter plot of 2D embedding with colors by label.
+    Optionally annotates centroids of the top-k most frequent labels.
+    """
+    assert xy.shape[1] == 2
+
+    labels = labels.astype(int)
+    n = len(labels)
+
+    # Optional subsampling for speed/readability
+    if n > max_points:
+        rng = np.random.default_rng(42)
+        idx = rng.choice(n, size=max_points, replace=False)
+        xy_plot = xy[idx]
+        labels_plot = labels[idx]
+    else:
+        xy_plot = xy
+        labels_plot = labels
+
+    unique = np.unique(labels_plot)
+    # map labels -> 0..C-1 for coloring
+    label_to_idx = {lab: i for i, lab in enumerate(unique)}
+    c = np.array([label_to_idx[lab] for lab in labels_plot], dtype=int)
+
+    plt.figure(figsize=(10, 8))
+    plt.scatter(xy_plot[:, 0], xy_plot[:, 1], c=c, s=s, alpha=alpha)
+    plt.title(f"{title} | N={len(labels_plot)} | classes={len(unique)}")
+    plt.xlabel("dim-1")
+    plt.ylabel("dim-2")
+    plt.tight_layout()
+
+    # Annotate centroids for the most frequent labels (helps sanity-check clustering)
+    if annotate_top_k > 0 and len(unique) > 1:
+        # counts on the plotted subset
+        vals, counts = np.unique(labels_plot, return_counts=True)
+        top = vals[np.argsort(-counts)][:annotate_top_k]
+
+        for lab in top:
+            mask = labels_plot == lab
+            cx, cy = xy_plot[mask].mean(axis=0)
+            plt.text(cx, cy, str(lab), fontsize=9)
+
+    plt.show()
