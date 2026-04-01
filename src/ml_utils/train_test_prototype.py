@@ -15,7 +15,11 @@ from torch_geometric.loader import DataLoader
 from torch_geometric.data import Dataset as PyGDataset
 from gnn.gnn import image_to_superpixel_graph, GNNEncoder
 import torch.nn.functional as F
-from dataloader import InMemoryGraphDataset
+from dataloader import InMemoryGraphDataset, UniversalGraphDataset
+import numpy as np
+from sklearn.preprocessing import LabelEncoder
+import argparse
+
 device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
 
 print(f"Using {device} device")
@@ -98,6 +102,8 @@ class ReIDModel(nn.Module):
         self.head = nn.Sequential(
             nn.Linear(gnn_out_dim, 256),
             nn.ReLU(),
+            nn.Linear(256, 256),
+            nn.ReLU(),
             nn.Linear(256, emb_dim),
         )
 
@@ -130,7 +136,7 @@ def train_one_epoch(loader, model, optimizer, margin=1.0):
 
 def train(loader, model, optimizer, num_epochs):
     for i in range(num_epochs):
-        batchloss = train_one_epoch(loader, model, optimizer, margin=0.5)
+        batchloss = train_one_epoch(loader, model, optimizer, margin=0.3)
         print(f"epoch {i} batchloss: {batchloss}")
 
 
@@ -149,66 +155,92 @@ def knn_accuracy(embeddings, labels, k=4):
 
 
 def eval(model, loader, closed_set: bool):
+    from sklearn.metrics.pairwise import cosine_distances
     model.eval()
+    emb_list, label_list = [], []
 
-    emb_list = []
-    label_list = []
-
+    # 1. Extract Embeddings
     with torch.no_grad():
         for data in loader:
             data = data.to(device)
-            labels = data.y.view(-1).to(device)
-
             emb = model(data)
-
             emb_list.append(emb)
-            label_list.append(labels)
+            label_list.append(data.y.view(-1))
 
-    embeddings = torch.cat(emb_list).cpu()
-    labels = torch.cat(label_list).cpu()
+    embeddings = torch.cat(emb_list).cpu().numpy()
+    labels = torch.cat(label_list).cpu().numpy()
 
-    if closed_set:
-        acc = knn_accuracy(
-            embeddings.numpy(),
-            labels.numpy()
-        ) * 100
+    # 2. Compute Distance Matrix (Cosine Distance)
+    # dists[i, j] is the distance between embedding i and embedding j
+    dists = cosine_distances(embeddings)
 
-        COLOR = accuracy_to_color(acc)
-        RESET = "\033[0m"
+    # 3. Calculate Rank-1 and mAP
+    all_ap = []
+    rank1_correct = 0
+    num_queries = len(labels)
 
-        print(
-            f"Validation accuracy in Closed-set problem setting: "
-            f"{COLOR}{acc:.2f}%{RESET}"
-        )
-        return
+    for i in range(num_queries):
+        query_label = labels[i]
+        
+        # Get distances for this query, excluding the query itself
+        query_dists = dists[i]
+        # We want to ignore the distance to itself (which is 0)
+        # We do this by setting its distance to infinity
+        query_dists[i] = np.inf 
+        
+        # Sort indices by distance (ascending)
+        sorted_indices = np.argsort(query_dists)
+        sorted_labels = labels[sorted_indices]
 
-    memory = ec.IdentityMemory(
-        threshold=0.10,
-        max_exemplars_per_identity=5
-    )
+        # --- Rank-1 ---
+        if sorted_labels[0] == query_label:
+            rank1_correct += 1
 
-    predicted_ids = []
+        # --- Average Precision (AP) ---
+        # Find positions of all matching labels
+        matches = (sorted_labels == query_label)
+        num_rel = np.sum(matches) # Total number of relevant items in the gallery
+        
+        if num_rel == 0:
+            continue
 
-    for emb in embeddings:
-        identity_id, _, _ = memory.upsert(emb)
-        predicted_ids.append(identity_id)
+        # Cumulative sum of matches to get "hits at rank k"
+        hits_at_k = np.cumsum(matches)
+        # Ranks at which matches occurred (1-indexed)
+        ranks = np.arange(1, len(sorted_labels) + 1)
+        
+        # Precision at each hit: (number of hits) / (current rank)
+        precisions = (hits_at_k / ranks) * matches
+        
+        # AP is the average of precisions at the points where a match was found
+        ap = np.sum(precisions) / num_rel
+        all_ap.append(ap)
 
-    predicted_ids = torch.tensor(predicted_ids)
+    rank1 = (rank1_correct / num_queries) * 100
+    mAP = np.mean(all_ap) * 100
 
-    ari = adjusted_rand_score(
-        labels.numpy(),
-        predicted_ids.numpy()
-    )
+    # UI Helpers
+    COLOR = accuracy_to_color(rank1)
+    RESET = "\033[0m"
+    mode_str = "Closed-Set" if closed_set else "Open-Set"
 
-    nmi = normalized_mutual_info_score(
-        labels.numpy(),
-        predicted_ids.numpy()
-    )
+    print(f"\n[{mode_str} Results]")
+    print(f"Rank-1 Accuracy: {COLOR}{rank1:.2f}%{RESET}")
+    print(f"mAP:             {COLOR}{mAP:.2f}%{RESET}")
 
-    print("Open-set evaluation:")
-    print(f"  Discovered identities : {len(memory.memory)}")
-    print(f"  ARI (cluster quality) : {ari:.4f}")
-    print(f"  NMI (label agreement): {nmi:.4f}")
+    # 4. Open-Set Specific Clustering Metrics
+    if not closed_set:
+        memory = ec.IdentityMemory(threshold=0.30, max_exemplars_per_identity=10)
+        predicted_ids = [memory.upsert(torch.from_numpy(e))[0] for e in embeddings]
+        
+        ari = adjusted_rand_score(labels, predicted_ids)
+        nmi = normalized_mutual_info_score(labels, predicted_ids)
+
+        print(f"Discovered IDs:  {len(memory.memory)}")
+        print(f"ARI:             {ari:.4f}")
+        print(f"NMI:             {nmi:.4f}")
+
+    return rank1, mAP
 
 def accuracy_to_color(acc_percent: float) -> str:
     """
@@ -226,81 +258,111 @@ def accuracy_to_color(acc_percent: float) -> str:
 
 
 
-def main(closed_set: bool):
-    # --- Configuration & Paths ---
-    train_csv = "src/images/Amur_Tigers/reid_list_train.csv"
-    train_root = "src/images/Amur_Tigers/train"
+def main(args):
+    # Setup Paths
+    csv_path = "src/images/reid-10k/metadata.csv"
+    img_root = "src/images/reid-10k"  # Base directory where dataset folders live
+    cache_pool = "src/images/reid-10k/graph_cache_pool"
+
+    # 1. Load the Universal Metadata
+    print("\n[ Loading Metadata ]")
+    df = pd.read_csv(csv_path)
+
+    # Filter out entries with no cluster_id/identity if necessary
+    df = df.dropna(subset=['identity']) 
+
+    # 2. Create Global Unique IDs (Crucial for multi-dataset)
+    df['global_identity'] = df['dataset'] + "_" + df['identity'].astype(str)
     
-    # We point both to a shared cache pool so the Open/Closed sets 
-    # can reuse the same .pt files if they share images.
-    global_cache = "src/images/Amur_Tigers/graph_cache_pool" 
-
-    # --- Data Loading & Filtering ---
-    df = pd.read_csv(train_csv)
-    df = df.rename(columns={"animal_id": "label"})
-    df["label"] = df["label"].astype(int)
-
-    # Filter out identities with only one image (can't form triplets)
-    counts = df["label"].value_counts()
+    counts = df['global_identity'].value_counts()
     keep_ids = counts[counts > 1].index
-    df = df[df["label"].isin(keep_ids)].reset_index(drop=True)
+    df = df[df['global_identity'].isin(keep_ids)].reset_index(drop=True)
 
-    print(f"After filtering: {len(df)} samples, {df['label'].nunique()} IDs")
+    le = LabelEncoder()
+    df['global_label'] = le.fit_transform(df['global_identity'])
 
-    # --- Splitting Logic ---
-    if closed_set:
-        print("Mode: Closed Set (Random split, all identities seen in training)")
-        train_df, val_df = train_test_split(df, test_size=0.2, stratify=df["label"], random_state=42)
+    # 3. Apply Holdout Logic
+    if args.holdout_species:
+        print(f"--> HOLDING OUT SPECIES: {args.holdout_species}")
+        train_df = df[df['species'] != args.holdout_species].reset_index(drop=True)
+        test_df = df[df['species'] == args.holdout_species].reset_index(drop=True)
+        
+    elif args.holdout_dataset:
+        print(f"--> HOLDING OUT DATASET: {args.holdout_dataset}")
+        train_df = df[df['dataset'] != args.holdout_dataset].reset_index(drop=True)
+        test_df = df[df['dataset'] == args.holdout_dataset].reset_index(drop=True)
+        
     else:
-        print("Mode: Open Set (ID split, validation identities are completely unseen)")
-        unique_labels = df["label"].unique()
-        train_labels, val_labels = train_test_split(unique_labels, test_size=0.3, random_state=42)
-        train_df = df[df["label"].isin(train_labels)]
-        val_df = df[df["label"].isin(val_labels)]
+        # Standard Open-Set Split on the whole universe
+        print("--> Standard Open-Set Split (No Holdout)")
+        unique_labels = df["global_label"].unique()
+        train_labels, test_labels = train_test_split(unique_labels, test_size=0.2, random_state=42)
+        train_df = df[df["global_label"].isin(train_labels)].reset_index(drop=True)
+        test_df = df[df["global_label"].isin(test_labels)].reset_index(drop=True)
 
-    # Prepare sample lists for the dataset
-    train_samples = list(zip(train_df["filename"].tolist(), train_df["label"].tolist()))
-    val_samples = list(zip(val_df["filename"].tolist(), val_df["label"].tolist()))
+    # 4. Create Sample Lists (mapping path -> label)
+    train_samples = list(zip(train_df["path"], train_df["global_label"]))
+    test_samples = list(zip(test_df["path"], test_df["global_label"]))
 
-    # --- Warmup Phase (Cache/Memory Loading) ---
-    # Using the same global_cache for both ensures we don't recompute 
-    # graphs that appear in both sets or across different runs.
-    print("\n--- Starting Train Dataset Warmup ---")
-    train_dataset = InMemoryGraphDataset(train_samples, train_root, global_cache, n_segments=300)
+    print(f"Train size: {len(train_samples)} images | Test size: {len(test_samples)} images")
+
+    # --- Initialize Universal Datasets ---
+    print("\n[ Preparing Training Data ]")
+    train_dataset = UniversalGraphDataset(
+        samples=train_samples, 
+        root_dir=img_root, 
+        cache_dir=cache_pool, 
+        mode=args.data_mode,
+        n_segments=args.segments
+    )
     
-    print("\n--- Starting Val Dataset Warmup ---")
-    val_dataset = InMemoryGraphDataset(val_samples, train_root, global_cache, n_segments=300)
+    print("\n[ Preparing Test/Holdout Data ]")
+    test_dataset = UniversalGraphDataset(
+        samples=test_samples, 
+        root_dir=img_root, 
+        cache_dir=cache_pool, 
+        mode=args.data_mode, 
+        n_segments=args.segments
+    )
 
-    # --- DataLoaders & Sampling ---
-    y_train = train_df["label"].values
-    P, K = 8, 4 # 8 Identities, 4 Images each = Batch size 32
-    batch_sampler = PKBatchSampler(y_train, P=P, K=K)
+    # DataLoaders
+    batch_sampler = PKBatchSampler(train_df["global_label"].values, P=8, K=4)
+    train_loader = DataLoader(train_dataset, batch_sampler=batch_sampler, num_workers=args.workers)
+    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=args.workers)
 
-    # We use the PyG DataLoader specifically designed for Graph Data objects
-    train_loader = DataLoader(train_dataset, batch_sampler=batch_sampler)
-    val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False)
-
-    print(f"\nTrain dataset length: {len(train_dataset)}")
-    print(f"Val dataset length:   {len(val_dataset)}")
-    print(f"Train identities:    {len(set(train_df['label'].tolist()))}")
-    print(f"Val identities:      {len(set(val_df['label'].tolist()))}")
-
-    # --- Model Initialization ---
-    # ReIDModel usually acts as a wrapper for your GNNEncoder 
-    # to project the graph embedding into a contrastive space.
+    # Model & Optimizer
     model = ReIDModel(gnn_out_dim=256, emb_dim=124).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-    # --- Training & Evaluation ---
-    print("\nStarting Training...")
-    train(train_loader, model, optimizer, num_epochs=50)
-
-    print("\nFinal Evaluation...")
-    eval(model, val_loader, closed_set=closed_set)
-
+    # Train & Evaluate
+    train(train_loader, model, optimizer, num_epochs=args.epochs)
+    
+    # Evaluate as an Open Set since the holdout data contains unseen IDs
+    print(f"\nEvaluating on Holdout Set...")
+    eval(model, test_loader, closed_set=False)
 if __name__ == "__main__":
-    # Choose between Open Set or Closed Set testing
-    main(closed_set=True)
+    parser = argparse.ArgumentParser(description="Wildlife Re-ID GNN Trainer")
+    
+    # Task settings
+    parser.add_argument("--closed_set", action="store_true", help="Run in closed-set mode (default is open-set)")
+    parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs")
+    
+    # Dataset scaling settings
+    parser.add_argument("--data_mode", type=str, default="auto", choices=["auto", "memory", "lazy"], 
+                        help="How to load graphs. 'auto' chooses based on dataset size.")
+    parser.add_argument("--segments", type=int, default=300, help="Number of superpixels (SLIC segments)")
+    parser.add_argument("--rebuild", action="store_true", help="Force rebuild of graph cache (ignore existing .pt files)")
+    
+    # Hardware settings
+    parser.add_argument("--workers", type=int, default=4, help="Number of CPU workers for DataLoader")
+    
+    # Holdout settings
+    parser.add_argument("--holdout_dataset", type=str, default=None, 
+                        help="Name of the dataset to hold out for testing (e.g., 'ATRW')")
+    parser.add_argument("--holdout_species", type=str, default=None, 
+                        help="Name of the species to hold out for testing (e.g., 'tiger')")
+    args = parser.parse_args()
+    main(args)
 
 
 
