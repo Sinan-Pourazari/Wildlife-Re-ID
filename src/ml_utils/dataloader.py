@@ -4,7 +4,10 @@ import cv2 as cv
 import os
 import pandas as pd
 from PIL import Image
-
+import torch
+from tqdm import tqdm
+from torch_geometric.data import Dataset as PyGDataset
+from gnn.gnn import image_to_superpixel_graph 
 
 
 class TripletDataset(Dataset):
@@ -124,3 +127,59 @@ class TestDataset(Dataset):
 
     def __len__(self):
         return len(self.df)
+    
+
+
+class InMemoryGraphDataset(PyGDataset):
+    def __init__(self, samples, root_dir, cache_dir, n_segments=64):
+        super().__init__()
+        self.samples = samples  # List of (filename, label) from your CSV split
+        self.root_dir = root_dir
+        self.cache_dir = cache_dir
+        self.n_segments = n_segments
+        self.graphs = []
+
+        if not os.path.exists(self.cache_dir):
+            os.makedirs(self.cache_dir)
+
+        # 1. Console Prompt (Only ask once per execution)
+        # We check a global flag so we don't ask for both Train and Val datasets
+        if not hasattr(InMemoryGraphDataset, "_user_choice"):
+            existing_count = len([f for f in os.listdir(cache_dir) if f.endswith('.pt')])
+            if existing_count > 0:
+                choice = input(f"\n[CACHE] Found {existing_count} graphs in '{cache_dir}'. Use cache? (y/n): ").strip().lower()
+                InMemoryGraphDataset._user_choice = (choice == 'y')
+            else:
+                InMemoryGraphDataset._user_choice = False
+
+        # 2. Loading / Generation Phase
+        print(f"Dataset Warmup: Preparing {len(samples)} samples...")
+        for filename, label in tqdm(samples):
+            # Map filename to .pt
+            graph_id = filename.rsplit('.', 1)[0] + '.pt'
+            cache_path = os.path.join(self.cache_dir, graph_id)
+
+            if InMemoryGraphDataset._user_choice and os.path.exists(cache_path):
+                # LOAD EXISTING
+                graph = torch.load(cache_path, weights_only=False)
+            else:
+                # GENERATE NEW
+                img_path = os.path.join(self.root_dir, filename)
+                img = Image.open(img_path).convert("RGB")
+                graph = image_to_superpixel_graph(img, n_segments=self.n_segments)
+                
+                # Save to the global pool
+                os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                torch.save(graph, cache_path)
+
+            # Important: Assign the label dynamically from the CSV
+            # This ensures that even if you change label mappings between 
+            # Open/Closed sets, the graph remains valid.
+            graph.y = torch.tensor([int(label)], dtype=torch.long)
+            self.graphs.append(graph)
+
+    def len(self):
+        return len(self.graphs)
+
+    def get(self, idx):
+        return self.graphs[idx]

@@ -15,7 +15,7 @@ from torch_geometric.loader import DataLoader
 from torch_geometric.data import Dataset as PyGDataset
 from gnn.gnn import image_to_superpixel_graph, GNNEncoder
 import torch.nn.functional as F
-
+from dataloader import InMemoryGraphDataset
 device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
 
 print(f"Using {device} device")
@@ -227,57 +227,80 @@ def accuracy_to_color(acc_percent: float) -> str:
 
 
 def main(closed_set: bool):
+    # --- Configuration & Paths ---
     train_csv = "src/images/Amur_Tigers/reid_list_train.csv"
-    train_root = "src/images/Amur_Tigers/train_resized"
+    train_root = "src/images/Amur_Tigers/train"
+    
+    # We point both to a shared cache pool so the Open/Closed sets 
+    # can reuse the same .pt files if they share images.
+    global_cache = "src/images/Amur_Tigers/graph_cache_pool" 
 
+    # --- Data Loading & Filtering ---
     df = pd.read_csv(train_csv)
     df = df.rename(columns={"animal_id": "label"})
     df["label"] = df["label"].astype(int)
 
+    # Filter out identities with only one image (can't form triplets)
     counts = df["label"].value_counts()
     keep_ids = counts[counts > 1].index
     df = df[df["label"].isin(keep_ids)].reset_index(drop=True)
 
-    print("After filtering:", len(df), "samples,", df["label"].nunique(), "IDs")
+    print(f"After filtering: {len(df)} samples, {df['label'].nunique()} IDs")
 
-    if not closed_set:
-        animal_ids = df["label"].unique()
-        train_ids, val_ids = train_test_split(animal_ids, test_size=0.4, random_state=42)
-
-        train_df = df[df["label"].isin(train_ids)].reset_index(drop=True)
-        val_df = df[df["label"].isin(val_ids)].reset_index(drop=True)
+    # --- Splitting Logic ---
+    if closed_set:
+        print("Mode: Closed Set (Random split, all identities seen in training)")
+        train_df, val_df = train_test_split(df, test_size=0.2, stratify=df["label"], random_state=42)
     else:
-        train_df, val_df = train_test_split(df, test_size=0.4, random_state=42)
-        train_df = train_df.reset_index(drop=True)
-        val_df = val_df.reset_index(drop=True)
+        print("Mode: Open Set (ID split, validation identities are completely unseen)")
+        unique_labels = df["label"].unique()
+        train_labels, val_labels = train_test_split(unique_labels, test_size=0.3, random_state=42)
+        train_df = df[df["label"].isin(train_labels)]
+        val_df = df[df["label"].isin(val_labels)]
 
+    # Prepare sample lists for the dataset
     train_samples = list(zip(train_df["filename"].tolist(), train_df["label"].tolist()))
     val_samples = list(zip(val_df["filename"].tolist(), val_df["label"].tolist()))
 
-    train_dataset = GraphImageDataset(train_samples, root_dir=train_root, n_segments=64)
-    val_dataset = GraphImageDataset(val_samples, root_dir=train_root, n_segments=64)
+    # --- Warmup Phase (Cache/Memory Loading) ---
+    # Using the same global_cache for both ensures we don't recompute 
+    # graphs that appear in both sets or across different runs.
+    print("\n--- Starting Train Dataset Warmup ---")
+    train_dataset = InMemoryGraphDataset(train_samples, train_root, global_cache, n_segments=300)
+    
+    print("\n--- Starting Val Dataset Warmup ---")
+    val_dataset = InMemoryGraphDataset(val_samples, train_root, global_cache, n_segments=300)
 
+    # --- DataLoaders & Sampling ---
     y_train = train_df["label"].values
-    P, K = 8, 4
+    P, K = 8, 4 # 8 Identities, 4 Images each = Batch size 32
     batch_sampler = PKBatchSampler(y_train, P=P, K=K)
 
+    # We use the PyG DataLoader specifically designed for Graph Data objects
     train_loader = DataLoader(train_dataset, batch_sampler=batch_sampler)
     val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False)
 
-    print("Train dataset length :", len(train_dataset))
-    print("Val dataset length   :", len(val_dataset))
+    print(f"\nTrain dataset length: {len(train_dataset)}")
+    print(f"Val dataset length:   {len(val_dataset)}")
+    print(f"Train identities:    {len(set(train_df['label'].tolist()))}")
+    print(f"Val identities:      {len(set(val_df['label'].tolist()))}")
 
+    # --- Model Initialization ---
+    # ReIDModel usually acts as a wrapper for your GNNEncoder 
+    # to project the graph embedding into a contrastive space.
     model = ReIDModel(gnn_out_dim=256, emb_dim=124).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
 
+    # --- Training & Evaluation ---
+    print("\nStarting Training...")
     train(train_loader, model, optimizer, num_epochs=50)
 
-    print("Train identities:", len(set(train_df["label"].tolist())))
-    print("Val identities  :", len(set(val_df["label"].tolist())))
+    print("\nFinal Evaluation...")
     eval(model, val_loader, closed_set=closed_set)
 
-
-main(False)
+if __name__ == "__main__":
+    # Choose between Open Set or Closed Set testing
+    main(closed_set=True)
 
 
 
