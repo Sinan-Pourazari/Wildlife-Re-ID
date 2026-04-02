@@ -1,3 +1,4 @@
+import datetime
 import os
 import torch
 from torch import nn
@@ -20,13 +21,20 @@ import numpy as np
 from sklearn.preprocessing import LabelEncoder
 import argparse
 
-device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
+device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu" 
+"""if torch.cuda.is_available():
+    device = "cuda"
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    device = "mps"
+else:
+    device = "cpu"
+"""
 
 print(f"Using {device} device")
 class SimpleDataset(TorchDataset):
     def __init__(self, features, labels):
-        self.features = torch.tensor(features, dtype=torch.float32)
-        self.labels   = torch.tensor(labels, dtype=torch.long)
+        self.features = torch.tensor(features, dtype=torch.float32)#.to(device) #TODO REM
+        self.labels   = torch.tensor(labels, dtype=torch.long)#.to(device) #TODO REM
 
     def __len__(self):
         return len(self.features)
@@ -96,23 +104,85 @@ class GraphImageDataset(PyGDataset):
         return graph
 
 class ReIDModel(nn.Module):
-    def __init__(self, gnn_out_dim=256, emb_dim=124):
+    def __init__(self, in_dim=14, hidden_dim=256, gnn_out_dim=256, emb_dim=512, use_hybrid_pooling=True):
         super().__init__()
-        self.encoder = GNNEncoder(in_dim=14, hidden_dim=256, out_dim=gnn_out_dim)
+        # Initialize the GNN Encoder with provided params
+        self.encoder = GNNEncoder(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=gnn_out_dim)
+        
+        # Calculate the actual size coming out of the GNN
+        # If pooling Mean + Max, the dimension is doubled
+        self.gnn_feature_size = gnn_out_dim * 2 if use_hybrid_pooling else gnn_out_dim
+
         self.head = nn.Sequential(
-            nn.Linear(gnn_out_dim, 256),
+            nn.Linear(self.gnn_feature_size, hidden_dim),
+            nn.BatchNorm1d(hidden_dim), # Added for training stability at 140k scale
             nn.ReLU(),
-            nn.Linear(256, 256),
-            nn.ReLU(),
-            nn.Linear(256, emb_dim),
+            nn.Linear(hidden_dim, emb_dim),
         )
 
     def forward(self, data):
-        z = self.encoder(data)
+        # 1. Extract graph-level features
+        z = self.encoder(data) 
+        
+        # 2. Project to Re-ID embedding space
         z = self.head(z)
-        z = F.normalize(z, dim=1)
-        return z
+        
+        # 3. L2 Normalize for Cosine Similarity / Metric Learning
+        return F.normalize(z, p=2, dim=1)
     
+    def save(self, args, label_encoder=None, save_dir="checkpoints_long_run"):
+        """Saves weights, metadata, and hyperparameters with attribute safety."""
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+
+        # --- DEFENSIVE CHECK ---
+        # If self.save_params doesn't exist (e.g. model was init'd before code update),
+        # we define a fallback so the script doesn't crash.
+        if hasattr(self, 'save_params'):
+            hyperparams = self.save_params
+        else:
+            print("Warning: 'save_params' not found in model. Using default fallback.")
+            hyperparams = {
+                'in_dim': 14,
+                'hidden_dim': 512,
+                'gnn_out_dim': 256,
+                'emb_dim': 512,
+                'use_hybrid_pooling': True
+            }
+
+        # Generate unique filename
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+        # Using getattr for args safety as well
+        species = getattr(args, 'holdout_species', 'universal') or 'universal'
+        model_name = f"gnn_reid_{species}_{timestamp}.pth"
+        save_path = os.path.join(save_dir, model_name)
+
+        # Prepare payload
+        payload = {
+            'model_state_dict': self.state_dict(),
+            'hyperparameters': hyperparams,
+            'args': vars(args) if hasattr(args, '__dict__') else args,
+            'label_encoder_classes': label_encoder.classes_ if label_encoder else None,
+            'timestamp': timestamp
+        }
+
+        print(f"Saving model to {save_path}...")
+        torch.save(payload, save_path)
+        print(f"--> Save complete.")
+        return save_path
+
+    @staticmethod
+    def load(checkpoint_path, device='cpu'):
+        """Reconstructs the model from a saved checkpoint."""
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        
+        # Initialize model with saved hyperparams
+        model = ReIDModel(**checkpoint['hyperparameters'])
+        model.load_state_dict(checkpoint['model_state_dict'])
+        model.to(device)
+        model.eval()
+        
+        return model, checkpoint.get('label_encoder_classes')
 
 def train_one_epoch(loader, model, optimizer, margin=1.0):
     model.train()
@@ -136,8 +206,10 @@ def train_one_epoch(loader, model, optimizer, margin=1.0):
 
 def train(loader, model, optimizer, num_epochs):
     for i in range(num_epochs):
-        batchloss = train_one_epoch(loader, model, optimizer, margin=0.3)
+        batchloss = train_one_epoch(loader, model, optimizer, margin=1)
         print(f"epoch {i} batchloss: {batchloss}")
+        if i % 5 == 0:
+            _=model.save(args)
 
 
 def knn_accuracy(embeddings, labels, k=4):
@@ -151,7 +223,6 @@ def knn_accuracy(embeddings, labels, k=4):
             correct += 1
 
     return correct / len(labels)
-
 
 
 def eval(model, loader, closed_set: bool):
@@ -230,7 +301,7 @@ def eval(model, loader, closed_set: bool):
 
     # 4. Open-Set Specific Clustering Metrics
     if not closed_set:
-        memory = ec.IdentityMemory(threshold=0.30, max_exemplars_per_identity=10)
+        memory = ec.IdentityMemory(threshold=0.70, max_exemplars_per_identity=10)
         predicted_ids = [memory.upsert(torch.from_numpy(e))[0] for e in embeddings]
         
         ari = adjusted_rand_score(labels, predicted_ids)
@@ -260,9 +331,9 @@ def accuracy_to_color(acc_percent: float) -> str:
 
 def main(args):
     # Setup Paths
-    csv_path = "src/images/reid-10k/metadata.csv"
-    img_root = "src/images/reid-10k"  # Base directory where dataset folders live
-    cache_pool = "src/images/reid-10k/graph_cache_pool"
+    csv_path = "src/images/metadata.csv"
+    img_root = "src/images"  # Base directory where dataset folders live
+    cache_pool = "src/images/graph_cache_pool"
 
     # 1. Load the Universal Metadata
     print("\n[ Loading Metadata ]")
@@ -315,7 +386,7 @@ def main(args):
         mode=args.data_mode,
         n_segments=args.segments,
         img_size= args.img_size,
-        rebuild_cache=args.img_size
+        rebuild_cache=args.rebuild
     )
     
     print("\n[ Preparing Test/Holdout Data ]")
@@ -328,20 +399,43 @@ def main(args):
     )
 
     # DataLoaders
-    batch_sampler = PKBatchSampler(train_df["global_label"].values, P=8, K=4)
+    batch_sampler = PKBatchSampler(train_df["global_label"].values, P=32, K=8)
     train_loader = DataLoader(train_dataset, batch_sampler=batch_sampler, num_workers=args.workers)
     test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=args.workers)
 
     # Model & Optimizer
-    model = ReIDModel(gnn_out_dim=256, emb_dim=124).to(device)
+    model = ReIDModel(in_dim=14,hidden_dim=512, gnn_out_dim=256, emb_dim=512)#.to(device) #TODO REM
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
     # Train & Evaluate
     train(train_loader, model, optimizer, num_epochs=args.epochs)
-    
+    # --- Saving the Results ---
+    print("\n[ Saving Model ]")
+    save_dir = "checkpoints"
+    os.makedirs(save_dir, exist_ok=True)
+
+    # Create a unique name based on the holdout or timestamp
+    print(f"Saving model...")
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+    model_name = f"gnn_reid_{args.holdout_species or 'universal'}_{timestamp}.pth"
+    save_path = os.path.join(save_dir, model_name)
+
+    # Save weights, label mapping, and hyperparameters
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'label_encoder_classes': le.classes_,
+        'args': args,
+        'in_dim': 14, # From your ReIDModel init
+        'hidden_dim': 512,
+        'gnn_out_dim': 256,
+        'emb_dim': 512
+    }, save_path)
+
+    print(f"--> Model and metadata saved to: {save_path}")
     # Evaluate as an Open Set since the holdout data contains unseen IDs
     print(f"\nEvaluating on Holdout Set...")
     eval(model, test_loader, closed_set=False)
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Wildlife Re-ID GNN Trainer")
     

@@ -6,7 +6,7 @@ from skimage.io import imread
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.data import Data
-from torch_geometric.nn import GCNConv, GATConv, global_mean_pool
+from torch_geometric.nn import GCNConv, GATConv, GATv2Conv, global_mean_pool, global_max_pool
 from PIL import Image
 from helper import visualize_superpixels, visualize_superpixels_with_graph, per_pixel_hog_bins
 
@@ -86,23 +86,40 @@ def image_to_superpixel_graph(img, n_segments=300, hog_bins=9, hog_signed=False,
     return data
 
 class GNNEncoder(nn.Module):
-    def __init__(self, in_dim=14, hidden_dim=256, out_dim=256):
+    def __init__(self, in_dim=14, hidden_dim=512, out_dim=512):
         super().__init__()
-        self.conv1 = GATConv(in_dim, hidden_dim)
-        self.conv2 = GATConv(hidden_dim, hidden_dim)
-        self.lin = nn.Linear(hidden_dim, out_dim)
-        self.output_dim = out_dim
+        self.conv1 = GATv2Conv(in_dim, hidden_dim//8, heads = 8)
+        self.norm1 = nn.LayerNorm(hidden_dim)
+
+        self.conv2 = GATv2Conv(hidden_dim, hidden_dim // 8, heads = 8)
+        self.norm2 = nn.LayerNorm(hidden_dim)
+
+        self.conv3 = GATv2Conv(hidden_dim, out_dim // 8, heads = 8)
+        self.norm3 = nn.LayerNorm(out_dim)
 
     def forward(self, data):
         
         x, edge_index, batch = data.x, data.edge_index, data.batch
 
-        x = F.relu(self.conv1(x, edge_index))
-        x = F.relu(self.conv2(x, edge_index))
+        # Layer 1
+        x = self.norm1(F.elu(self.conv1(x, edge_index)))
 
-        # Graph-level embedding via global pooling
-        x = global_mean_pool(x, batch)
-        return self.lin(x)
+        # Layer 2
+        identity = x
+        x = self.norm2(F.elu(self.conv2(x,edge_index)))
+        x = x + identity #Residual connection
+
+        # Layer 3
+
+        x = self.norm3(F.elu(self.conv3(x,edge_index)))
+
+
+        # We pool the node-level features 'x' into graph-level features
+        pooled_mean = global_mean_pool(x, batch) # Shape: [batch_size, out_dim]
+        pooled_max = global_max_pool(x, batch)   # Shape: [batch_size, out_dim]
+        
+        # Concatenate to get the final [batch_size, out_dim * 2] embedding
+        return torch.cat([pooled_mean, pooled_max], dim=1)
 """
 if __name__ == "__main__":
     # --------------------------------------------------

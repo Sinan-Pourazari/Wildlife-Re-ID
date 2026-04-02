@@ -25,7 +25,7 @@ def process_single_image(filename, root_dir, cache_dir, n_segments, rebuild, max
     cache_path = os.path.join(cache_subdir, f"seg{n_segments}_{safe_filename}")
 
     if not rebuild and os.path.exists(cache_path):
-        return True
+        return False
 
     try:
         # Ensure the dataset-specific subfolder exists
@@ -271,7 +271,7 @@ class UniversalGraphDataset(PyGDataset):
         
         # We pass n_jobs=-1 to use ALL available CPU cores.
         # If you want to leave some cores for browsing/other tasks, use -2 or -4.
-        n_jobs = -2
+        n_jobs = -1
         
         # The 'delayed' wrapper prepares the function calls
         tasks = (
@@ -293,14 +293,15 @@ class UniversalGraphDataset(PyGDataset):
         )
 
         # Count successes/errors
-        processed = sum(1 for r in results if r is True)
+        newly_created = results.count(True)
+        skipped = results.count(False)
         errors = [r for r in results if isinstance(r, str)]
-        
+
         print(f"\n[ WARMUP COMPLETE ]")
-        print(f"--> New graphs created: {processed}")
-        print(f"--> Images skipped (already cached): {len(results) - processed - len(errors)}")
+        print(f"--> New graphs created: {newly_created}")
+        print(f"--> Images skipped (already cached): {skipped}")
         if errors:
-            print(f"--> Errors encountered: {len(errors)} (check logs)")
+            print(f"--> Errors encountered: {len(errors)}")
 
     def len(self):
         return len(self.samples)
