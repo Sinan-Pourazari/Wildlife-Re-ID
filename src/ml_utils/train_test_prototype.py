@@ -313,7 +313,9 @@ def main(args):
         root_dir=img_root, 
         cache_dir=cache_pool, 
         mode=args.data_mode,
-        n_segments=args.segments
+        n_segments=args.segments,
+        img_size= args.img_size,
+        rebuild_cache=args.img_size
     )
     
     print("\n[ Preparing Test/Holdout Data ]")
@@ -352,6 +354,8 @@ if __name__ == "__main__":
                         help="How to load graphs. 'auto' chooses based on dataset size.")
     parser.add_argument("--segments", type=int, default=300, help="Number of superpixels (SLIC segments)")
     parser.add_argument("--rebuild", action="store_true", help="Force rebuild of graph cache (ignore existing .pt files)")
+    parser.add_argument("--img_size", type=int, default=1024, 
+                    help="Max dimension (width or height) for images before graph creation")
     
     # Hardware settings
     parser.add_argument("--workers", type=int, default=4, help="Number of CPU workers for DataLoader")
