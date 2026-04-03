@@ -33,8 +33,8 @@ else:
 print(f"Using {device} device")
 class SimpleDataset(TorchDataset):
     def __init__(self, features, labels):
-        self.features = torch.tensor(features, dtype=torch.float32)#.to(device) #TODO REM
-        self.labels   = torch.tensor(labels, dtype=torch.long)#.to(device) #TODO REM
+        self.features = torch.tensor(features, dtype=torch.float32).to(device) #TODO REM
+        self.labels   = torch.tensor(labels, dtype=torch.long).to(device) #TODO REM
 
     def __len__(self):
         return len(self.features)
@@ -331,10 +331,9 @@ def accuracy_to_color(acc_percent: float) -> str:
 
 def main(args):
     # Setup Paths
-    csv_path = "src/images/metadata.csv"
-    img_root = "src/images"  # Base directory where dataset folders live
-    cache_pool = "src/images/graph_cache_pool"
-
+    csv_path = "src/images/reid-10k/metadata.csv"
+    img_root = "src/images/reid-10k"  # Base directory where dataset folders live
+    cache_pool = "src/images/reid-10k/graph_cache_pool"
     # 1. Load the Universal Metadata
     print("\n[ Loading Metadata ]")
     df = pd.read_csv(csv_path)
@@ -399,12 +398,12 @@ def main(args):
     )
 
     # DataLoaders
-    batch_sampler = PKBatchSampler(train_df["global_label"].values, P=32, K=8)
-    train_loader = DataLoader(train_dataset, batch_sampler=batch_sampler, num_workers=args.workers)
+    batch_sampler = PKBatchSampler(train_df["global_label"].values, P=8, K=4)
+    train_loader = DataLoader(train_dataset, batch_sampler=batch_sampler, num_workers=args.workers, persistent_workers=True)
     test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=args.workers)
 
     # Model & Optimizer
-    model = ReIDModel(in_dim=14,hidden_dim=512, gnn_out_dim=256, emb_dim=512)#.to(device) #TODO REM
+    model = ReIDModel(in_dim=14,hidden_dim=512, gnn_out_dim=256, emb_dim=512).to(device) #TODO REM
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
     # Train & Evaluate

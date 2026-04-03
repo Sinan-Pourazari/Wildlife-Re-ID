@@ -248,12 +248,21 @@ class UniversalGraphDataset(PyGDataset):
 
         # 3. Memory Loading (Only if in memory mode)
         if self.mode == 'memory':
-            print("--> Loading graphs into RAM...")
-            for filename, label in tqdm(self.samples, desc="RAM Loading"):
+            print("--> Loading graphs into RAM (Parallel Threads)...")
+            
+            # Helper function for the parallel worker
+            def _load_single(sample):
+                filename, label = sample
                 cache_path = self._get_cache_path(filename)
                 graph = torch.load(cache_path, weights_only=False)
                 graph.y = torch.tensor([int(label)], dtype=torch.long)
-                self.graphs.append(graph)
+                return graph
+
+            # Use n_jobs=-1 to use all cores, backend="threading" to avoid memory copying overhead
+            self.graphs = Parallel(n_jobs=-1, backend="threading")(
+                delayed(_load_single)(sample) 
+                for sample in tqdm(self.samples, desc="RAM Loading")
+            )
 
     def _get_cache_path(self, filename):
             """
