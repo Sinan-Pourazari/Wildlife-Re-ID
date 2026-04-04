@@ -1,16 +1,40 @@
 import random
-from torch.utils.data import Dataset
-import cv2 as cv
 import os
+import io
 import pandas as pd
+import cv2 as cv
 from PIL import Image
-import torch
 from tqdm import tqdm
-from torch_geometric.data import Dataset as PyGDataset
-from gnn.gnn import image_to_superpixel_graph 
 from joblib import Parallel, delayed
+import torch
+import lmdb
+from torch_geometric.data import Dataset as PyGDataset
+from torch.utils.data import Dataset
+from gnn.gnn import image_to_superpixel_graph
 
+# Lazy import inside workers prevents pickling issues across OS environments
+def process_for_lmdb(filename, root_dir, n_segments, max_size=1024):
+    """
+    Worker function: Loads image, generates graph, and serializes it to bytes.
+    Does NOT write to disk/LMDB directly.
+    """
+        
+    img_path = os.path.join(root_dir, filename)
+    img = Image.open(img_path).convert("RGB")
 
+    # Resize Mechanic
+    if max(img.size) > max_size:
+        img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+
+    # Generate Graph
+    graph = image_to_superpixel_graph(img, n_segments=n_segments)
+        
+    # Serialize to bytes for LMDB
+    buffer = io.BytesIO()
+    torch.save(graph, buffer)
+        
+    return True, buffer.getvalue()
+    
 def process_single_image(filename, root_dir, cache_dir, n_segments, rebuild, max_size=1024):
     # --- 1. Identify Dataset Folder ---
     # Assuming path is "images/DatasetName/..."
@@ -220,97 +244,164 @@ class InMemoryGraphDataset(PyGDataset):
     def get(self, idx):
         return self.graphs[idx]
     
+import random
+import os
+import io
+import pandas as pd
+import cv2 as cv
+from PIL import Image
+from tqdm import tqdm
+from joblib import Parallel, delayed
+import torch
+import lmdb
+from torch_geometric.data import Dataset as PyGDataset
+from torch.utils.data import Dataset
+
+# Lazy import inside workers prevents pickling issues across OS environments
+def process_for_lmdb(filename, root_dir, n_segments, max_size=1024):
+    """
+    Worker function: Loads image, generates graph, and serializes it to bytes.
+    Does NOT write to disk/LMDB directly.
+    """
+    try:
+        from gnn.gnn import image_to_superpixel_graph
+        
+        img_path = os.path.join(root_dir, filename)
+        img = Image.open(img_path).convert("RGB")
+
+        # Resize Mechanic
+        if max(img.size) > max_size:
+            img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+
+        # Generate Graph
+        graph = image_to_superpixel_graph(img, n_segments=n_segments)
+        
+        # Serialize to bytes for LMDB
+        buffer = io.BytesIO()
+        torch.save(graph, buffer)
+        
+        return True, buffer.getvalue()
+    except Exception as e:
+        return False, f"Error {filename}: {str(e)}"
+
+
 class UniversalGraphDataset(PyGDataset):
-    def __init__(self, samples, root_dir, cache_dir, mode='auto', n_segments=300, rebuild_cache=False, img_size=1024):
+    def __init__(self, samples, root_dir, cache_dir, mode='auto', n_segments=300, rebuild_cache=False, img_size=1024, num_train_classes=None):
         super().__init__()
         self.samples = samples
         self.root_dir = root_dir
-        self.cache_dir = cache_dir
+        self.cache_dir = cache_dir  # This is now the directory holding data.mdb and lock.mdb
         self.n_segments = n_segments
-        self.graphs = []
         self.img_size = img_size
-        # 1. Determine Mode
+        self.graphs = []
+        
+        # We start with None to avoid multiprocessing pickling issues in DataLoader workers
+        self.env = None 
+
         if mode == 'auto':
-            # Threshold: ~8000 graphs is roughly 3-4 GB of RAM. 
             self.mode = 'memory' if len(samples) <= 8000 else 'lazy'
         else:
             self.mode = mode.lower()
 
         print(f"--> Initializing Dataset in [{self.mode.upper()}] mode for {len(samples)} samples.")
 
-        if not os.path.exists(self.cache_dir):
-            os.makedirs(self.cache_dir)
+        os.makedirs(self.cache_dir, exist_ok=True)
 
-        # 2. Pre-computation / Warmup Phase
-        # Even in lazy mode, we want to ensure all graphs exist on disk before training starts
-        # so we don't bottleneck the GPU during epoch 1.
+        # 1. Warmup / Generation Phase
         self._warmup_cache(rebuild_cache)
 
-        # 3. Memory Loading (Only if in memory mode)
+        # 2. Memory Loading (Only if in memory mode)
         if self.mode == 'memory':
-            print("--> Loading graphs into RAM (Parallel Threads)...")
-            
-            # Helper function for the parallel worker
-            def _load_single(sample):
-                filename, label = sample
-                cache_path = self._get_cache_path(filename)
-                graph = torch.load(cache_path, weights_only=False)
-                graph.y = torch.tensor([int(label)], dtype=torch.long)
-                return graph
+            self._load_all_to_memory()
 
-            # Use n_jobs=-1 to use all cores, backend="threading" to avoid memory copying overhead
-            self.graphs = Parallel(n_jobs=-1, backend="threading")(
-                delayed(_load_single)(sample) 
-                for sample in tqdm(self.samples, desc="RAM Loading")
+    def _init_db(self):
+        """Lazily initialize the LMDB environment inside the DataLoader worker."""
+        if self.env is None:
+            self.env = lmdb.open(
+                self.cache_dir,
+                readonly=True,
+                lock=False,       # crucial for PyTorch multi-worker DataLoader
+                readahead=False,  # disabling readahead improves random access speeds
+                meminit=False     # improves performance
             )
 
-    def _get_cache_path(self, filename):
-            """
-            Matches the logic in process_single_image to find the file 
-            within its dataset-specific subfolder.
-            """
-            parts = filename.split('/')
-            dataset_name = parts[1] if len(parts) > 1 else "unknown"
-            
-            safe_filename = os.path.basename(filename).rsplit('.', 1)[0] + ".pt"
-            return os.path.join(self.cache_dir, dataset_name, f"seg{self.n_segments}_{safe_filename}")
+    def _get_key(self, filename):
+        """Standardized byte-key generator for LMDB."""
+        return f"seg{self.n_segments}_{filename}".encode('utf-8')
 
     def _warmup_cache(self, rebuild):
-        print(f"\n[ CACHE WARMUP ] Checking {len(self.samples)} samples...")
+        print(f"\n[ CACHE WARMUP ] Checking {len(self.samples)} samples against LMDB...")
         
-        # We pass n_jobs=-1 to use ALL available CPU cores.
-        # If you want to leave some cores for browsing/other tasks, use -2 or -4.
-        n_jobs = -1
+        # 100GB map size. (This is virtual memory, it won't actually consume 100GB of disk space)
+        map_size = 100 * 1024 * 1024 * 1024 
+        env = lmdb.open(self.cache_dir, map_size=map_size)
+
+        # Gather existing keys to avoid redundant work
+        with env.begin() as txn:
+            existing_keys = set(txn.cursor().iternext(values=False))
+
+        # Filter down to tasks that actually need processing
+        tasks = []
+        for filename, _ in self.samples:
+            key = self._get_key(filename)
+            if not rebuild and key in existing_keys:
+                continue
+            tasks.append((key, filename))
+
+        if not tasks:
+            print("--> All graphs present in LMDB. Skipping generation.")
+            env.close()
+            return
+
+        print(f"--> Launching Parallel Warmup for {len(tasks)} missing graphs...")
         
-        # The 'delayed' wrapper prepares the function calls
-        tasks = (
-            delayed(process_single_image)(
-                filename, 
-                self.root_dir, 
-                self.cache_dir, 
-                self.n_segments, 
-                rebuild,
-                self.img_size
-            ) 
-            for filename, _ in self.samples
-        )
-        print(f"--> Launching Parallel Warmup using {os.cpu_count()} cores...")
-        
-        # Run the tasks and wrap with tqdm for the status bar
-        results = Parallel(n_jobs=n_jobs, backend="multiprocessing")(
-            tqdm(tasks, total=len(self.samples), desc="Generating Graphs", unit="img")
+        # Helper to wrap the task for Joblib
+        def wrapper(task):
+            key, filename = task
+            success, result = process_for_lmdb(filename, self.root_dir, self.n_segments, self.img_size)
+            return key, success, result
+
+        # return_as="generator" yields results as soon as workers finish them
+        results_gen = Parallel(n_jobs=-1, backend="multiprocessing", return_as="generator")(
+            delayed(wrapper)(task) for task in tasks
         )
 
-        # Count successes/errors
-        newly_created = results.count(True)
-        skipped = results.count(False)
-        errors = [r for r in results if isinstance(r, str)]
+        newly_created = 0
+        errors = []
+
+        # Single main-thread writer to LMDB (fast and safe)
+        with env.begin(write=True) as txn:
+            for key, success, result in tqdm(results_gen, total=len(tasks), desc="Writing to LMDB", unit="img"):
+                if success:
+                    txn.put(key, result)
+                    newly_created += 1
+                else:
+                    errors.append(result)
+
+        env.close()
 
         print(f"\n[ WARMUP COMPLETE ]")
-        print(f"--> New graphs created: {newly_created}")
-        print(f"--> Images skipped (already cached): {skipped}")
+        print(f"--> New graphs added to LMDB: {newly_created}")
         if errors:
             print(f"--> Errors encountered: {len(errors)}")
+
+    def _load_all_to_memory(self):
+        """Sequentially load all graphs into RAM (LMDB sequential read is extremely fast)."""
+        print("--> Loading graphs into RAM from LMDB...")
+        self._init_db()
+        
+        with self.env.begin() as txn:
+            for filename, label in tqdm(self.samples, desc="RAM Loading"):
+                key = self._get_key(filename)
+                graph_bytes = txn.get(key)
+                
+                if graph_bytes is None:
+                    raise KeyError(f"Graph not found in LMDB for key: {key.decode('utf-8')}")
+                
+                buffer = io.BytesIO(graph_bytes)
+                graph = torch.load(buffer, weights_only=False)
+                graph.y = torch.tensor([int(label)], dtype=torch.long)
+                self.graphs.append(graph)
 
     def len(self):
         return len(self.samples)
@@ -320,9 +411,24 @@ class UniversalGraphDataset(PyGDataset):
             # O(1) RAM access
             return self.graphs[idx]
         else:
-            # Disk streaming
+            # Disk streaming from LMDB
+            self._init_db() # Ensures the env is open for the specific worker process
+            
             filename, label = self.samples[idx]
-            cache_path = self._get_cache_path(filename)
-            graph = torch.load(cache_path, weights_only=False)
+            key = self._get_key(filename)
+            
+            with self.env.begin() as txn:
+                graph_bytes = txn.get(key)
+                
+            if graph_bytes is None:
+                raise KeyError(f"Missing key in LMDB: {key.decode('utf-8')}")
+                
+            buffer = io.BytesIO(graph_bytes)
+            graph = torch.load(buffer, weights_only=False)
             graph.y = torch.tensor([int(label)], dtype=torch.long)
+            
             return graph
+            
+    def __del__(self):
+        if hasattr(self, 'env') and self.env is not None:
+            self.env.close()

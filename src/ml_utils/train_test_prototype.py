@@ -140,7 +140,7 @@ class ReIDModel(nn.Module):
         
         return embeddings
     
-    def save(self, args, label_encoder=None, save_dir="checkpoints_long_run"):
+    def save(self, args, label_encoder=None, save_dir="checkpoints_long_run_v2"):
         """Saves weights, metadata, and hyperparameters with attribute safety."""
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
@@ -175,7 +175,7 @@ class ReIDModel(nn.Module):
             'label_encoder_classes': label_encoder.classes_ if label_encoder else None,
             'timestamp': timestamp
         }
-
+    
         print(f"Saving model to {save_path}...")
         torch.save(payload, save_path)
         print(f"--> Save complete.")
@@ -226,7 +226,8 @@ def train(loader, model, optimizer, num_epochs):
     for i in range(num_epochs):
         batchloss = train_one_epoch(loader, model, optimizer, margin=1)
         print(f"epoch {i} batchloss: {batchloss}")
-        _=model.save(args)
+        if i % 5 ==0:
+            _=model.save(args)
 
 
 def knn_accuracy(embeddings, labels, k=4):
@@ -368,7 +369,7 @@ def main(args):
     le = LabelEncoder()
     df['global_label'] = le.fit_transform(df['global_identity'])
 
-    # 3. Apply Holdout Logic
+# 3. Apply Holdout Logic
     if args.holdout_species:
         print(f"--> HOLDING OUT SPECIES: {args.holdout_species}")
         train_df = df[df['species'] != args.holdout_species].reset_index(drop=True)
@@ -386,27 +387,27 @@ def main(args):
         train_labels, test_labels = train_test_split(unique_labels, test_size=0.2, random_state=42)
         train_df = df[df["global_label"].isin(train_labels)].reset_index(drop=True)
         test_df = df[df["global_label"].isin(test_labels)].reset_index(drop=True)
-        
-        # Squash the remaining training labels to be strictly 0 to (N-1)
-        train_le = LabelEncoder()
-        train_df['contiguous_label'] = train_le.fit_transform(train_df['global_label'])
-        
-        # Calculate the exact number of classes for THIS specific run
-        num_train_classes = len(train_le.classes_)
-        print(f"--> Training Classes after split: {num_train_classes}")
 
-        # 4. Create Sample Lists (mapping path -> label)
-        # Train uses the NEW contiguous labels
-        train_samples = list(zip(train_df["path"], train_df["contiguous_label"]))
-        
-        # Test can still use global_labels because Eval/Triplet doesn't care about gaps
-        test_samples = list(zip(test_df["path"], test_df["global_label"]))
-        # 4. Create Sample Lists (mapping path -> label)
-        train_samples = list(zip(train_df["path"], train_df["global_label"]))
-        test_samples = list(zip(test_df["path"], test_df["global_label"]))
 
-        print(f"Train size: {len(train_samples)} images | Test size: {len(test_samples)} images")
 
+    # No matter how the split was made, we must ensure training labels 
+    # are strictly 0 to (N-1) for the Cross Entropy classifier.
+    print("\n[ Processing Labels ]")
+    train_le = LabelEncoder()
+    train_df['contiguous_label'] = train_le.fit_transform(train_df['global_label'])
+    
+    # Calculate the number of classes for the model init
+    num_train_classes = len(train_le.classes_)
+    print(f"--> Active Training Classes: {num_train_classes}")
+
+    # 4. Create Sample Lists (mapping path -> label)
+    # Train uses the NEW contiguous labels
+    train_samples = list(zip(train_df["path"], train_df["contiguous_label"]))
+    
+    # Test uses the global_labels (Evaluation and Triplet loss don't care about gaps)
+    test_samples = list(zip(test_df["path"], test_df["global_label"]))
+
+    print(f"Train size: {len(train_samples)} images | Test size: {len(test_samples)} images")
     # --- Initialize Universal Datasets ---
     print("\n[ Preparing Training Data ]")
     train_dataset = UniversalGraphDataset(
@@ -436,7 +437,7 @@ def main(args):
     test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=args.workers)
 
     # Model & Optimizer
-    model = ReIDModel(in_dim=14,hidden_dim=512, gnn_out_dim=256, emb_dim=512).to(device) #TODO REM
+    model = ReIDModel(num_classes=num_train_classes,in_dim=14,hidden_dim=512, gnn_out_dim=256, emb_dim=512).to(device) #TODO REM
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
     # Train & Evaluate
