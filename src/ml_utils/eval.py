@@ -74,9 +74,9 @@ def compute_reid_metrics(features, labels):
     
     return rank_1, rank_5, rank_10, mAP
 
-def compute_clustering_metrics(embeddings, labels, threshold=0.70):
+def compute_clustering_metrics(embeddings, labels, threshold=0.30):
     """Computes Open-Set metrics: ARI, NMI using IdentityMemory."""
-    memory = ec.IdentityMemory(threshold=threshold, max_exemplars_per_identity=10)
+    memory = ec.IdentityMemory(threshold=threshold, max_exemplars_per_identity=5)
     
     predicted_ids = []
     for emb in embeddings:
@@ -187,7 +187,7 @@ def main(args):
         n_segments=args.segments,
         rebuild_cache=False 
     )
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, persistent_workers=True)
     
     pth_files = glob.glob(os.path.join(args.checkpoints_dir, "*.pth"))
     if not pth_files:
