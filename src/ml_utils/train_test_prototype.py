@@ -104,7 +104,7 @@ class GraphImageDataset(PyGDataset):
         return graph
 
 class ReIDModel(nn.Module):
-    def __init__(self, in_dim=14, hidden_dim=256, gnn_out_dim=256, emb_dim=512, use_hybrid_pooling=True):
+    def __init__(self, num_classes, in_dim=14, hidden_dim=256, gnn_out_dim=256, emb_dim=512, use_hybrid_pooling=True):
         super().__init__()
         # Initialize the GNN Encoder with provided params
         self.encoder = GNNEncoder(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=gnn_out_dim)
@@ -120,15 +120,25 @@ class ReIDModel(nn.Module):
             nn.Linear(hidden_dim, emb_dim),
         )
 
+        # Classification head (Used ONLY during training for CE loss)
+        self.classifier = nn.Linear(emb_dim, num_classes)
+
     def forward(self, data):
         # 1. Extract graph-level features
         z = self.encoder(data) 
         
         # 2. Project to Re-ID embedding space
-        z = self.head(z)
+        features = self.head(z)
         
         # 3. L2 Normalize for Cosine Similarity / Metric Learning
-        return F.normalize(z, p=2, dim=1)
+        embeddings = F.normalize(features, p=2, dim=1)
+
+        if self.training:
+            # Return both for the dual-loss training loop
+            logits = self.classifier(features) # Use un-normalized features for CE
+            return embeddings, logits
+        
+        return embeddings
     
     def save(self, args, label_encoder=None, save_dir="checkpoints_long_run"):
         """Saves weights, metadata, and hyperparameters with attribute safety."""
@@ -187,13 +197,21 @@ class ReIDModel(nn.Module):
 def train_one_epoch(loader, model, optimizer, margin=1.0):
     model.train()
     total = 0.0
+    criterion_ce = nn.CrossEntropyLoss()
 
     for data in loader:
         data = data.to(device)
         labels = data.y.view(-1).to(device)
 
-        emb = model(data)
-        loss = batch_semi_hard_triplet_loss(emb, labels, margin=margin)
+        # Unpack the two outputs
+        emb, logits = model(data)
+
+        # Calculate losses
+        loss_triplet = batch_hard_triplet_loss(emb, labels, margin=margin)
+        loss_ce = criterion_ce(logits, labels)
+
+        # Combined Loss (1:1 weight is usually a good start)
+        loss = loss_triplet + loss_ce
 
         optimizer.zero_grad()
         loss.backward()
@@ -208,8 +226,7 @@ def train(loader, model, optimizer, num_epochs):
     for i in range(num_epochs):
         batchloss = train_one_epoch(loader, model, optimizer, margin=1)
         print(f"epoch {i} batchloss: {batchloss}")
-        if i % 5 == 0:
-            _=model.save(args)
+        _=model.save(args)
 
 
 def knn_accuracy(embeddings, labels, k=4):
@@ -369,16 +386,31 @@ def main(args):
         train_labels, test_labels = train_test_split(unique_labels, test_size=0.2, random_state=42)
         train_df = df[df["global_label"].isin(train_labels)].reset_index(drop=True)
         test_df = df[df["global_label"].isin(test_labels)].reset_index(drop=True)
+        
+        # Squash the remaining training labels to be strictly 0 to (N-1)
+        train_le = LabelEncoder()
+        train_df['contiguous_label'] = train_le.fit_transform(train_df['global_label'])
+        
+        # Calculate the exact number of classes for THIS specific run
+        num_train_classes = len(train_le.classes_)
+        print(f"--> Training Classes after split: {num_train_classes}")
 
-    # 4. Create Sample Lists (mapping path -> label)
-    train_samples = list(zip(train_df["path"], train_df["global_label"]))
-    test_samples = list(zip(test_df["path"], test_df["global_label"]))
+        # 4. Create Sample Lists (mapping path -> label)
+        # Train uses the NEW contiguous labels
+        train_samples = list(zip(train_df["path"], train_df["contiguous_label"]))
+        
+        # Test can still use global_labels because Eval/Triplet doesn't care about gaps
+        test_samples = list(zip(test_df["path"], test_df["global_label"]))
+        # 4. Create Sample Lists (mapping path -> label)
+        train_samples = list(zip(train_df["path"], train_df["global_label"]))
+        test_samples = list(zip(test_df["path"], test_df["global_label"]))
 
-    print(f"Train size: {len(train_samples)} images | Test size: {len(test_samples)} images")
+        print(f"Train size: {len(train_samples)} images | Test size: {len(test_samples)} images")
 
     # --- Initialize Universal Datasets ---
     print("\n[ Preparing Training Data ]")
     train_dataset = UniversalGraphDataset(
+        num_train_classes = num_train_classes,
         samples=train_samples, 
         root_dir=img_root, 
         cache_dir=cache_pool, 
@@ -390,6 +422,7 @@ def main(args):
     
     print("\n[ Preparing Test/Holdout Data ]")
     test_dataset = UniversalGraphDataset(
+        num_train_classes = num_train_classes,
         samples=test_samples, 
         root_dir=img_root, 
         cache_dir=cache_pool, 
@@ -399,7 +432,7 @@ def main(args):
 
     # DataLoaders
     batch_sampler = PKBatchSampler(train_df["global_label"].values, P=8, K=4)
-    train_loader = DataLoader(train_dataset, batch_sampler=batch_sampler, num_workers=args.workers, persistent_workers=True)
+    train_loader = DataLoader(train_dataset, batch_sampler=batch_sampler, num_workers=args.workers, persistent_workers=True, prefetch_factor=4)
     test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=args.workers)
 
     # Model & Optimizer
@@ -427,7 +460,8 @@ def main(args):
         'in_dim': 14, # From your ReIDModel init
         'hidden_dim': 512,
         'gnn_out_dim': 256,
-        'emb_dim': 512
+        'emb_dim': 512,
+        'num_classes': num_train_classes
     }, save_path)
 
     print(f"--> Model and metadata saved to: {save_path}")
