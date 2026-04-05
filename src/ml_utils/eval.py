@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from torch_geometric.loader import DataLoader
 from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 from sklearn.model_selection import train_test_split
+import hdbscan
 
 # Import from your existing modules
 from train_test_prototype import ReIDModel, reduce_to_2d
@@ -74,19 +75,17 @@ def compute_reid_metrics(features, labels):
     
     return rank_1, rank_5, rank_10, mAP
 
-def compute_clustering_metrics(embeddings, labels, threshold=0.30):
-    """Computes Open-Set metrics: ARI, NMI using IdentityMemory."""
-    memory = ec.IdentityMemory(threshold=threshold, max_exemplars_per_identity=5)
+def compute_clustering_metrics(embeddings, labels):
+    # min_cluster_size=2 is key for Re-ID where some animals have few photos
+    clusterer = hdbscan.HDBSCAN(min_cluster_size=5, min_samples=1, metric='euclidean')
+    predicted_ids = clusterer.fit_predict(embeddings.numpy())
     
-    predicted_ids = []
-    for emb in embeddings:
-        pid, _, _ = memory.upsert(emb)
-        predicted_ids.append(pid)
-        
     ari = adjusted_rand_score(labels.numpy(), predicted_ids)
     nmi = normalized_mutual_info_score(labels.numpy(), predicted_ids)
     
-    return ari, nmi, len(memory.memory)
+    # Count clusters (ignoring -1 noise)
+    discovered_ids = len(set(predicted_ids)) - (1 if -1 in predicted_ids else 0)
+    return ari, nmi, discovered_ids
 
 def plot_benchmark_results(results_df, save_dir):
     """Generates two bar charts: Retrieval (Rank/mAP) and Clustering (ARI/NMI)."""
@@ -166,9 +165,8 @@ def get_test_samples(args):
     elif args.holdout_dataset:
         test_df = df[df['dataset'] == args.holdout_dataset].reset_index(drop=True)
     else:
-        unique_labels = df["global_label"].unique()
-        _, test_labels = train_test_split(unique_labels, test_size=0.2, random_state=42)
-        test_df = df[df["global_label"].isin(test_labels)].reset_index(drop=True)
+        print("Loading exact test split from training run...")
+        test_df = pd.read_csv("current_test_split.csv")
 
     return list(zip(test_df["path"], test_df["global_label"]))
 
@@ -269,7 +267,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Wildlife Re-ID Comprehensive Evaluator")
     
     # Directory & Data Config
-    parser.add_argument("--checkpoints_dir", type=str, default="checkpoints_long_run", help="Directory containing .pth models")
+    parser.add_argument("--checkpoints_dir", type=str, default="checkpoints_long_run_v2", help="Directory containing .pth models")
     parser.add_argument("--csv_path", type=str, default="src/images/reid-10k/metadata.csv", help="Dataset metadata CSV")
     parser.add_argument("--root_dir", type=str, default="src/images/reid-10k", help="Base directory for image files")
     parser.add_argument("--cache_dir", type=str, default="src/images/reid-10k/graph_cache_pool", help="Cache directory for PT graphs")
