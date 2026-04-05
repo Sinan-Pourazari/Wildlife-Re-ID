@@ -227,6 +227,9 @@ class ReIDModel(nn.Module):
 def train_one_epoch(loader, model, optimizer, margin=1.0):
     model.train()
     total = 0.0
+    total_triplet = 0.0
+    total_ce = 0.0
+    total_compact = 0.0
     criterion_ce = nn.CrossEntropyLoss()
     for data in loader:
         data = data.to(device)
@@ -249,13 +252,13 @@ def train_one_epoch(loader, model, optimizer, margin=1.0):
 
         total += float(loss.item())
 
-    return total / len(loader)
+    return total / len(loader), total_triplet / len(loader), total_ce / len(loader), total_compact / len(loader) 
 
 
 def train(loader, model, optimizer, num_epochs, start_epoch=0, args=None):
     for i in range(start_epoch, num_epochs):
-        batchloss = train_one_epoch(loader, model, optimizer, margin=1)
-        print(f"epoch {i} batchloss: {batchloss}")
+        total_batchloss, triplet, ce, compact = train_one_epoch(loader, model, optimizer, margin=1)
+        print(f"epoch {i} batchloss: {total_batchloss}, triplet loss: {triplet}, cross entropy loss: {ce}, compactness loss: {compact}")
         if i % 2 ==0:
             _=model.save(args,eppoch=i, optimizer=optimizer)
 
