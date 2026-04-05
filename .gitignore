@@ -3,7 +3,7 @@
 # Local virtualenv in repo root
 .venv_wildlife/*
 .venv*/
-
+.venv_wildlife*
 # Local datasets / large media
 /jpg/
 /py/images/**/*.jpg
@@ -13,6 +13,7 @@
 /src/test_vid/*
 *.jpg
 *.csv
+/checkpoints*/
 
 # Local test videos and outputs
 /test_vid/
