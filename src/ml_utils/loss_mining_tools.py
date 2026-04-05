@@ -107,3 +107,33 @@ def batch_semi_hard_triplet_loss(emb, labels, margin=0.2):
     chosen_neg = torch.where(use_semi, closest_semi, closest_neg)
 
     return F.relu(hardest_pos - chosen_neg + margin).mean()
+
+def batch_compactness_loss(embeddings, labels):
+    """
+    Calculates the variance of embeddings from their class centers within a single batch.
+    Penalizes embeddings that stray too far from their batch-wise center.
+    """
+    loss = 0.0
+    unique_labels = torch.unique(labels)
+    valid_classes = 0
+    
+    for label in unique_labels:
+        # 1. Find all embeddings for this specific animal in the batch
+        mask = (labels == label)
+        class_embs = embeddings[mask]
+        
+        # 2. We only calculate variance if there are at least 2 images of this animal
+        if len(class_embs) > 1:
+            # Calculate the "center of mass" for this animal in this batch
+            center = class_embs.mean(dim=0)
+            
+            # Penalize the Mean Squared Error (distance) between each image and the center
+            loss += F.mse_loss(class_embs, center.expand_as(class_embs))
+            valid_classes += 1
+            
+    # Average the loss across the number of valid identities in the batch
+    if valid_classes > 0:
+        return loss / valid_classes
+    
+    # Fallback if no classes had >1 image (shouldn't happen with your PK sampler)
+    return torch.tensor(0.0, device=embeddings.device, requires_grad=True)

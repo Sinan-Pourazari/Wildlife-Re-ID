@@ -10,7 +10,7 @@ from sklearn.neighbors import NearestNeighbors
 from sklearn.model_selection import train_test_split
 import embedding_clusterings as ec
 from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
-from loss_mining_tools import batch_hard_triplet_loss, PKBatchSampler, batch_semi_hard_triplet_loss
+from loss_mining_tools import batch_hard_triplet_loss, PKBatchSampler, batch_semi_hard_triplet_loss, batch_compactness_loss
 from PIL import Image
 from torch_geometric.loader import DataLoader
 from torch_geometric.data import Dataset as PyGDataset
@@ -106,6 +106,14 @@ class GraphImageDataset(PyGDataset):
 class ReIDModel(nn.Module):
     def __init__(self, num_classes, in_dim=14, hidden_dim=256, gnn_out_dim=256, emb_dim=512, use_hybrid_pooling=True):
         super().__init__()
+        self.save_params = {
+            'num_classes': num_classes,
+            'in_dim': in_dim,
+            'hidden_dim': hidden_dim,
+            'gnn_out_dim': gnn_out_dim,
+            'emb_dim': emb_dim,
+            'use_hybrid_pooling': use_hybrid_pooling
+        }
         # Initialize the GNN Encoder with provided params
         self.encoder = GNNEncoder(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=gnn_out_dim)
         
@@ -116,7 +124,8 @@ class ReIDModel(nn.Module):
         self.head = nn.Sequential(
             nn.Linear(self.gnn_feature_size, hidden_dim),
             nn.BatchNorm1d(hidden_dim), # Added for training stability at 140k scale
-            nn.ReLU(),
+            nn.GELU(),
+            nn.Dropout(p=0.1),
             nn.Linear(hidden_dim, emb_dim),
         )
 
@@ -140,7 +149,7 @@ class ReIDModel(nn.Module):
         
         return embeddings
     
-    def save(self, args, label_encoder=None, save_dir="checkpoints_long_run_v2"):
+    def save(self, args, label_encoder=None, save_dir="checkpoints_long_run_v3"):
         """Saves weights, metadata, and hyperparameters with attribute safety."""
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
@@ -183,12 +192,31 @@ class ReIDModel(nn.Module):
 
     @staticmethod
     def load(checkpoint_path, device='cpu'):
-        """Reconstructs the model from a saved checkpoint."""
+        """Reconstructs the model, handling both old and new checkpoint formats."""
         checkpoint = torch.load(checkpoint_path, map_location=device)
         
-        # Initialize model with saved hyperparams
-        model = ReIDModel(**checkpoint['hyperparameters'])
-        model.load_state_dict(checkpoint['model_state_dict'])
+        hyperparams = checkpoint.get('hyperparameters', {})
+        if not hyperparams:
+            hyperparams = {
+                'in_dim': checkpoint.get('in_dim', 14),
+                'hidden_dim': checkpoint.get('hidden_dim', 512),
+                'gnn_out_dim': checkpoint.get('gnn_out_dim', 256),
+                'emb_dim': checkpoint.get('emb_dim', 512)
+            }
+
+        if 'num_classes' not in hyperparams:
+            hyperparams['num_classes'] = 1
+
+        model = ReIDModel(**hyperparams)
+        
+        # FILTER OUT THE CLASSIFIER
+        state_dict = checkpoint['model_state_dict']
+        # Create a new dict that excludes anything belonging to the CE head
+        filtered_state_dict = {k: v for k, v in state_dict.items() if not k.startswith('classifier.')}
+        
+        # Load the filtered weights
+        model.load_state_dict(filtered_state_dict, strict=False)
+        
         model.to(device)
         model.eval()
         
@@ -198,7 +226,6 @@ def train_one_epoch(loader, model, optimizer, margin=1.0):
     model.train()
     total = 0.0
     criterion_ce = nn.CrossEntropyLoss()
-
     for data in loader:
         data = data.to(device)
         labels = data.y.view(-1).to(device)
@@ -209,9 +236,10 @@ def train_one_epoch(loader, model, optimizer, margin=1.0):
         # Calculate losses
         loss_triplet = batch_hard_triplet_loss(emb, labels, margin=margin)
         loss_ce = criterion_ce(logits, labels)
+        loss_compact = batch_compactness_loss(emb, labels)
 
-        # Combined Loss (1:1 weight is usually a good start)
-        loss = loss_triplet + loss_ce
+        # Combined Loss
+        loss = loss_triplet + (0.25 * loss_ce) + (0.1 * loss_compact)
 
         optimizer.zero_grad()
         loss.backward()
@@ -226,7 +254,7 @@ def train(loader, model, optimizer, num_epochs):
     for i in range(num_epochs):
         batchloss = train_one_epoch(loader, model, optimizer, margin=1)
         print(f"epoch {i} batchloss: {batchloss}")
-        if i % 5 ==0:
+        if i % 2 ==0:
             _=model.save(args)
 
 
@@ -384,12 +412,12 @@ def main(args):
         # Standard Open-Set Split on the whole universe
         print("--> Standard Open-Set Split (No Holdout)")
         unique_labels = df["global_label"].unique()
-        train_labels, test_labels = train_test_split(unique_labels, test_size=0.2, random_state=42)
+        train_labels, test_labels = train_test_split(unique_labels, test_size=0.1, random_state=42)
         train_df = df[df["global_label"].isin(train_labels)].reset_index(drop=True)
         test_df = df[df["global_label"].isin(test_labels)].reset_index(drop=True)
+        test_df.to_csv("current_test_split.csv", index=False)
 
-
-
+    
     # No matter how the split was made, we must ensure training labels 
     # are strictly 0 to (N-1) for the Cross Entropy classifier.
     print("\n[ Processing Labels ]")
@@ -432,7 +460,7 @@ def main(args):
     )
 
     # DataLoaders
-    batch_sampler = PKBatchSampler(train_df["global_label"].values, P=8, K=4)
+    batch_sampler = PKBatchSampler(train_df["global_label"].values, P=64, K=2)
     train_loader = DataLoader(train_dataset, batch_sampler=batch_sampler, num_workers=args.workers, persistent_workers=True, prefetch_factor=4)
     test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=args.workers)
 
