@@ -149,7 +149,7 @@ class ReIDModel(nn.Module):
         
         return embeddings
     
-    def save(self, args, label_encoder=None, save_dir="checkpoints_long_run_v3"):
+    def save(self, args, epoch, optimizer, label_encoder=None, save_dir="checkpoints_long_run_v3"):
         """Saves weights, metadata, and hyperparameters with attribute safety."""
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
@@ -180,6 +180,8 @@ class ReIDModel(nn.Module):
         payload = {
             'model_state_dict': self.state_dict(),
             'hyperparameters': hyperparams,
+            'optimizer_state_dict': optimizer.state_dict(), # <--- NEW
+            'epoch': epoch,                                 # <--- NEW
             'args': vars(args) if hasattr(args, '__dict__') else args,
             'label_encoder_classes': label_encoder.classes_ if label_encoder else None,
             'timestamp': timestamp
@@ -250,12 +252,12 @@ def train_one_epoch(loader, model, optimizer, margin=1.0):
     return total / len(loader)
 
 
-def train(loader, model, optimizer, num_epochs):
-    for i in range(num_epochs):
+def train(loader, model, optimizer, num_epochs, start_epoch=0, args=None):
+    for i in range(start_epoch, num_epochs):
         batchloss = train_one_epoch(loader, model, optimizer, margin=1)
         print(f"epoch {i} batchloss: {batchloss}")
         if i % 2 ==0:
-            _=model.save(args)
+            _=model.save(args,eppoch=i, optimizer=optimizer)
 
 
 def knn_accuracy(embeddings, labels, k=4):
@@ -468,8 +470,31 @@ def main(args):
     model = ReIDModel(num_classes=num_train_classes,in_dim=14,hidden_dim=512, gnn_out_dim=256, emb_dim=512).to(device) #TODO REM
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
+    # --- NEW: RESUME LOGIC ---
+    start_epoch = 0
+    if args.resume:
+        if os.path.isfile(args.resume):
+            print(f"\n[ Resuming Training from: {args.resume} ]")
+            checkpoint = torch.load(args.resume, map_location=device)
+            
+            # 1. Load the full model weights (including classifier)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            
+            # 2. Load the optimizer's momentum buffers
+            if 'optimizer_state_dict' in checkpoint:
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                
+            # 3. Set the starting epoch
+            if 'epoch' in checkpoint:
+                start_epoch = checkpoint['epoch'] + 1 # Start on the *next* epoch
+                
+            print(f"--> Successfully loaded. Resuming at Epoch {start_epoch}...")
+        else:
+            print(f"WARNING: No checkpoint found at '{args.resume}'. Starting from scratch.")
+
     # Train & Evaluate
-    train(train_loader, model, optimizer, num_epochs=args.epochs)
+    # Pass the start_epoch and args into the train loop
+    train(train_loader, model, optimizer, num_epochs=args.epochs, start_epoch=start_epoch, args=args)
     # --- Saving the Results ---
     print("\n[ Saving Model ]")
     save_dir = "checkpoints"
@@ -521,6 +546,9 @@ if __name__ == "__main__":
                         help="Name of the dataset to hold out for testing (e.g., 'ATRW')")
     parser.add_argument("--holdout_species", type=str, default=None, 
                         help="Name of the species to hold out for testing (e.g., 'tiger')")
+    
+    # Resume training flag
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint .pth file to resume training")
     args = parser.parse_args()
     main(args)
 
@@ -627,3 +655,8 @@ def plot_embedding_2d(
             plt.text(cx, cy, str(lab), fontsize=9)
 
     plt.show()
+
+#TODO for IDs with only one image, add on the fly rdm iamge argumentation for positive pairs, should be fine with batch pre fetch enabled
+#TODO log individual loss components in addtiont to overall loss per epoch
+#TODO introduce real checkpointing
+#TODO add another Linear layer after the last to give the seperator head a chance to repopulate the dorpout neurons
