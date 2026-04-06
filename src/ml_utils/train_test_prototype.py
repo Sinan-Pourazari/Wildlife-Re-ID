@@ -10,7 +10,7 @@ from sklearn.neighbors import NearestNeighbors
 from sklearn.model_selection import train_test_split
 import embedding_clusterings as ec
 from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
-from loss_mining_tools import batch_hard_triplet_loss, PKBatchSampler, batch_semi_hard_triplet_loss, batch_compactness_loss
+from loss_mining_tools import batch_hard_triplet_loss, PKBatchSampler, batch_semi_hard_triplet_loss, batch_compactness_loss, batch_topk_triplet_loss
 from PIL import Image
 from torch_geometric.loader import DataLoader
 from torch_geometric.data import Dataset as PyGDataset
@@ -125,7 +125,7 @@ class ReIDModel(nn.Module):
             nn.Linear(self.gnn_feature_size, hidden_dim),
             nn.BatchNorm1d(hidden_dim), # Added for training stability at 140k scale
             nn.GELU(),
-            nn.Dropout(p=0.1),
+            #nn.Dropout(p=0.1),
             nn.Linear(hidden_dim, emb_dim),
         )
 
@@ -145,14 +145,14 @@ class ReIDModel(nn.Module):
         if self.training:
             # Return both for the dual-loss training loop
             logits = self.classifier(features) # Use un-normalized features for CE
-            return embeddings, logits
+            return embeddings, logits ,features
         
         return embeddings
     
-    def save(self, args, epoch, optimizer, label_encoder=None, save_dir="checkpoints_long_run_v3"):
+    def save(self, args, epoch, optimizer, label_encoder=None):
         """Saves weights, metadata, and hyperparameters with attribute safety."""
-        if not os.path.exists(save_dir):
-            os.makedirs(save_dir)
+        if not os.path.exists(args.checkpoint_dir):
+            os.makedirs(args.checkpoint_dir)
 
         # --- DEFENSIVE CHECK ---
         # If self.save_params doesn't exist (e.g. model was init'd before code update),
@@ -174,14 +174,14 @@ class ReIDModel(nn.Module):
         # Using getattr for args safety as well
         species = getattr(args, 'holdout_species', 'universal') or 'universal'
         model_name = f"gnn_reid_{species}_{timestamp}.pth"
-        save_path = os.path.join(save_dir, model_name)
+        save_path = os.path.join(args.checkpoint_dir, model_name)
 
         # Prepare payload
         payload = {
             'model_state_dict': self.state_dict(),
             'hyperparameters': hyperparams,
-            'optimizer_state_dict': optimizer.state_dict(), # <--- NEW
-            'epoch': epoch,                                 # <--- NEW
+            'optimizer_state_dict': optimizer.state_dict(), 
+            'epoch': epoch,                                 
             'args': vars(args) if hasattr(args, '__dict__') else args,
             'label_encoder_classes': label_encoder.classes_ if label_encoder else None,
             'timestamp': timestamp
@@ -236,21 +236,27 @@ def train_one_epoch(loader, model, optimizer, margin=1.0):
         labels = data.y.view(-1).to(device)
 
         # Unpack the two outputs
-        emb, logits = model(data)
+        emb, logits, features = model(data)
 
         # Calculate losses
-        loss_triplet = batch_hard_triplet_loss(emb, labels, margin=margin)
-        loss_ce = criterion_ce(logits, labels)
-        loss_compact = batch_compactness_loss(emb, labels)
+        #loss_triplet = batch_hard_triplet_loss(emb, labels, margin=margin)
+        loss_triplet = batch_topk_triplet_loss(emb, labels, margin=margin, k_pos=1, k_neg=10)
+        loss_ce = 0.25 * criterion_ce(logits, labels)
+
+        
+        loss_compact = 6 * batch_compactness_loss(features, labels)
 
         # Combined Loss
-        loss = loss_triplet + (0.25 * loss_ce) + (0.1 * loss_compact)
+        loss = loss_triplet + loss_ce + loss_compact
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
         total += float(loss.item())
+        total_triplet += loss_triplet
+        total_ce += loss_ce
+        total_compact += loss_compact
 
     return total / len(loader), total_triplet / len(loader), total_ce / len(loader), total_compact / len(loader) 
 
@@ -260,7 +266,7 @@ def train(loader, model, optimizer, num_epochs, start_epoch=0, args=None):
         total_batchloss, triplet, ce, compact = train_one_epoch(loader, model, optimizer, margin=1)
         print(f"epoch {i} batchloss: {total_batchloss}, triplet loss: {triplet}, cross entropy loss: {ce}, compactness loss: {compact}")
         if i % 2 ==0:
-            _=model.save(args,eppoch=i, optimizer=optimizer)
+            _=model.save(args,epoch=i, optimizer=optimizer)
 
 
 def knn_accuracy(embeddings, labels, k=4):
@@ -390,14 +396,25 @@ def main(args):
     df = pd.read_csv(csv_path)
 
     # Filter out entries with no cluster_id/identity if necessary
-    df = df.dropna(subset=['identity']) 
-
-    # 2. Create Global Unique IDs (Crucial for multi-dataset)
     df['global_identity'] = df['dataset'] + "_" + df['identity'].astype(str)
     
     counts = df['global_identity'].value_counts()
     keep_ids = counts[counts > 1].index
     df = df[df['global_identity'].isin(keep_ids)].reset_index(drop=True)
+
+    # --- NEW: SUBSET LOGIC ---
+    if args.subset_fraction < 1.0:
+        print(f"\n[ Applying {args.subset_fraction * 100:.0f}% Subset ]")
+        unique_ids = df['global_identity'].unique()
+        keep_n = max(2, int(len(unique_ids) * args.subset_fraction)) # Keep at least 2 IDs
+        
+        # Randomly select a subset of identities
+        np.random.seed(42) # Keep it reproducible so you test on the same subset
+        sampled_ids = np.random.choice(unique_ids, keep_n, replace=False)
+        
+        # Filter the dataframe to only include those identities
+        df = df[df['global_identity'].isin(sampled_ids)].reset_index(drop=True)
+        print(f"--> Shrunk dataset to {keep_n} unique identities ({len(df)} total images)")
 
     le = LabelEncoder()
     df['global_label'] = le.fit_transform(df['global_identity'])
@@ -420,7 +437,8 @@ def main(args):
         train_labels, test_labels = train_test_split(unique_labels, test_size=0.1, random_state=42)
         train_df = df[df["global_label"].isin(train_labels)].reset_index(drop=True)
         test_df = df[df["global_label"].isin(test_labels)].reset_index(drop=True)
-        test_df.to_csv("current_test_split.csv", index=False)
+        os.mkdir(args.checkpoint_dir)
+        test_df.to_csv(f"{args.checkpoint_dir}/current_test_split.csv", index=False)
 
     
     # No matter how the split was made, we must ensure training labels 
@@ -534,22 +552,22 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs")
     
     # Dataset scaling settings
-    parser.add_argument("--data_mode", type=str, default="auto", choices=["auto", "memory", "lazy"], 
-                        help="How to load graphs. 'auto' chooses based on dataset size.")
+    parser.add_argument("--data_mode", type=str, default="auto", choices=["auto", "memory", "lazy"], help="How to load graphs. 'auto' chooses based on dataset size.")
     parser.add_argument("--segments", type=int, default=300, help="Number of superpixels (SLIC segments)")
     parser.add_argument("--rebuild", action="store_true", help="Force rebuild of graph cache (ignore existing .pt files)")
-    parser.add_argument("--img_size", type=int, default=1024, 
-                    help="Max dimension (width or height) for images before graph creation")
-    
+    parser.add_argument("--img_size", type=int, default=1024, help="Max dimension (width or height) for images before graph creation")
+    parser.add_argument("--subset_fraction", type=float, default=1.0, help="Fraction of identities to keep (e.g., 0.1 for 10%)")
+
     # Hardware settings
     parser.add_argument("--workers", type=int, default=4, help="Number of CPU workers for DataLoader")
     
     # Holdout settings
-    parser.add_argument("--holdout_dataset", type=str, default=None, 
-                        help="Name of the dataset to hold out for testing (e.g., 'ATRW')")
-    parser.add_argument("--holdout_species", type=str, default=None, 
-                        help="Name of the species to hold out for testing (e.g., 'tiger')")
+    parser.add_argument("--holdout_dataset", type=str, default=None, help="Name of the dataset to hold out for testing (e.g., 'ATRW')")
+    parser.add_argument("--holdout_species", type=str, default=None, help="Name of the species to hold out for testing (e.g., 'tiger')")
     
+    # checkpoint dir
+    parser.add_argument("--checkpoint_dir", type= str, default="checkpoints_long_run_v3", help="name of directory for checkpointing")
+
     # Resume training flag
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint .pth file to resume training")
     args = parser.parse_args()
@@ -564,10 +582,13 @@ import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 
-def reduce_to_2d(
+def reduce_to_nd(
+    args,
     embeddings: torch.Tensor,
+    n_components: int = 2,
     method: str = "tsne",
     seed: int = 42,
+
 ) -> np.ndarray:
     """
     embeddings: torch.Tensor on CPU (N, D)
@@ -581,7 +602,7 @@ def reduce_to_2d(
         method = "pca"
 
     if method.lower() == "pca":
-        return PCA(n_components=2, random_state=seed).fit_transform(X)
+        return PCA(n_components=n_components, random_state=seed).fit_transform(X)
 
     if method.lower() == "tsne":
         # Standard trick: PCA -> t-SNE for speed/stability
@@ -594,11 +615,12 @@ def reduce_to_2d(
         perplexity = min(perplexity, n - 1)
 
         tsne = TSNE(
-            n_components=2,
+            n_components=n_components,
             init="pca",
             learning_rate="auto",
             perplexity=perplexity,
             random_state=seed,
+            n_jobs=args.workers
         )
         return tsne.fit_transform(Xp)
 
@@ -660,6 +682,5 @@ def plot_embedding_2d(
     plt.show()
 
 #TODO for IDs with only one image, add on the fly rdm iamge argumentation for positive pairs, should be fine with batch pre fetch enabled
-#TODO log individual loss components in addtiont to overall loss per epoch
-#TODO introduce real checkpointing
 #TODO add another Linear layer after the last to give the seperator head a chance to repopulate the dorpout neurons
+#TODO indenity aware pk triplet mining ( long taile dists.)
