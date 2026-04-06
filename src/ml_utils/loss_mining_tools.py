@@ -3,7 +3,7 @@ import random
 import numpy as np
 import torch
 import torch.nn.functional as F
-
+import torch.nn as nn
 class PKBatchSampler(Sampler):
     def __init__(self, labels, P=8, K=4, drop_last=True):
         self.labels = np.asarray(labels)
@@ -50,6 +50,46 @@ def pairwise_dist(x):
     dist = xx + xx.t() - 2.0 * (x @ x.t())
     return dist.clamp_min(0.0)
 
+def batch_topk_triplet_loss(embeddings, labels, margin=1.0, k_pos=1, k_neg=10):
+    """
+    Functional implementation of Top-K Hard Triplet Loss.
+    """
+    # 1. Compute Pairwise Distance Matrix
+    dist_mat = torch.cdist(embeddings, embeddings, p=2)
+
+    # 2. Create Boolean Masks
+    N = labels.size(0)
+    is_same = labels.unsqueeze(0) == labels.unsqueeze(1)
+    is_self = torch.eye(N, dtype=torch.bool, device=embeddings.device)
+
+    pos_mask = is_same & ~is_self
+    neg_mask = ~is_same
+
+    # 3. POSITIVE MINING (Furthest)
+    pos_dists = dist_mat.clone()
+    pos_dists[~pos_mask] = -float('inf')
+
+    actual_k_pos = max(1, min(k_pos, pos_mask.sum(dim=1).max().item()))
+    top_pos_dists, _ = torch.topk(pos_dists, k=actual_k_pos, dim=1, largest=True)
+    
+    valid_pos = top_pos_dists > -1e5
+    mean_hard_pos = (top_pos_dists * valid_pos).sum(dim=1) / valid_pos.sum(dim=1).clamp(min=1)
+
+    # 4. NEGATIVE MINING (Closest)
+    neg_dists = dist_mat.clone()
+    neg_dists[~neg_mask] = float('inf')
+
+    actual_k_neg = max(1, min(k_neg, neg_mask.sum(dim=1).max().item()))
+    top_neg_dists, _ = torch.topk(neg_dists, k=actual_k_neg, dim=1, largest=False)
+    
+    valid_neg = top_neg_dists < 1e5
+    mean_hard_neg = (top_neg_dists * valid_neg).sum(dim=1) / valid_neg.sum(dim=1).clamp(min=1)
+
+    # 5. COMPUTE TRIPLET LOSS
+    losses = F.relu(mean_hard_pos - mean_hard_neg + margin)
+    
+    return losses.mean()
+    
 def batch_hard_triplet_loss(emb, labels, margin=1.0):
     # emb: (B, D), labels: (B,)
     dist = pairwise_dist(emb)
