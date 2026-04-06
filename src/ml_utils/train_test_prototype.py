@@ -469,18 +469,25 @@ def main(args):
         mode=args.data_mode,
         n_segments=args.segments,
         img_size= args.img_size,
-        rebuild_cache=args.rebuild
+        rebuild_cache=args.rebuild,
+        features=args.features
     )
-    
+
+    # Look at the very first graph in the dataset to see how wide the features are
+    first_graph = train_dataset[0]
+    dynamic_in_dim = first_graph.x.shape[1]
+    print(f"--> Dynamically detected Node Feature Dimension (in_dim): {dynamic_in_dim}")
     print("\n[ Preparing Test/Holdout Data ]")
+
     test_dataset = UniversalGraphDataset(
         num_train_classes = num_train_classes,
         samples=test_samples, 
         root_dir=img_root, 
         cache_dir=cache_pool, 
         mode=args.data_mode, 
-        n_segments=args.segments
-    )
+        n_segments=args.segments,
+        features= args.features
+        )
 
     # DataLoaders
     batch_sampler = PKBatchSampler(train_df["global_label"].values, P=64, K=2)
@@ -488,7 +495,13 @@ def main(args):
     test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=args.workers)
 
     # Model & Optimizer
-    model = ReIDModel(num_classes=num_train_classes,in_dim=14,hidden_dim=512, gnn_out_dim=256, emb_dim=512).to(device) #TODO REM
+    # Look at the first graph to find out the feature width dynamically
+    first_graph = train_dataset[0]
+    dynamic_in_dim = first_graph.x.shape[1]
+    print(f"--> Dynamically detected Node Feature Dimension (in_dim): {dynamic_in_dim}")
+
+    # Model & Optimizer (Notice in_dim is now dynamic)
+    model = ReIDModel(num_classes=num_train_classes, in_dim=dynamic_in_dim, hidden_dim=512, gnn_out_dim=256, emb_dim=512).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
     # --- NEW: RESUME LOGIC ---
@@ -571,6 +584,10 @@ if __name__ == "__main__":
     # Resume training flag
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint .pth file to resume training")
     args = parser.parse_args()
+
+    # Feature extractor settings:
+    parser.add_argument("--features", nargs="+", default=["color", "pos", "hog", "lbp", "texture"], help="List of node features to extract (color pos hog lbp texture)")
+    
     main(args)
 
 

@@ -11,25 +11,21 @@ import lmdb
 from torch_geometric.data import Dataset as PyGDataset
 from torch.utils.data import Dataset
 from gnn.gnn import image_to_superpixel_graph
-
+from PIL import ImageOps
 # Lazy import inside workers prevents pickling issues across OS environments
-def process_for_lmdb(filename, root_dir, n_segments, max_size=1024):
+def process_for_lmdb(filename, root_dir, n_segments, features, max_size=1024):
     """
     Worker function: Loads image, generates graph, and serializes it to bytes.
-    Does NOT write to disk/LMDB directly.
     """
-        
     img_path = os.path.join(root_dir, filename)
     img = Image.open(img_path).convert("RGB")
 
-    # Resize Mechanic
     if max(img.size) > max_size:
         img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
 
-    # Generate Graph
-    graph = image_to_superpixel_graph(img, n_segments=n_segments)
+    # Pass features down to the GNN function!
+    graph = image_to_superpixel_graph(img, n_segments=n_segments, features=features)
         
-    # Serialize to bytes for LMDB
     buffer = io.BytesIO()
     torch.save(graph, buffer)
         
@@ -59,8 +55,9 @@ def process_single_image(filename, root_dir, cache_dir, n_segments, rebuild, max
         img = Image.open(img_path).convert("RGB")
 
         # Resize Mechanic
-        if max(img.size) > max_size:
-            img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+        # Force every single image to be exactly 512x512
+        # 1. Resize while keeping perfect aspect ratio, and pad the rest with black
+        img = ImageOps.pad(img, (max_size, max_size), color=(0, 0, 0), method=Image.Resampling.LANCZOS)
 
         from gnn.gnn import image_to_superpixel_graph
         graph = image_to_superpixel_graph(img, n_segments=n_segments)
@@ -244,49 +241,11 @@ class InMemoryGraphDataset(PyGDataset):
     def get(self, idx):
         return self.graphs[idx]
     
-import random
-import os
-import io
-import pandas as pd
-import cv2 as cv
-from PIL import Image
-from tqdm import tqdm
-from joblib import Parallel, delayed
-import torch
-import lmdb
-from torch_geometric.data import Dataset as PyGDataset
-from torch.utils.data import Dataset
 
-# Lazy import inside workers prevents pickling issues across OS environments
-def process_for_lmdb(filename, root_dir, n_segments, max_size=1024):
-    """
-    Worker function: Loads image, generates graph, and serializes it to bytes.
-    Does NOT write to disk/LMDB directly.
-    """
-    try:
-        from gnn.gnn import image_to_superpixel_graph
-        
-        img_path = os.path.join(root_dir, filename)
-        img = Image.open(img_path).convert("RGB")
-
-        # Resize Mechanic
-        if max(img.size) > max_size:
-            img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
-
-        # Generate Graph
-        graph = image_to_superpixel_graph(img, n_segments=n_segments)
-        
-        # Serialize to bytes for LMDB
-        buffer = io.BytesIO()
-        torch.save(graph, buffer)
-        
-        return True, buffer.getvalue()
-    except Exception as e:
-        return False, f"Error {filename}: {str(e)}"
 
 
 class UniversalGraphDataset(PyGDataset):
-    def __init__(self, samples, root_dir, cache_dir, mode='auto', n_segments=300, rebuild_cache=False, img_size=1024, num_train_classes=None):
+    def __init__(self, samples, root_dir, cache_dir, mode='auto', n_segments=300, rebuild_cache=False, img_size=1024, num_train_classes=None, features=['color', 'pos', 'hog']):
         super().__init__()
         self.samples = samples
         self.root_dir = root_dir
@@ -294,7 +253,7 @@ class UniversalGraphDataset(PyGDataset):
         self.n_segments = n_segments
         self.img_size = img_size
         self.graphs = []
-        
+        self.features = features
         # We start with None to avoid multiprocessing pickling issues in DataLoader workers
         self.env = None 
 
@@ -326,8 +285,9 @@ class UniversalGraphDataset(PyGDataset):
             )
 
     def _get_key(self, filename):
-        """Standardized byte-key generator for LMDB."""
-        return f"seg{self.n_segments}_{filename}".encode('utf-8')
+        """Standardized byte-key generator for LMDB, now feature-aware."""
+        feature_str = "-".join(sorted(self.features)) # e.g., "color-hog-lbp-pos"
+        return f"seg{self.n_segments}_{feature_str}_{filename}".encode('utf-8')
 
     def _warmup_cache(self, rebuild):
         print(f"\n[ CACHE WARMUP ] Checking {len(self.samples)} samples against LMDB...")
@@ -358,9 +318,9 @@ class UniversalGraphDataset(PyGDataset):
         # Helper to wrap the task for Joblib
         def wrapper(task):
             key, filename = task
-            success, result = process_for_lmdb(filename, self.root_dir, self.n_segments, self.img_size)
+            # PASS self.features HERE!
+            success, result = process_for_lmdb(filename, self.root_dir, self.n_segments, self.features, self.img_size)
             return key, success, result
-
         # return_as="generator" yields results as soon as workers finish them
         results_gen = Parallel(n_jobs=-1, backend="multiprocessing", return_as="generator")(
             delayed(wrapper)(task) for task in tasks
