@@ -14,19 +14,19 @@ from gnn.gnn import image_to_superpixel_graph
 from PIL import ImageOps
 import numpy as np
 
-# Lazy import inside workers prevents pickling issues across OS environments
-def process_for_lmdb(filename, root_dir, n_segments, features, max_size=512):
+def process_for_lmdb(filename, root_dir, n_segments, features, max_size=1024):
     img_path = os.path.join(root_dir, filename)
     img = Image.open(img_path).convert("RGB")
 
-    # 1. Create a pure white mask matching the original image size
+    # 1. Use the faster Thumbnail method (reduces total pixel area)
+    if max(img.size) > max_size:
+        img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+        
+    # 2. Create the white mask to match the (now smaller) image
     mask = Image.new('L', img.size, color=255)
 
-    # 2. Pad BOTH the image and the mask identically
-    img = ImageOps.pad(img, (max_size, max_size), color=(0, 0, 0), method=Image.Resampling.LANCZOS)
-    mask = ImageOps.pad(mask, (max_size, max_size), color=0, method=Image.Resampling.NEAREST)
-
-    # Pass the mask into your graph builder!
+    from gnn.gnn import image_to_superpixel_graph
+    # Pass the mask in to keep the graph safe from black edges
     graph = image_to_superpixel_graph(img, mask=np.array(mask), n_segments=n_segments, features=features)
         
     buffer = io.BytesIO()
@@ -320,12 +320,14 @@ class UniversalGraphDataset(PyGDataset):
         
         # Helper to wrap the task for Joblib
         def wrapper(task):
+            import torch
+            torch.set_num_threads(1)  # <--- STOPS CPU THRASHING
+            
             key, filename = task
-            # PASS self.features HERE!
             success, result = process_for_lmdb(filename, self.root_dir, self.n_segments, self.features, self.img_size)
             return key, success, result
         # return_as="generator" yields results as soon as workers finish them
-        results_gen = Parallel(n_jobs=-1, backend="multiprocessing", return_as="generator")(
+        results_gen = Parallel(n_jobs=-1, return_as="generator")(
             delayed(wrapper)(task) for task in tasks
         )
 

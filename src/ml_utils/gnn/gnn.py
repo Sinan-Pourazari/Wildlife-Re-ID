@@ -63,9 +63,10 @@ def image_to_superpixel_graph(img, mask=None, n_segments=300, hog_bins=9, hog_si
         if 'hog' in features:
             x_list.append(torch.tensor(np.array(hogs), dtype=torch.float))
 
-    # --- 3. NEW: Local Binary Patterns (LBP) Histogram ---
+   # --- 3. NEW: Local Binary Patterns (LBP) Histogram ---
     if 'lbp' in features:
-        gray = rgb2gray(img)
+        # Multiply by 255 and convert to 8-bit integer to safely calculate LBP
+        gray = (rgb2gray(img) * 255).astype(np.uint8)
         lbp = local_binary_pattern(gray, P=8, R=1.0, method='uniform')
         lbp_flat = torch.tensor(lbp, dtype=torch.long).view(-1)
         

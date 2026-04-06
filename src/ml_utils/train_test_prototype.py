@@ -583,10 +583,10 @@ if __name__ == "__main__":
 
     # Resume training flag
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint .pth file to resume training")
-    args = parser.parse_args()
 
     # Feature extractor settings:
     parser.add_argument("--features", nargs="+", default=["color", "pos", "hog", "lbp", "texture"], help="List of node features to extract (color pos hog lbp texture)")
+    args = parser.parse_args()
     
     main(args)
 
