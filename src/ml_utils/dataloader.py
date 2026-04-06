@@ -12,19 +12,22 @@ from torch_geometric.data import Dataset as PyGDataset
 from torch.utils.data import Dataset
 from gnn.gnn import image_to_superpixel_graph
 from PIL import ImageOps
+import numpy as np
+
 # Lazy import inside workers prevents pickling issues across OS environments
-def process_for_lmdb(filename, root_dir, n_segments, features, max_size=1024):
-    """
-    Worker function: Loads image, generates graph, and serializes it to bytes.
-    """
+def process_for_lmdb(filename, root_dir, n_segments, features, max_size=512):
     img_path = os.path.join(root_dir, filename)
     img = Image.open(img_path).convert("RGB")
 
-    if max(img.size) > max_size:
-        img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+    # 1. Create a pure white mask matching the original image size
+    mask = Image.new('L', img.size, color=255)
 
-    # Pass features down to the GNN function!
-    graph = image_to_superpixel_graph(img, n_segments=n_segments, features=features)
+    # 2. Pad BOTH the image and the mask identically
+    img = ImageOps.pad(img, (max_size, max_size), color=(0, 0, 0), method=Image.Resampling.LANCZOS)
+    mask = ImageOps.pad(mask, (max_size, max_size), color=0, method=Image.Resampling.NEAREST)
+
+    # Pass the mask into your graph builder!
+    graph = image_to_superpixel_graph(img, mask=np.array(mask), n_segments=n_segments, features=features)
         
     buffer = io.BytesIO()
     torch.save(graph, buffer)

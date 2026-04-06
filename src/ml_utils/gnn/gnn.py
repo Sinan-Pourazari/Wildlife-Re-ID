@@ -96,57 +96,53 @@ def image_to_superpixel_graph(img, n_segments=300, hog_bins=9, hog_signed=False,
 
 # --- Combine all selected features ---
     x = torch.cat(x_list, dim=1)
-    
-    # ==========================================
-    # --- 5. GRAPH PRUNING (Kill the Padding) ---
-    # ==========================================
-    
-    # 1. Calculate the average RGB color of every superpixel
-    # We use PyTorch scatter to do this instantly on the CPU
-    img_flat = torch.tensor(img, dtype=torch.float).view(-1, 3)
-    node_counts = torch.bincount(seg_flat, minlength=num_nodes).view(-1, 1).float()
-    
-    node_colors = torch.zeros((num_nodes, 3), dtype=torch.float)
-    node_colors.scatter_add_(0, seg_flat.unsqueeze(1).expand(-1, 3), img_flat)
-    node_colors = node_colors / (node_counts + 1e-6)
-
-    # 2. A node is "padding" if its average color is pure black (Sum of RGB is tiny)
-    # 5.0 out of 765 gives a tiny buffer for jpeg compression artifacts
-    is_valid_node = node_colors.sum(dim=1) > 5.0  
-
-    # 3. Filter the features: Keep only the valid nodes! 
-    # This shrinks x from e.g., [300, in_dim] to [210, in_dim]
-    x_pruned = x[is_valid_node]
-
-    # 4. Create a mapping array to fix the edge connections
-    # If we delete node 5, the old node 6 needs to become the new node 5.
-    old_to_new_ids = torch.full((num_nodes,), -1, dtype=torch.long)
-    old_to_new_ids[is_valid_node] = torch.arange(x_pruned.size(0))
 
     # ==========================================
-    # --- 6. Build Pruned Edges ---
+    # --- 5. GRAPH PRUNING (Using the Mask) ---
     # ==========================================
-    edges = set()
-    for y in range(h - 1):
-        for x_ in range(w - 1):
-            a = segments[y, x_]
-            b = segments[y, x_ + 1]
-            c = segments[y + 1, x_]
+    if mask is not None:
+        # Flatten the mask [H*W]
+        mask_flat = torch.tensor(mask, dtype=torch.float).view(-1)
+        node_counts = torch.bincount(seg_flat, minlength=num_nodes).float()
+        
+        # Calculate the average mask value for each superpixel
+        node_mask_scores = torch.zeros(num_nodes, dtype=torch.float)
+        node_mask_scores.scatter_add_(0, seg_flat, mask_flat)
+        node_mask_scores = node_mask_scores / (node_counts + 1e-6)
 
-            # Only add the edge if BOTH nodes are valid (not black padding)
-            if a != b and is_valid_node[a] and is_valid_node[b]:
-                # Map the old segment IDs to the new pruned IDs
-                new_a, new_b = old_to_new_ids[a].item(), old_to_new_ids[b].item()
-                edges.add((new_a, new_b))
-                edges.add((new_b, new_a))
-                
-            if a != c and is_valid_node[a] and is_valid_node[c]:
-                new_a, new_c = old_to_new_ids[a].item(), old_to_new_ids[c].item()
-                edges.add((new_a, new_c))
-                edges.add((new_c, new_a))
+        # If a superpixel is mostly in the padding (score close to 0), delete it.
+        # If it is mostly in the real image (score close to 255), keep it!
+        # 127 is the perfect middle-ground threshold.
+        is_valid_node = node_mask_scores > 127.0 
 
-    edge_index = torch.tensor(list(edges), dtype=torch.long).t().contiguous()
+        # Filter features and map edges
+        x_pruned = x[is_valid_node]
 
-    # Pass the pruned features (x_pruned) instead of the raw x
-    data = Data(x=x_pruned, edge_index=edge_index)
+        old_to_new_ids = torch.full((num_nodes,), -1, dtype=torch.long)
+        old_to_new_ids[is_valid_node] = torch.arange(x_pruned.size(0))
+
+        # --- Build Pruned Edges ---
+        edges = set()
+        for y in range(h - 1):
+            for x_ in range(w - 1):
+                a = segments[y, x_]
+                b = segments[y, x_ + 1]
+                c = segments[y + 1, x_]
+
+                if a != b and is_valid_node[a] and is_valid_node[b]:
+                    edges.add((old_to_new_ids[a].item(), old_to_new_ids[b].item()))
+                    edges.add((old_to_new_ids[b].item(), old_to_new_ids[a].item()))
+                    
+                if a != c and is_valid_node[a] and is_valid_node[c]:
+                    edges.add((old_to_new_ids[a].item(), old_to_new_ids[c].item()))
+                    edges.add((old_to_new_ids[c].item(), old_to_new_ids[a].item()))
+
+        edge_index = torch.tensor(list(edges), dtype=torch.long).t().contiguous()
+        data = Data(x=x_pruned, edge_index=edge_index)
+        
+    else:
+        # If no mask is provided, just return the raw graph
+        edge_index = ... # (Your old edge building logic)
+        data = Data(x=x, edge_index=edge_index)
+        
     return data
