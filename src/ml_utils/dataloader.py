@@ -246,20 +246,18 @@ class InMemoryGraphDataset(PyGDataset):
     
 
 
-
 class UniversalGraphDataset(PyGDataset):
+    _shared_envs = {}
     def __init__(self, samples, root_dir, cache_dir, mode='auto', n_segments=300, rebuild_cache=False, img_size=1024, num_train_classes=None, features=['color', 'pos', 'hog']):
         super().__init__()
         self.samples = samples
         self.root_dir = root_dir
-        self.cache_dir = cache_dir  # This is now the directory holding data.mdb and lock.mdb
+        self.cache_dir = os.path.abspath(cache_dir)  # This is now the directory holding data.mdb and lock.mdb
         self.n_segments = n_segments
         self.img_size = img_size
         self.graphs = []
         self.features = features
-        # We start with None to avoid multiprocessing pickling issues in DataLoader workers
-        self.env = None 
-
+        
         if mode == 'auto':
             self.mode = 'memory' if len(samples) <= 8000 else 'lazy'
         else:
@@ -269,23 +267,49 @@ class UniversalGraphDataset(PyGDataset):
 
         os.makedirs(self.cache_dir, exist_ok=True)
 
-        # 1. Warmup / Generation Phase
+        # 1. Warmup / Generation Phase (CALLED ONLY ONCE NOW)
         self._warmup_cache(rebuild_cache)
 
         # 2. Memory Loading (Only if in memory mode)
         if self.mode == 'memory':
             self._load_all_to_memory()
 
-    def _init_db(self):
-        """Lazily initialize the LMDB environment inside the DataLoader worker."""
-        if self.env is None:
-            self.env = lmdb.open(
+    def _init_db(self, write=False):
+        """Shared initialization to prevent 'Environment already open' errors."""
+        pid = os.getpid()
+        # Tie the environment handle to the specific Process ID!
+        env_key = (self.cache_dir, pid)
+
+        # FIXED: Now strictly using env_key instead of self.cache_dir
+        if env_key not in UniversalGraphDataset._shared_envs:
+            #print(f"{env_key=} does not exist!")
+            inherited_keys = list(UniversalGraphDataset._shared_envs.keys())
+            for idx, k in enumerate(inherited_keys):
+                #print(f"Init db {idx=}, {k=}")
+                if k[1] != pid:  # If the handle belongs to a different process (the parent)
+                    #print(f"Closing {k=}")
+                    try:
+                        UniversalGraphDataset._shared_envs[k].close()
+                    except Exception:
+                        pass
+                    del UniversalGraphDataset._shared_envs[k]
+
+            # 100GB map size (virtual)
+            map_size = 100 * 1024 * 1024 * 1024 
+            
+            UniversalGraphDataset._shared_envs[env_key] = lmdb.open(
                 self.cache_dir,
-                readonly=True,
-                lock=False,       # crucial for PyTorch multi-worker DataLoader
-                readahead=False,  # disabling readahead improves random access speeds
-                meminit=False     # improves performance
+                map_size=map_size,
+                readonly=not write, # Warmup needs write=True, Workers need write=False
+                lock=write,         # Only lock if we are writing
+                readahead=False,
+                meminit=False,
+                max_readers=2048
             )
+        else:
+            #print(f"{env_key=} does not exist!")
+            pass
+        return UniversalGraphDataset._shared_envs[env_key]
 
     def _get_key(self, filename):
         """Standardized byte-key generator for LMDB, now feature-aware."""
@@ -296,8 +320,7 @@ class UniversalGraphDataset(PyGDataset):
         print(f"\n[ CACHE WARMUP ] Checking {len(self.samples)} samples against LMDB...")
         
         # 100GB map size. (This is virtual memory, it won't actually consume 100GB of disk space)
-        map_size = 100 * 1024 * 1024 * 1024 
-        env = lmdb.open(self.cache_dir, map_size=map_size)
+        env = self._init_db(write=True)
 
         # Gather existing keys to avoid redundant work
         with env.begin() as txn:
@@ -313,7 +336,6 @@ class UniversalGraphDataset(PyGDataset):
 
         if not tasks:
             print("--> All graphs present in LMDB. Skipping generation.")
-            env.close()
             return
 
         print(f"--> Launching Parallel Warmup for {len(tasks)} missing graphs...")
@@ -327,23 +349,36 @@ class UniversalGraphDataset(PyGDataset):
             success, result = process_for_lmdb(filename, self.root_dir, self.n_segments, self.features, self.img_size)
             return key, success, result
         # return_as="generator" yields results as soon as workers finish them
-        results_gen = Parallel(n_jobs=-1, return_as="generator")(
-            delayed(wrapper)(task) for task in tasks
-        )
+        results_gen = Parallel(
+            n_jobs=-1, 
+            return_as="generator",
+            batch_size=20,  # Send 20 images at a time to each worker
+            pre_dispatch="2*n_jobs" # Ensure we don't overwhelm RAM
+        )(delayed(wrapper)(task) for task in tasks)
 
         newly_created = 0
         errors = []
+        buffer_limit = 200 # Write in chunks of 200 graphs
+        current_buffer = []
 
-        # Single main-thread writer to LMDB (fast and safe)
-        with env.begin(write=True) as txn:
-            for key, success, result in tqdm(results_gen, total=len(tasks), desc="Writing to LMDB", unit="img"):
-                if success:
-                    txn.put(key, result)
-                    newly_created += 1
-                else:
-                    errors.append(result)
-
-        env.close()
+        for key, success, result in tqdm(results_gen, total=len(tasks), desc="Writing to LMDB", unit="img"):
+            if success:
+                current_buffer.append((key, result))
+                newly_created += 1
+                
+                if len(current_buffer) >= buffer_limit:
+                    with env.begin(write=True) as txn:
+                        for k, r in current_buffer:
+                            txn.put(k, r)
+                    current_buffer = [] # Clear buffer
+            else:
+                errors.append(result)
+        
+        # Final flush for any leftovers
+        if current_buffer:
+            with env.begin(write=True) as txn:
+                for k, r in current_buffer:
+                    txn.put(k, r)
 
         print(f"\n[ WARMUP COMPLETE ]")
         print(f"--> New graphs added to LMDB: {newly_created}")
@@ -353,9 +388,11 @@ class UniversalGraphDataset(PyGDataset):
     def _load_all_to_memory(self):
         """Sequentially load all graphs into RAM (LMDB sequential read is extremely fast)."""
         print("--> Loading graphs into RAM from LMDB...")
-        self._init_db()
         
-        with self.env.begin() as txn:
+        # FIXED: Capture the shared handle
+        env = self._init_db(write=False)
+        
+        with env.begin() as txn:
             for filename, label in tqdm(self.samples, desc="RAM Loading"):
                 key = self._get_key(filename)
                 graph_bytes = txn.get(key)
@@ -373,16 +410,15 @@ class UniversalGraphDataset(PyGDataset):
 
     def get(self, idx):
         if self.mode == 'memory':
-            # O(1) RAM access
             return self.graphs[idx]
         else:
-            # Disk streaming from LMDB
-            self._init_db() # Ensures the env is open for the specific worker process
+            # Get the shared handle
+            env = self._init_db(write=False)
             
             filename, label = self.samples[idx]
             key = self._get_key(filename)
             
-            with self.env.begin() as txn:
+            with env.begin(write=False) as txn:
                 graph_bytes = txn.get(key)
                 
             if graph_bytes is None:
@@ -395,5 +431,5 @@ class UniversalGraphDataset(PyGDataset):
             return graph
             
     def __del__(self):
-        if hasattr(self, 'env') and self.env is not None:
-            self.env.close()
+        # We let the class-level manager handle LMDB cleanup safely.
+        pass
