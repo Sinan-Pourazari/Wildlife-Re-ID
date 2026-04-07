@@ -21,14 +21,14 @@ import numpy as np
 from sklearn.preprocessing import LabelEncoder
 import argparse
 
-device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu" 
-"""if torch.cuda.is_available():
+#device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu" 
+if torch.cuda.is_available():
     device = "cuda"
 elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
     device = "mps"
 else:
     device = "cpu"
-"""
+
 
 print(f"Using {device} device")
 class SimpleDataset(TorchDataset):
@@ -102,7 +102,7 @@ class GraphImageDataset(PyGDataset):
         graph = image_to_superpixel_graph(img, n_segments=self.n_segments)
         graph.y = torch.tensor([int(label)], dtype=torch.long)
         return graph
-
+    
 class ReIDModel(nn.Module):
     def __init__(self, num_classes, in_dim=14, hidden_dim=256, gnn_out_dim=256, emb_dim=512, use_hybrid_pooling=True):
         super().__init__()
@@ -149,14 +149,13 @@ class ReIDModel(nn.Module):
         
         return embeddings
     
-    def save(self, args, epoch, optimizer, label_encoder=None):
+    # --- CHANGE 1: Accept train_classes instead of label_encoder ---
+    def save(self, args, epoch, optimizer, train_classes=None):
         """Saves weights, metadata, and hyperparameters with attribute safety."""
         if not os.path.exists(args.checkpoint_dir):
             os.makedirs(args.checkpoint_dir)
 
         # --- DEFENSIVE CHECK ---
-        # If self.save_params doesn't exist (e.g. model was init'd before code update),
-        # we define a fallback so the script doesn't crash.
         if hasattr(self, 'save_params'):
             hyperparams = self.save_params
         else:
@@ -171,7 +170,6 @@ class ReIDModel(nn.Module):
 
         # Generate unique filename
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
-        # Using getattr for args safety as well
         species = getattr(args, 'holdout_species', 'universal') or 'universal'
         model_name = f"gnn_reid_{species}_{timestamp}.pth"
         save_path = os.path.join(args.checkpoint_dir, model_name)
@@ -183,7 +181,8 @@ class ReIDModel(nn.Module):
             'optimizer_state_dict': optimizer.state_dict(), 
             'epoch': epoch,                                 
             'args': vars(args) if hasattr(args, '__dict__') else args,
-            'label_encoder_classes': label_encoder.classes_ if label_encoder else None,
+            # --- CHANGE 2: Save the raw list directly ---
+            'label_encoder_classes': train_classes, 
             'timestamp': timestamp
         }
     
@@ -213,7 +212,6 @@ class ReIDModel(nn.Module):
         
         # FILTER OUT THE CLASSIFIER
         state_dict = checkpoint['model_state_dict']
-        # Create a new dict that excludes anything belonging to the CE head
         filtered_state_dict = {k: v for k, v in state_dict.items() if not k.startswith('classifier.')}
         
         # Load the filtered weights
@@ -261,12 +259,12 @@ def train_one_epoch(loader, model, optimizer, margin=1.0):
     return total / len(loader), total_triplet / len(loader), total_ce / len(loader), total_compact / len(loader) 
 
 
-def train(loader, model, optimizer, num_epochs, start_epoch=0, args=None):
+def train(loader, model, optimizer, num_epochs, start_epoch=0, args=None, train_classes = None):
     for i in range(start_epoch, num_epochs):
         total_batchloss, triplet, ce, compact = train_one_epoch(loader, model, optimizer, margin=1)
         print(f"epoch {i} batchloss: {total_batchloss}, triplet loss: {triplet}, cross entropy loss: {ce}, compactness loss: {compact}")
         if i % 2 ==0:
-            _=model.save(args,epoch=i, optimizer=optimizer)
+            _=model.save(args,epoch=i, optimizer=optimizer, train_classes=train_classes )
 
 
 def knn_accuracy(embeddings, labels, k=4):
@@ -394,7 +392,22 @@ def main(args):
     # 1. Load the Universal Metadata
     print("\n[ Loading Metadata ]")
     df = pd.read_csv(csv_path)
+    
+    # --- FILTER BY SPECIFIC SPECIES ---
+    if args.species:
+        print(f"--> Filtering dataset to ONLY include: {args.species}")
+        df = df[df['species'].isin(args.species)].reset_index(drop=True)
+        
+        # Safety check to prevent crashing later if typos were made
+        if len(df) == 0:
+            raise ValueError(f"No images found for the specified species: {args.species}. Check your spelling.")
 
+    # Filter out entries with no cluster_id/identity if necessary
+    df['global_identity'] = df['dataset'] + "_" + df['identity'].astype(str)
+    
+    counts = df['global_identity'].value_counts()
+    keep_ids = counts[counts > 1].index
+    df = df[df['global_identity'].isin(keep_ids)].reset_index(drop=True)
     # Filter out entries with no cluster_id/identity if necessary
     df['global_identity'] = df['dataset'] + "_" + df['identity'].astype(str)
     
@@ -492,7 +505,7 @@ def main(args):
     # DataLoaders
     batch_sampler = PKBatchSampler(train_df["global_label"].values, P=64, K=2)
     train_loader = DataLoader(train_dataset, batch_sampler=batch_sampler, num_workers=args.workers, persistent_workers=True, prefetch_factor=4)
-    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=args.workers)
+    #test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=args.workers)
 
     # Model & Optimizer
     # Look at the first graph to find out the feature width dynamically
@@ -504,7 +517,7 @@ def main(args):
     model = ReIDModel(num_classes=num_train_classes, in_dim=dynamic_in_dim, hidden_dim=512, gnn_out_dim=256, emb_dim=512).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-    # --- NEW: RESUME LOGIC ---
+    # --- RESUME LOGIC ---
     start_epoch = 0
     if args.resume:
         if os.path.isfile(args.resume):
@@ -528,7 +541,7 @@ def main(args):
 
     # Train & Evaluate
     # Pass the start_epoch and args into the train loop
-    train(train_loader, model, optimizer, num_epochs=args.epochs, start_epoch=start_epoch, args=args)
+    train(train_loader, model, optimizer, num_epochs=args.epochs, start_epoch=start_epoch, args=args, train_classes=train_labels.tolist())
     # --- Saving the Results ---
     print("\n[ Saving Model ]")
     save_dir = "checkpoints"
@@ -540,22 +553,10 @@ def main(args):
     model_name = f"gnn_reid_{args.holdout_species or 'universal'}_{timestamp}.pth"
     save_path = os.path.join(save_dir, model_name)
 
-    # Save weights, label mapping, and hyperparameters
-    torch.save({
-        'model_state_dict': model.state_dict(),
-        'label_encoder_classes': le.classes_,
-        'args': args,
-        'in_dim': 14, # From your ReIDModel init
-        'hidden_dim': 512,
-        'gnn_out_dim': 256,
-        'emb_dim': 512,
-        'num_classes': num_train_classes
-    }, save_path)
-
     print(f"--> Model and metadata saved to: {save_path}")
     # Evaluate as an Open Set since the holdout data contains unseen IDs
     print(f"\nEvaluating on Holdout Set...")
-    eval(model, test_loader, closed_set=False)
+    #eval(model, test_loader, closed_set=False)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Wildlife Re-ID GNN Trainer")
@@ -570,7 +571,7 @@ if __name__ == "__main__":
     parser.add_argument("--rebuild", action="store_true", help="Force rebuild of graph cache (ignore existing .pt files)")
     parser.add_argument("--img_size", type=int, default=1024, help="Max dimension (width or height) for images before graph creation")
     parser.add_argument("--subset_fraction", type=float, default=1.0, help="Fraction of identities to keep (e.g., 0.1 for 10%)")
-
+    parser.add_argument("--species", type=str, nargs="+", default=None, help="List of specific species to use (e.g., --species tiger fox wolf)")
     # Hardware settings
     parser.add_argument("--workers", type=int, default=4, help="Number of CPU workers for DataLoader")
     
