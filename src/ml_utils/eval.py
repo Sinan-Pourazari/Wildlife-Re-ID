@@ -19,7 +19,76 @@ import plotly.express as px
 # Import from your existing modules
 from train_test_prototype import ReIDModel, reduce_to_nd
 from dataloader import UniversalGraphDataset
+import numpy as np
+from sklearn.metrics import balanced_accuracy_score
 
+def calculate_baks(y_true: np.ndarray, y_pred: np.ndarray, known_classes: set) -> float:
+    """
+    Calculates the Balanced Accuracy on Known Samples (BaKS).
+    
+    Args:
+        y_true (np.ndarray): Ground truth labels.
+        y_pred (np.ndarray): Predicted labels.
+        known_classes (set or list): The label IDs present in the training set.
+        
+    Returns:
+        float: The BaKS score (0.0 to 1.0). Returns 0.0 if no known samples exist.
+    """
+    known_mask = np.isin(y_true, list(known_classes))
+    y_true_known = y_true[known_mask]
+    y_pred_known = y_pred[known_mask]
+
+    # Safety check to prevent division by zero if the batch/set has no knowns
+    if len(y_true_known) == 0:
+        return 0.0
+
+    return float(balanced_accuracy_score(y_true_known, y_pred_known))
+
+import numpy as np
+
+def calculate_baus(y_true: np.ndarray, y_pred: np.ndarray, known_classes: set, unknown_label: int = -1) -> float:
+    """
+    Calculates the Balanced Accuracy on Unknown Samples (BAUS).
+    
+    Args:
+        y_true (np.ndarray): Ground truth labels.
+        y_pred (np.ndarray): Predicted labels.
+        known_classes (set or list): The label IDs present in the training set.
+        unknown_label (int): The label your pipeline assigns to rejected predictions.
+        
+    Returns:
+        float: The BAUS score (0.0 to 1.0). Returns 0.0 if no unknown samples exist.
+    """
+    unknown_mask = ~np.isin(y_true, list(known_classes))
+    y_true_unknown = y_true[unknown_mask]
+    y_pred_unknown = y_pred[unknown_mask]
+
+    # Safety check if the test set is strictly closed-set (no unknowns)
+    if len(y_true_unknown) == 0:
+        return 0.0
+
+    unique_unknown_classes = np.unique(y_true_unknown)
+    class_rejection_rates = []
+
+    for uk_cls in unique_unknown_classes:
+        cls_mask = (y_true_unknown == uk_cls)
+        
+        # Calculate what percentage of this specific animal's photos were correctly rejected
+        correct_rejections = (y_pred_unknown[cls_mask] == unknown_label)
+        rejection_rate = np.mean(correct_rejections)
+        
+        class_rejection_rates.append(rejection_rate)
+
+    # Macro-average so a rare unknown animal matters as much as a common unknown animal
+    return float(np.mean(class_rejection_rates))
+
+def compute_open_set_score(y_true, y_pred, known_classes):
+    baks = calculate_baks(y_true, y_pred, known_classes)
+    baus = calculate_baus(y_true, y_pred, known_classes)
+    
+    geometric_mean = np.sqrt(baks * baus)
+    
+    return baks, baus, geometric_mean
 def plot_interactive_3d_tsne(xyz, labels, title, save_path):
     df = pd.DataFrame({
         'Component 1': xyz[:, 0],
@@ -53,7 +122,7 @@ def extract_features(model, dataloader, device):
             
     return torch.cat(all_emb), torch.cat(all_labels)
 
-def compute_reid_metrics(features, labels, device='cpu'):
+def compute_reid_metrics(features, labels, device='cpu', sim_thresh=0.6):
     features = features.to(device)
     labels = labels.to(device)
     
@@ -65,7 +134,18 @@ def compute_reid_metrics(features, labels, device='cpu'):
     
     sorted_indices = torch.argsort(sim_matrix, dim=1, descending=True)
     sorted_labels = labels[sorted_indices]
+
+    # 1. Get the absolute highest similarity score for each query
+    top1_sims = sim_matrix.max(dim=1).values
+    top1_labels = sorted_labels[:, 0]
     
+    # 2. Apply the threshold: if the closest match is too far, label it -1 (Unknown)
+    y_pred = top1_labels.clone()
+    y_pred[top1_sims < sim_thresh] = -1 
+    
+    # 3. Move to CPU/Numpy for the scikit-learn math
+    y_true_np = labels.cpu().numpy()
+    y_pred_np = y_pred.cpu().numpy()
     N = labels.size(0)
     aps = []
     cmc_1, cmc_5, cmc_10 = 0.0, 0.0, 0.0
@@ -93,7 +173,10 @@ def compute_reid_metrics(features, labels, device='cpu'):
     rank_10 = (cmc_10 / valid_queries) * 100
     mAP = np.mean(aps) * 100 if aps else 0.0
     
-    return rank_1, rank_5, rank_10, mAP
+    # Calculate the Open-Set Metrics
+    baks = calculate_baks(y_true_np, y_pred_np, known_classes)
+    baus = calculate_baus(y_true_np, y_pred_np, known_classes)
+    return rank_1, rank_5, rank_10, mAP, baks, baus
 
 def compute_clustering_metrics(args, embeddings, labels):
     clusterer = hdbscan.HDBSCAN(min_cluster_size=3, min_samples=1, metric='euclidean', core_dist_n_jobs=1)
@@ -106,15 +189,15 @@ def compute_clustering_metrics(args, embeddings, labels):
     return ari, nmi, discovered_ids
 
 def plot_benchmark_results(results_df, save_dir):
-    plt.figure(figsize=(14, 7))
     x = np.arange(len(results_df))
-    width = 0.2
     
+    # 1. Retrieval Metrics Graph
+    plt.figure(figsize=(14, 7))
+    width = 0.2
     plt.bar(x - width*1.5, results_df['Rank-1 (%)'], width, label='Rank-1', color='#1f77b4')
     plt.bar(x - width*0.5, results_df['Rank-5 (%)'], width, label='Rank-5', color='#2ca02c')
     plt.bar(x + width*0.5, results_df['Rank-10 (%)'], width, label='Rank-10', color='#9467bd')
     plt.bar(x + width*1.5, results_df['mAP (%)'], width, label='mAP', color='#ff7f0e')
-    
     plt.ylabel('Percentage (%)', fontsize=12)
     plt.title('Re-ID Model Benchmarks (Retrieval)', fontsize=14)
     plt.xticks(x, results_df['Model Name'], rotation=45, ha='right', fontsize=10)
@@ -123,12 +206,11 @@ def plot_benchmark_results(results_df, save_dir):
     plt.savefig(os.path.join(save_dir, 'benchmark_retrieval.png'), dpi=300)
     plt.close()
 
+    # 2. Clustering Metrics Graph
     plt.figure(figsize=(14, 7))
     width = 0.35
-    
     plt.bar(x - width/2, results_df['ARI'], width, label='ARI', color='#8c564b')
     plt.bar(x + width/2, results_df['NMI'], width, label='NMI', color='#e377c2')
-    
     plt.ylabel('Score (0 to 1)', fontsize=12)
     plt.title('Re-ID Model Benchmarks (Open-Set Clustering)', fontsize=14)
     plt.xticks(x, results_df['Model Name'], rotation=45, ha='right', fontsize=10)
@@ -136,6 +218,24 @@ def plot_benchmark_results(results_df, save_dir):
     plt.tight_layout()
     plt.savefig(os.path.join(save_dir, 'benchmark_clustering.png'), dpi=300)
     plt.close()
+
+    if 'BaKS' in results_df.columns:
+        plt.figure(figsize=(14, 7))
+        width = 0.25
+        plt.bar(x - width, results_df['BaKS'], width, label='BaKS (Knowns)', color='#17becf')
+        plt.bar(x, results_df['BAUS'], width, label='BAUS (Unknowns)', color='#bcbd22')
+        plt.bar(x + width, results_df['H-Score'], width, label='H-Score (Geometric Mean)', color='#7f7f7f')
+        plt.ylabel('Score (0 to 1)', fontsize=12)
+        plt.title('Re-ID Model Benchmarks (Open-Set Performance)', fontsize=14)
+        plt.xticks(x, results_df['Model Name'], rotation=45, ha='right', fontsize=10)
+        
+        # Add a threshold line to easily spot perfect balance
+        plt.axhline(y=0.5, color='r', linestyle='--', alpha=0.3)
+        
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_dir, 'benchmark_openset.png'), dpi=300)
+        plt.close()
 
 def plot_detailed_tsne(features_nd, labels, title, save_path):
     dim = features_nd.shape[1]
@@ -220,12 +320,16 @@ def evaluate_metrics_worker(ckpt_path, feats_np, labels_np, args):
     features = torch.from_numpy(feats_np)
     labels = torch.from_numpy(labels_np)
     
-    r1, r5, r10, map_val = compute_reid_metrics(features, labels, device='cpu')
+    # Pass known_classes down!
+    r1, r5, r10, map_val, baks, baus = compute_reid_metrics(features, labels, known_classes, device='cpu', sim_thresh=0.6)
     ari, nmi, discovered_ids = compute_clustering_metrics(args, feats_np, labels_np)
     
+    harmonic_score = np.sqrt(baks * baus)
+
     return {
         'Model Name': model_name.replace('.pth', ''),
         'Rank-1 (%)': r1, 'Rank-5 (%)': r5, 'Rank-10 (%)': r10, 'mAP (%)': map_val,
+        'BaKS': baks, 'BAUS': baus, 'H-Score': harmonic_score, # <--- NEW METRICS ADDED HERE
         'ARI': ari, 'NMI': nmi, 'Discovered IDs': discovered_ids,
         'ckpt_path': ckpt_path 
     }
@@ -290,15 +394,18 @@ def main(args):
         test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, 
                                  num_workers=args.workers, persistent_workers=True)
 
+# --- PHASE 1: SEQUENTIAL GPU FEATURE EXTRACTION ---
+        # ... (loader setup code) ...
         for ckpt in sorted(pth_files):
             model_name = os.path.basename(ckpt)
             print(f"Processing: {model_name}")
             try:
-                model, _ = ReIDModel.load(ckpt, device=main_device)
+                # Capture the second return value (train_classes)
+                model, train_classes = ReIDModel.load(ckpt, device=main_device)
                 features, labels = extract_features(model, test_loader, main_device)
                 
-                # CRITICAL: Convert immediately to raw NumPy to strip PyTorch IPC/CUDA bindings
-                extracted_data[ckpt] = (features.cpu().numpy(), labels.cpu().numpy())
+                # CRITICAL: Store the known classes as a set alongside the numpy arrays
+                extracted_data[ckpt] = (features.cpu().numpy(), labels.cpu().numpy(), set(train_classes))
                 
                 # Free VRAM immediately
                 del model
@@ -310,14 +417,15 @@ def main(args):
         print(f"\n--- PHASE 2: PARALLEL METRICS CALCULATION ({args.parallel_workers} Workers) ---")
         results = []
         
-        # Explicitly enforce the spawn context for the Pool
         spawn_context = mp.get_context('spawn')
         
         with ProcessPoolExecutor(max_workers=args.parallel_workers, mp_context=spawn_context) as executor:
             futures = {}
-            for ckpt, (feats_np, lbls_np) in extracted_data.items():
-                # Send raw numpy arrays directly to the worker
-                future = executor.submit(evaluate_metrics_worker, ckpt, feats_np, lbls_np, args)
+            # Unpack the known_classes here
+            for ckpt, (feats_np, lbls_np, known_classes) in extracted_data.items():
+                
+                # Send raw numpy arrays AND known_classes to the worker
+                future = executor.submit(evaluate_metrics_worker, ckpt, feats_np, lbls_np, known_classes, args)
                 futures[future] = ckpt
                 
             for future in tqdm(as_completed(futures), total=len(futures), desc="Computing Metrics"):
@@ -335,7 +443,7 @@ def main(args):
     if args.top_k_detailed > 0:
         top_k = min(args.top_k_detailed, len(df))
         print(f"\n--- PHASE 3: PARALLEL t-SNE GENERATION (Top {top_k} Models) ---")
-        top_models = df.sort_values(by='mAP (%)', ascending=False).head(top_k)
+        top_models = df.sort_values(by='H-Score', ascending=False).head(top_k)
         
         # Catch for use_existing_csv scenario
         if args.use_existing_csv and not extracted_data:
@@ -346,9 +454,13 @@ def main(args):
             )
             test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers)
             for row in top_models.itertuples():
-                model, _ = ReIDModel.load(row.ckpt_path, device=main_device)
+                # --- FIX: Capture train_classes here ---
+                model, train_classes = ReIDModel.load(row.ckpt_path, device=main_device)
                 feats, lbls = extract_features(model, test_loader, main_device)
-                extracted_data[row.ckpt_path] = (feats.cpu().numpy(), lbls.cpu().numpy())
+                
+                # --- FIX: Store train_classes in the tuple ---
+                extracted_data[row.ckpt_path] = (feats.cpu().numpy(), lbls.cpu().numpy(), set(train_classes))
+                
                 del model
                 torch.cuda.empty_cache()
 
@@ -371,9 +483,9 @@ if __name__ == "__main__":
     
     # Directory & Data Config
     parser.add_argument("--checkpoints_dir", type=str, default="checkpoints_long_run_v2", help="Directory containing .pth models")
-    parser.add_argument("--csv_path", type=str, default="src/images/metadata.csv", help="Dataset metadata CSV")
-    parser.add_argument("--root_dir", type=str, default="src/images", help="Base directory for image files")
-    parser.add_argument("--cache_dir", type=str, default="src/images/graph_cache_pool", help="Cache directory for PT graphs")
+    parser.add_argument("--csv_path", type=str, default="src/images/reid-10k/metadata.csv", help="Dataset metadata CSV")
+    parser.add_argument("--root_dir", type=str, default="src/images/reid-10k", help="Base directory for image files")
+    parser.add_argument("--cache_dir", type=str, default="src/images/reid-10k/graph_cache_pool", help="Cache directory for PT graphs")
     
     # Holdout Config (Mirrors train_test_prototype)
     parser.add_argument("--holdout_dataset", type=str, default=None, help="Evaluate specifically on held-out dataset")
