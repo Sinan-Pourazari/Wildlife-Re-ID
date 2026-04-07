@@ -312,7 +312,7 @@ def get_test_samples(args):
 # PARALLEL WORKER FUNCTIONS (PURE CPU)
 # ==========================================
 
-def evaluate_metrics_worker(ckpt_path, feats_np, labels_np, args):
+def evaluate_metrics_worker(ckpt_path, feats_np, labels_np,known_classes, args):
     """Worker function to compute metrics purely from numpy arrays on CPU"""
     model_name = os.path.basename(ckpt_path)
     

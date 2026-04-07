@@ -169,7 +169,7 @@ class ReIDModel(nn.Module):
             }
 
         # Generate unique filename
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         species = getattr(args, 'holdout_species', 'universal') or 'universal'
         model_name = f"gnn_reid_{species}_{timestamp}.pth"
         save_path = os.path.join(args.checkpoint_dir, model_name)
@@ -547,13 +547,6 @@ def main(args):
     save_dir = "checkpoints"
     os.makedirs(save_dir, exist_ok=True)
 
-    # Create a unique name based on the holdout or timestamp
-    print(f"Saving model...")
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
-    model_name = f"gnn_reid_{args.holdout_species or 'universal'}_{timestamp}.pth"
-    save_path = os.path.join(save_dir, model_name)
-
-    print(f"--> Model and metadata saved to: {save_path}")
     # Evaluate as an Open Set since the holdout data contains unseen IDs
     print(f"\nEvaluating on Holdout Set...")
     #eval(model, test_loader, closed_set=False)
