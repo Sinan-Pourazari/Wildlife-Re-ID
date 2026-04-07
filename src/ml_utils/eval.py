@@ -1,59 +1,45 @@
 import os
 import glob
 import argparse
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import torch
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib import patheffects
 import seaborn as sns
 from tqdm import tqdm
 import torch.nn.functional as F
 from torch_geometric.loader import DataLoader
 from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
-from sklearn.model_selection import train_test_split
 import hdbscan
+import plotly.express as px
 
 # Import from your existing modules
 from train_test_prototype import ReIDModel, reduce_to_nd
 from dataloader import UniversalGraphDataset
-import embedding_clusterings as ec
-import plotly.express as px
-import pandas as pd
 
 def plot_interactive_3d_tsne(xyz, labels, title, save_path):
-    """Generates an interactive 3D t-SNE and saves it as an HTML file."""
-    
-    # Convert to DataFrame
     df = pd.DataFrame({
         'Component 1': xyz[:, 0],
         'Component 2': xyz[:, 1],
         'Component 3': xyz[:, 2],
-        # Convert labels to string so Plotly treats them as discrete categories/colors
         'Identity': [str(lab) for lab in labels] 
     })
 
-    # Create the interactive 3D scatter
     fig = px.scatter_3d(
-        df, 
-        x='Component 1', 
-        y='Component 2', 
-        z='Component 3',
-        color='Identity',
-        hover_name='Identity', # Tooltip when you hover over a dot
+        df, x='Component 1', y='Component 2', z='Component 3',
+        color='Identity', hover_name='Identity',
         title=f"{title}<br>Interactive 3D t-SNE Projection (N={len(labels)})",
         opacity=0.8
     )
 
-    # 1. Shrink the dots (Plotly defaults to massive dots)
-    # 2. Hide the legend (With 300+ identities, the legend will crash your browser)
     fig.update_traces(marker=dict(size=3))
     fig.update_layout(showlegend=False, margin=dict(l=0, r=0, b=0, t=40))
-
-    # Save as an interactive webpage
     fig.write_html(save_path)
 
 def extract_features(model, dataloader, device):
-    """Passes the test set through the model and collects embeddings and labels."""
     model.eval()
     all_emb = []
     all_labels = []
@@ -67,9 +53,7 @@ def extract_features(model, dataloader, device):
             
     return torch.cat(all_emb), torch.cat(all_labels)
 
-def compute_reid_metrics(features, labels, device='cuda'):
-    """Computes Rank-1, Rank-5, Rank-10 and mAP using cosine similarity."""
-    # 1. Move to GPU for fast matrix math
+def compute_reid_metrics(features, labels, device='cpu'):
     features = features.to(device)
     labels = labels.to(device)
     
@@ -81,10 +65,6 @@ def compute_reid_metrics(features, labels, device='cuda'):
     
     sorted_indices = torch.argsort(sim_matrix, dim=1, descending=True)
     sorted_labels = labels[sorted_indices]
-    
-    # 2. Bring back to CPU for the loop (so we don't clog VRAM)
-    sorted_labels = sorted_labels.cpu()
-    labels = labels.cpu()
     
     N = labels.size(0)
     aps = []
@@ -98,14 +78,12 @@ def compute_reid_metrics(features, labels, device='cuda'):
         if num_pos == 0:
             continue
             
-        # CMC at Rank 1, 5, 10
         if matches[0] == 1: cmc_1 += 1
         if matches[:5].sum() > 0: cmc_5 += 1
         if matches[:10].sum() > 0: cmc_10 += 1
             
-        # Average Precision (AP)
         cum_matches = torch.cumsum(matches, dim=0)
-        precision = cum_matches / torch.arange(1, N + 1, dtype=torch.float32)
+        precision = cum_matches / torch.arange(1, N + 1, dtype=torch.float32, device=device)
         ap = torch.sum(precision * matches) / num_pos
         aps.append(ap.item())
         
@@ -118,21 +96,16 @@ def compute_reid_metrics(features, labels, device='cuda'):
     return rank_1, rank_5, rank_10, mAP
 
 def compute_clustering_metrics(args, embeddings, labels):
-    # min_cluster_size=2 is key for Re-ID where some animals have few photos
-    clusterer = hdbscan.HDBSCAN(min_cluster_size=3, min_samples=1, metric='euclidean', core_dist_n_jobs=
-                                args.workers)
-    predicted_ids = clusterer.fit_predict(embeddings.numpy())
+    clusterer = hdbscan.HDBSCAN(min_cluster_size=3, min_samples=1, metric='euclidean', core_dist_n_jobs=1)
+    predicted_ids = clusterer.fit_predict(embeddings)
     
-    ari = adjusted_rand_score(labels.numpy(), predicted_ids)
-    nmi = normalized_mutual_info_score(labels.numpy(), predicted_ids)
+    ari = adjusted_rand_score(labels, predicted_ids)
+    nmi = normalized_mutual_info_score(labels, predicted_ids)
     
-    # Count clusters (ignoring -1 noise)
     discovered_ids = len(set(predicted_ids)) - (1 if -1 in predicted_ids else 0)
     return ari, nmi, discovered_ids
 
 def plot_benchmark_results(results_df, save_dir):
-    """Generates two bar charts: Retrieval (Rank/mAP) and Clustering (ARI/NMI)."""
-    # 1. Retrieval Metrics Graph
     plt.figure(figsize=(14, 7))
     x = np.arange(len(results_df))
     width = 0.2
@@ -150,7 +123,6 @@ def plot_benchmark_results(results_df, save_dir):
     plt.savefig(os.path.join(save_dir, 'benchmark_retrieval.png'), dpi=300)
     plt.close()
 
-    # 2. Clustering Metrics Graph
     plt.figure(figsize=(14, 7))
     width = 0.35
     
@@ -165,29 +137,15 @@ def plot_benchmark_results(results_df, save_dir):
     plt.savefig(os.path.join(save_dir, 'benchmark_clustering.png'), dpi=300)
     plt.close()
 
-from matplotlib import patheffects
-
-from matplotlib import patheffects
-import seaborn as sns
-import matplotlib.pyplot as plt
-import numpy as np
-
 def plot_detailed_tsne(features_nd, labels, title, save_path):
-    """
-    Pass it a 2D array -> Saves an independent 2D PNG.
-    Pass it a 3D array -> Saves an independent 3D PNG.
-    """
     dim = features_nd.shape[1]
-    
     fig = plt.figure(figsize=(12, 10))
     
-    # Strictly creates ONE full-screen axis (No subplots)
     if dim == 3:
         ax = plt.axes(projection='3d')
     else:
         ax = plt.axes()
 
-    # Generate distinct colors
     unique_labels = np.unique(labels)
     palette = sns.color_palette("husl", len(unique_labels))
     np.random.seed(42)
@@ -196,7 +154,6 @@ def plot_detailed_tsne(features_nd, labels, title, save_path):
     label_to_color = {lab: palette[i] for i, lab in enumerate(unique_labels)}
     color_list = [label_to_color[lab] for lab in labels]
 
-    # Plot based on dimension
     if dim == 3:
         ax.scatter(features_nd[:, 0], features_nd[:, 1], features_nd[:, 2], c=color_list, s=15, alpha=0.8)
         ax.set_zlabel("Component 3")
@@ -207,7 +164,6 @@ def plot_detailed_tsne(features_nd, labels, title, save_path):
     ax.set_xlabel("Component 1")
     ax.set_ylabel("Component 2")
     
-    # Annotate Top 15
     vals, counts = np.unique(labels, return_counts=True)
     top = vals[np.argsort(-counts)][:15]
     
@@ -229,115 +185,145 @@ def plot_detailed_tsne(features_nd, labels, title, save_path):
     plt.close()
 
 def get_test_samples(args):
-    """Reproduces the dataset splitting logic from train_test_prototype.py"""
     df = pd.read_csv(args.csv_path).dropna(subset=['identity'])
     df['global_identity'] = df['dataset'] + "_" + df['identity'].astype(str)
     
-    # Filter singles
     counts = df['global_identity'].value_counts()
     df = df[df['global_identity'].isin(counts[counts > 1].index)].reset_index(drop=True)
     
     from sklearn.preprocessing import LabelEncoder
     df['global_label'] = LabelEncoder().fit_transform(df['global_identity'])
 
-    # Holdout logic
     if args.holdout_species:
         test_df = df[df['species'] == args.holdout_species].reset_index(drop=True)
     elif args.holdout_dataset:
         test_df = df[df['dataset'] == args.holdout_dataset].reset_index(drop=True)
     else:
-        print("Loading exact test split from training run...")
         test_df = pd.read_csv(f"{args.checkpoints_dir}/current_test_split.csv")
+
+    if args.eval_filter_species:
+        test_df = test_df[test_df['species'] == args.eval_filter_species].reset_index(drop=True)
+        if len(test_df) == 0:
+            raise ValueError(f"No images found for species '{args.eval_filter_species}'!")
 
     return list(zip(test_df["path"], test_df["global_label"]))
 
-def main(args):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"[{device.type.upper()}] Starting Evaluation Suite...")
+# ==========================================
+# PARALLEL WORKER FUNCTIONS (PURE CPU)
+# ==========================================
+
+def evaluate_metrics_worker(ckpt_path, feats_np, labels_np, args):
+    """Worker function to compute metrics purely from numpy arrays on CPU"""
+    model_name = os.path.basename(ckpt_path)
     
-    # 1. Setup Data Paths
+    # Reconstruct isolated CPU PyTorch tensors for the matrix math
+    features = torch.from_numpy(feats_np)
+    labels = torch.from_numpy(labels_np)
+    
+    r1, r5, r10, map_val = compute_reid_metrics(features, labels, device='cpu')
+    ari, nmi, discovered_ids = compute_clustering_metrics(args, feats_np, labels_np)
+    
+    return {
+        'Model Name': model_name.replace('.pth', ''),
+        'Rank-1 (%)': r1, 'Rank-5 (%)': r5, 'Rank-10 (%)': r10, 'mAP (%)': map_val,
+        'ARI': ari, 'NMI': nmi, 'Discovered IDs': discovered_ids,
+        'ckpt_path': ckpt_path 
+    }
+
+def generate_tsne_worker(ckpt_path, feats_np, labels_np, args, eval_out_dir):
+    """Worker function to compute and plot t-SNE from numpy arrays on CPU"""
+    model_name = os.path.basename(ckpt_path).replace('.pth', '')
+    
+    # reduce_to_nd usually expects a torch tensor, adapt based on your train_test_prototype
+    features = torch.from_numpy(feats_np)
+    
+    # 2D t-SNE
+    xy_2d = reduce_to_nd(args, features, n_components=2, method="tsne", seed=42)
+    save_path_2d = os.path.join(eval_out_dir, f'tsne_2d_{model_name}.png')
+    plot_detailed_tsne(xy_2d, labels_np, model_name, save_path_2d)
+    
+    # 3D t-SNE
+    xyz_3d = reduce_to_nd(args, features, n_components=3, method="tsne", seed=42)
+    save_path_3d_png = os.path.join(eval_out_dir, f'tsne_3d_{model_name}.png')
+    plot_detailed_tsne(xyz_3d, labels_np, model_name, save_path_3d_png)
+    
+    save_path_3d_html = os.path.join(eval_out_dir, f'tsne_3d_interactive_{model_name}.html')
+    plot_interactive_3d_tsne(xyz_3d, labels_np, model_name, save_path_3d_html)
+    
+    return model_name
+
+# ==========================================
+# MAIN EXECUTION
+# ==========================================
+
+def main(args):
+    main_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"[{main_device.type.upper()}] Starting Asynchronous Pipeline...")
+    
     eval_out_dir = os.path.join(args.checkpoints_dir, "evaluation_results")
     csv_path = os.path.join(eval_out_dir, 'benchmark_stats.csv')
+    os.makedirs(eval_out_dir, exist_ok=True)
     
-    # --- PHASE 1: EVALUATION (OR SKIP) ---
+    test_samples = get_test_samples(args)
+    true_unique_ids = len(set(label for _, label in test_samples))
+    print(f"Evaluated Test Set Size: {len(test_samples)} images")
+    print(f"--> TRUE Unique Identities in Test Set: {true_unique_ids}")
+    
+    pth_files = glob.glob(os.path.join(args.checkpoints_dir, "*.pth"))
+    if not pth_files:
+        print(f"No .pth files found in {args.checkpoints_dir}")
+        return
+
+    # Dictionary to hold pure raw NumPy arrays in RAM (Safe for Multiprocessing)
+    extracted_data = {}
+
+    # --- PHASE 1: SEQUENTIAL GPU INFERENCE ---
     if args.use_existing_csv and os.path.exists(csv_path):
-        print(f"\n[ SKIPPING EVALUATION: Using existing benchmark results from {csv_path} ]")
+        print(f"\n[ PHASE 1 SKIPPED: Using existing benchmark results ]")
         df = pd.read_csv(csv_path)
-        
-        # We still need the dataloader for the t-SNE feature extraction later!
-        test_samples = get_test_samples(args)
-
-        true_unique_ids = len(set(label for _, label in test_samples))
-        print(f"Evaluated Test Set Size: {len(test_samples)} images")
-        print(f"--> TRUE Unique Identities in Test Set: {true_unique_ids}")
-        
-        test_dataset = UniversalGraphDataset(
-            samples=test_samples, root_dir=args.root_dir, cache_dir=args.cache_dir,
-            mode=args.data_mode, n_segments=args.segments, rebuild_cache=False 
-        )
-        test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, 
-                                 num_workers=args.workers, persistent_workers=True)
     else:
-        test_samples = get_test_samples(args)
-
-        true_unique_ids = len(set(label for _, label in test_samples))
-        print(f"Evaluated Test Set Size: {len(test_samples)} images")
-        print(f"--> TRUE Unique Identities in Test Set: {true_unique_ids}")
-
+        print(f"\n--- PHASE 1: SEQUENTIAL GPU FEATURE EXTRACTION ---")
         test_dataset = UniversalGraphDataset(
             samples=test_samples, root_dir=args.root_dir, cache_dir=args.cache_dir,
-            mode=args.data_mode, n_segments=args.segments, rebuild_cache=False 
+            mode=args.data_mode, n_segments=args.segments, rebuild_cache=False, features=args.features 
         )
         test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, 
                                  num_workers=args.workers, persistent_workers=True)
-        
-        os.makedirs(eval_out_dir, exist_ok=True)
-        summary_path = os.path.join(eval_out_dir, "test_set_summary.txt")
 
-        with open(summary_path, "w") as f:
-            f.write("=== Test Set Ground Truth ===\n")
-            f.write(f"Total Images: {len(test_samples)}\n")
-            f.write(f"True Unique Identities: {true_unique_ids}\n")
-        print(f"--> Ground truth stats saved to {summary_path}")
-        pth_files = glob.glob(os.path.join(args.checkpoints_dir, "*.pth"))
-
-        if not pth_files:
-            print(f"No .pth files found in {args.checkpoints_dir}")
-            return
-        
-        print(f"Found {len(pth_files)} checkpoints. Beginning Evaluation...")
-        results = []
-        
         for ckpt in sorted(pth_files):
             model_name = os.path.basename(ckpt)
-            print(f"\nEvaluating: {model_name}")
-            
+            print(f"Processing: {model_name}")
             try:
-                model, _ = ReIDModel.load(ckpt, device=device)
-            except Exception as e:
-                print(f"Failed to load {model_name}: {e}")
-                continue
+                model, _ = ReIDModel.load(ckpt, device=main_device)
+                features, labels = extract_features(model, test_loader, main_device)
                 
-            features, labels = extract_features(model, test_loader, device)
-            
-            r1, r5, r10, map_val = compute_reid_metrics(features, labels)
-            ari, nmi, discovered_ids = compute_clustering_metrics(args, features, labels)
-            
-            print(f"  Retrieval -> R1: {r1:.1f}% | R5: {r5:.1f}% | R10: {r10:.1f}% | mAP: {map_val:.1f}%")
-            print(f"  Clustering-> ARI: {ari:.3f} | NMI: {nmi:.3f} | Discovered IDs: {discovered_ids}")
-            
-            results.append({
-                'Model Name': model_name.replace('.pth', ''),
-                'Rank-1 (%)': r1, 'Rank-5 (%)': r5, 'Rank-10 (%)': r10, 'mAP (%)': map_val,
-                'ARI': ari, 'NMI': nmi, 'Discovered IDs': discovered_ids,
-                'ckpt_path': ckpt 
-            })
-            
-            del model, features, labels
-            torch.cuda.empty_cache()
-            
-        df = pd.DataFrame(results)
+                # CRITICAL: Convert immediately to raw NumPy to strip PyTorch IPC/CUDA bindings
+                extracted_data[ckpt] = (features.cpu().numpy(), labels.cpu().numpy())
+                
+                # Free VRAM immediately
+                del model
+                torch.cuda.empty_cache()
+            except Exception as e:
+                print(f"Failed to infer {model_name}: {e}")
+
+        # --- PHASE 2: PARALLEL CPU METRICS ---
+        print(f"\n--- PHASE 2: PARALLEL METRICS CALCULATION ({args.parallel_workers} Workers) ---")
+        results = []
         
+        # Explicitly enforce the spawn context for the Pool
+        spawn_context = mp.get_context('spawn')
+        
+        with ProcessPoolExecutor(max_workers=args.parallel_workers, mp_context=spawn_context) as executor:
+            futures = {}
+            for ckpt, (feats_np, lbls_np) in extracted_data.items():
+                # Send raw numpy arrays directly to the worker
+                future = executor.submit(evaluate_metrics_worker, ckpt, feats_np, lbls_np, args)
+                futures[future] = ckpt
+                
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Computing Metrics"):
+                results.append(future.result())
+                    
+        df = pd.DataFrame(results)
         print("\n================ BENCHMARK SUMMARY ================")
         display_df = df.drop(columns=['ckpt_path'])
         print(display_df.to_string(index=False))
@@ -345,40 +331,38 @@ def main(args):
         plot_benchmark_results(df, eval_out_dir)
         df.to_csv(csv_path, index=False)
 
-    # --- PHASE 2: TOP-K VISUALIZATION (2D and 3D) ---
+    # --- PHASE 3: PARALLEL TOP-K VISUALIZATION ---
     if args.top_k_detailed > 0:
         top_k = min(args.top_k_detailed, len(df))
-        print(f"\n[ Detailed Analysis: Generating t-SNE for Top {top_k} Models (Sorted by mAP) ]")
-        
+        print(f"\n--- PHASE 3: PARALLEL t-SNE GENERATION (Top {top_k} Models) ---")
         top_models = df.sort_values(by='mAP (%)', ascending=False).head(top_k)
         
-        for idx, row in top_models.iterrows():
-            model_name = row['Model Name']
-            print(f"\n--> Processing t-SNE for {model_name}...")
-            
-            model, _ = ReIDModel.load(row['ckpt_path'], device=device)
-            features, labels = extract_features(model, test_loader, device)
-            
-            # --- 1. Generate & Save 2D Image ---
-            print("    Computing 2D Reduction...")
-            xy_2d = reduce_to_nd(args,features, n_components=2, method="tsne", seed=42)
-            save_path_2d = os.path.join(eval_out_dir, f'tsne_2d_{model_name}.png')
-            plot_detailed_tsne(xy_2d, labels.numpy(), model_name, save_path_2d)
-            
-            # --- 2. Generate 3D ---
-            print("    Computing 3D Reduction...")
-            xyz_3d = reduce_to_nd(args, features, n_components=3, method="tsne", seed=42)
-            
-            # Save the static PNG for a quick glance
-            save_path_3d_png = os.path.join(eval_out_dir, f'tsne_3d_{model_name}.png')
-            plot_detailed_tsne(xyz_3d, labels.numpy(), model_name, save_path_3d_png)
-            
-            # --- NEW: Save the Interactive HTML ---
-            save_path_3d_html = os.path.join(eval_out_dir, f'tsne_3d_interactive_{model_name}.html')
-            plot_interactive_3d_tsne(xyz_3d, labels.numpy(), model_name, save_path_3d_html)
-            
-            del model, features, labels
-            torch.cuda.empty_cache()
+        # Catch for use_existing_csv scenario
+        if args.use_existing_csv and not extracted_data:
+            print("Re-extracting features sequentially for Top-K models...")
+            test_dataset = UniversalGraphDataset(
+                samples=test_samples, root_dir=args.root_dir, cache_dir=args.cache_dir,
+                mode=args.data_mode, n_segments=args.segments, rebuild_cache=False, features=args.features 
+            )
+            test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers)
+            for row in top_models.itertuples():
+                model, _ = ReIDModel.load(row.ckpt_path, device=main_device)
+                feats, lbls = extract_features(model, test_loader, main_device)
+                extracted_data[row.ckpt_path] = (feats.cpu().numpy(), lbls.cpu().numpy())
+                del model
+                torch.cuda.empty_cache()
+
+        spawn_context = mp.get_context('spawn')
+        with ProcessPoolExecutor(max_workers=args.parallel_workers, mp_context=spawn_context) as executor:
+            tsne_futures = []
+            for row in top_models.itertuples():
+                feats_np, lbls_np = extracted_data[row.ckpt_path]
+                tsne_futures.append(
+                    executor.submit(generate_tsne_worker, row.ckpt_path, feats_np, lbls_np, args, eval_out_dir)
+                )
+                
+            for future in tqdm(as_completed(tsne_futures), total=len(tsne_futures), desc="Generating Plots"):
+                future.result()
 
     print(f"\n--> All evaluations complete. Outputs saved to: {eval_out_dir}")
 
@@ -387,13 +371,14 @@ if __name__ == "__main__":
     
     # Directory & Data Config
     parser.add_argument("--checkpoints_dir", type=str, default="checkpoints_long_run_v2", help="Directory containing .pth models")
-    parser.add_argument("--csv_path", type=str, default="src/images/reid-10k/metadata.csv", help="Dataset metadata CSV")
-    parser.add_argument("--root_dir", type=str, default="src/images/reid-10k", help="Base directory for image files")
-    parser.add_argument("--cache_dir", type=str, default="src/images/reid-10k/graph_cache_pool", help="Cache directory for PT graphs")
+    parser.add_argument("--csv_path", type=str, default="src/images/metadata.csv", help="Dataset metadata CSV")
+    parser.add_argument("--root_dir", type=str, default="src/images", help="Base directory for image files")
+    parser.add_argument("--cache_dir", type=str, default="src/images/graph_cache_pool", help="Cache directory for PT graphs")
     
     # Holdout Config (Mirrors train_test_prototype)
     parser.add_argument("--holdout_dataset", type=str, default=None, help="Evaluate specifically on held-out dataset")
     parser.add_argument("--holdout_species", type=str, default=None, help="Evaluate specifically on held-out species")
+    parser.add_argument("--eval_filter_species", type=str, default=None, help="Isolate a single species from the standard test split (e.g., 'tiger')")
     
     # GNN & Dataloader
     parser.add_argument("--segments", type=int, default=300, help="Number of superpixel segments")
@@ -404,5 +389,9 @@ if __name__ == "__main__":
     # Evaluation specifics
     parser.add_argument("--top_k_detailed", type=int, default=5, help="Generate t-SNE embeddings and extra graphs for top K models")
     parser.add_argument("--use_existing_csv", action="store_true", help="Skip evaluation and plot t-SNE directly from benchmark_stats.csv")
+    parser.add_argument("--parallel_workers", type=int, default=4, help="Number of CPU/Evaluation processes to run concurrently")
+    
+    parser.add_argument("--features", nargs="+", default=["color", "pos", "hog", "lbp", "texture"], help="List of node features to extract")
+
     args = parser.parse_args()
     main(args)
