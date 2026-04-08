@@ -15,6 +15,9 @@ from torch_geometric.loader import DataLoader
 from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 import hdbscan
 import plotly.express as px
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import connected_components
+import torch.nn.functional as F
 
 # Import from your existing modules
 from train_test_prototype import ReIDModel, reduce_to_nd
@@ -108,21 +111,43 @@ def plot_interactive_3d_tsne(xyz, labels, title, save_path):
     fig.update_layout(showlegend=False, margin=dict(l=0, r=0, b=0, t=40))
     fig.write_html(save_path)
 
-def extract_features(model, dataloader, device):
+def extract_features(model, dataloader, device, species_confidence_thresh = 0.6):
     model.eval()
     all_emb = []
     all_labels = []
-    
+    all_species_preds = []
     with torch.no_grad():
         for data in tqdm(dataloader, desc="Extracting Features", leave=False):
             data = data.to(device)
-            emb = model(data)
-            all_emb.append(emb.cpu())
-            all_labels.append(data.y.cpu())
+            if data.y.dim() > 1 or data.y.numel() > data.x.size(0):
+                labels = data.y.view(-1, 2)[:, 0] # Grab just the Identity Label
+            else:
+                labels = data.y.view(-1)
+                
+            out = model(data)
             
-    return torch.cat(all_emb), torch.cat(all_labels)
+            # If model returns a tuple, it has the species head!
+            if isinstance(out, tuple):
+                emb, species_logits = out
+                # Convert logits to hard predictions (e.g., 0, 1, 2)
+                probs = F.softmax(species_logits, dim=1)
+                # 2. Get the highest probability and its corresponding class
+                max_probs, species_preds = torch.max(probs, dim=1)
+                # 3. If the model isn't confident, overwrite the prediction to -1 (Unknown Species)
+                species_preds[max_probs < species_confidence_thresh] = -1
+                all_species_preds.append(species_preds.cpu())
+            else:
+                emb = out
+                # Fallback for older models without a species head
+                all_species_preds.append(torch.zeros(emb.size(0), dtype=torch.long))
+            labels = data.y.view(emb.size(0), -1)[:, 0]
+            all_emb.append(emb.cpu())
+            all_labels.append(labels.cpu())
+            
+    return torch.cat(all_emb), torch.cat(all_labels), torch.cat(all_species_preds)
+            
 
-def compute_reid_metrics(features, labels, device='cpu', sim_thresh=0.6):
+def compute_reid_metrics(features, labels, known_classes, device='cpu', sim_thresh=0.6):
     features = features.to(device)
     labels = labels.to(device)
     
@@ -178,16 +203,85 @@ def compute_reid_metrics(features, labels, device='cpu', sim_thresh=0.6):
     baus = calculate_baus(y_true_np, y_pred_np, known_classes)
     return rank_1, rank_5, rank_10, mAP, baks, baus
 
-def compute_clustering_metrics(args, embeddings, labels):
-    clusterer = hdbscan.HDBSCAN(min_cluster_size=3, min_samples=1, metric='euclidean', core_dist_n_jobs=1)
-    predicted_ids = clusterer.fit_predict(embeddings)
+def compute_clustering_metrics_hdbscan(args, embeddings, labels, species_preds, sim_thresh=0.8):
+    # 1. Initialize all predictions as noise (-1)
+    predicted_ids = np.zeros(len(labels), dtype=int) - 1 
     
+    unique_species = np.unique(species_preds)
+    current_cluster_offset = 0 # Keeps track of the ID counter across different species
+    
+    # 2. Iterate through each predicted species independently
+    for species in unique_species:
+        # Create a boolean mask for the current species
+        mask = (species_preds == species)
+        species_embeddings = embeddings[mask]
+        
+        # If HDBSCAN's min_cluster_size is 4, it will crash or fail on tiny arrays
+        # We leave them as noise (-1) and skip
+        if len(species_embeddings) < 3:
+            continue
+            
+        # 3. Cluster just this specific species
+        clusterer = hdbscan.HDBSCAN(
+            min_cluster_size=3, 
+            min_samples=1, 
+            metric='euclidean', 
+            core_dist_n_jobs=1
+        )
+        species_clusters = clusterer.fit_predict(species_embeddings)
+        
+        # 4. Offset the cluster IDs so they don't overlap with the previous species
+        valid_clusters = (species_clusters != -1)
+        if np.any(valid_clusters):
+            # Shift the IDs up by the offset
+            species_clusters[valid_clusters] += current_cluster_offset
+            # Update the offset for the next loop
+            current_cluster_offset = np.max(species_clusters[valid_clusters]) + 1
+            
+        # 5. Place the updated labels back into the main array
+        predicted_ids[mask] = species_clusters
+
+    # 6. Compute standard metrics
     ari = adjusted_rand_score(labels, predicted_ids)
     nmi = normalized_mutual_info_score(labels, predicted_ids)
     
+    # Calculate how many unique IDs were found (excluding the noise label '-1')
     discovered_ids = len(set(predicted_ids)) - (1 if -1 in predicted_ids else 0)
+    
     return ari, nmi, discovered_ids
 
+def compute_clustering_metrics(args, embeddings, labels, species_preds, sim_thresh=0.8):
+    """
+    Replaces HDBSCAN with Rank-1 Graph Clustering (Connected Components).
+    """
+    # 1. Convert numpy array back to tensor for fast similarity math
+    features = torch.tensor(embeddings, dtype=torch.float32)
+    features = F.normalize(features, p=2, dim=1)
+    
+    # 2. Compute the same Cosine Similarity matrix used for retrieval
+    sim_matrix = torch.mm(features, features.t()).numpy()
+    species_preds_t = torch.tensor(species_preds)
+    cross_species_mask = species_preds_t.unsqueeze(1) != species_preds_t.unsqueeze(0)
+    
+    # set similarity scores between different species to inf
+    sim_matrix = torch.mm(features, features.t())
+    sim_matrix_np = sim_matrix.numpy()
+    # 3. Create the Adjacency Graph
+    # If the similarity between two images is higher than our threshold, connect them!
+    adj_matrix = (sim_matrix_np > sim_thresh).astype(int)
+    
+    # 4. Find the Clusters (Connected Components)
+    graph = csr_matrix(adj_matrix)
+    n_components, predicted_ids = connected_components(csgraph=graph, directed=False, return_labels=True)
+    
+    # 5. Compute Metrics
+    ari = adjusted_rand_score(labels, predicted_ids)
+    nmi = normalized_mutual_info_score(labels, predicted_ids)
+    
+    # The number of components IS the number of discovered IDs
+    discovered_ids = n_components
+    
+    return ari, nmi, discovered_ids
 def plot_benchmark_results(results_df, save_dir):
     x = np.arange(len(results_df))
     
@@ -305,14 +399,26 @@ def get_test_samples(args):
         test_df = test_df[test_df['species'] == args.eval_filter_species].reset_index(drop=True)
         if len(test_df) == 0:
             raise ValueError(f"No images found for species '{args.eval_filter_species}'!")
+    if hasattr(args, 'max_images_per_id') and args.max_images_per_id is not None:
+        # Determine the column to group by based on what split was loaded
+        group_col = 'global_label' if 'global_label' in test_df.columns else 'identity'
+        
+        # Randomly sample 'max_images_per_id' from each group, using a fixed seed for reproducibility
+        test_df = test_df.groupby(group_col, group_keys=False).apply(
+            lambda x: x.sample(min(len(x), args.max_images_per_id), random_state=42)
+        ).reset_index(drop=True)
+        
+        print(f"Downsampled test set to a maximum of {args.max_images_per_id} images per identity.")
+        print(f"New test set size: {len(test_df)} images")
 
-    return list(zip(test_df["path"], test_df["global_label"]))
+    #TODO CHANGE THIS WE LATER WANT THE SPECIES ID TOO
+    return list(zip(test_df["path"], test_df["global_label"], [0] * len(test_df)))
 
 # ==========================================
 # PARALLEL WORKER FUNCTIONS (PURE CPU)
 # ==========================================
 
-def evaluate_metrics_worker(ckpt_path, feats_np, labels_np,known_classes, args):
+def evaluate_metrics_worker(ckpt_path, feats_np, labels_np, species_preds_np,known_classes, args):
     """Worker function to compute metrics purely from numpy arrays on CPU"""
     model_name = os.path.basename(ckpt_path)
     
@@ -322,7 +428,7 @@ def evaluate_metrics_worker(ckpt_path, feats_np, labels_np,known_classes, args):
     
     # Pass known_classes down!
     r1, r5, r10, map_val, baks, baus = compute_reid_metrics(features, labels, known_classes, device='cpu', sim_thresh=0.6)
-    ari, nmi, discovered_ids = compute_clustering_metrics(args, feats_np, labels_np)
+    ari, nmi, discovered_ids = compute_clustering_metrics_hdbscan(args, feats_np, labels_np, species_preds_np, sim_thresh = 0.8)
     
     harmonic_score = np.sqrt(baks * baus)
 
@@ -369,7 +475,8 @@ def main(args):
     os.makedirs(eval_out_dir, exist_ok=True)
     
     test_samples = get_test_samples(args)
-    true_unique_ids = len(set(label for _, label in test_samples))
+    #TODO _ is indiv id and species id!
+    true_unique_ids = len(set(label for _, label, _ in test_samples))
     print(f"Evaluated Test Set Size: {len(test_samples)} images")
     print(f"--> TRUE Unique Identities in Test Set: {true_unique_ids}")
     
@@ -388,7 +495,7 @@ def main(args):
     else:
         print(f"\n--- PHASE 1: SEQUENTIAL GPU FEATURE EXTRACTION ---")
         test_dataset = UniversalGraphDataset(
-            samples=test_samples, root_dir=args.root_dir, cache_dir=args.cache_dir,
+            samples=test_samples, root_dir=args.root_dir, cache_dir=args.cache_dir, n_hops= args.n_hops,
             mode=args.data_mode, n_segments=args.segments, rebuild_cache=False, features=args.features 
         )
         test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, 
@@ -402,10 +509,10 @@ def main(args):
             try:
                 # Capture the second return value (train_classes)
                 model, train_classes = ReIDModel.load(ckpt, device=main_device)
-                features, labels = extract_features(model, test_loader, main_device)
-                
+                features, labels, species_preds = extract_features(model, test_loader, main_device)
+                known_classes_set = set(train_classes) if train_classes is not None else set()                
                 # CRITICAL: Store the known classes as a set alongside the numpy arrays
-                extracted_data[ckpt] = (features.cpu().numpy(), labels.cpu().numpy(), set(train_classes))
+                extracted_data[ckpt] = (features.cpu().numpy(), labels.cpu().numpy(), species_preds.cpu().numpy(), known_classes_set)
                 
                 # Free VRAM immediately
                 del model
@@ -422,16 +529,17 @@ def main(args):
         with ProcessPoolExecutor(max_workers=args.parallel_workers, mp_context=spawn_context) as executor:
             futures = {}
             # Unpack the known_classes here
-            for ckpt, (feats_np, lbls_np, known_classes) in extracted_data.items():
-                
+            for ckpt, (feats_np, lbls_np, species_preds_np, known_classes) in extracted_data.items():                
                 # Send raw numpy arrays AND known_classes to the worker
-                future = executor.submit(evaluate_metrics_worker, ckpt, feats_np, lbls_np, known_classes, args)
+                future = executor.submit(evaluate_metrics_worker, ckpt, feats_np, lbls_np, species_preds_np, known_classes, args)                
                 futures[future] = ckpt
                 
             for future in tqdm(as_completed(futures), total=len(futures), desc="Computing Metrics"):
                 results.append(future.result())
                     
         df = pd.DataFrame(results)
+        df = df.sort_values(by='Model Name', ascending=True).reset_index(drop=True)
+
         print("\n================ BENCHMARK SUMMARY ================")
         display_df = df.drop(columns=['ckpt_path'])
         print(display_df.to_string(index=False))
@@ -456,11 +564,11 @@ def main(args):
             for row in top_models.itertuples():
                 # --- FIX: Capture train_classes here ---
                 model, train_classes = ReIDModel.load(row.ckpt_path, device=main_device)
-                feats, lbls = extract_features(model, test_loader, main_device)
-                
+                feats, lbls, species_preds = extract_features(model, test_loader, main_device)                
                 # --- FIX: Store train_classes in the tuple ---
-                extracted_data[row.ckpt_path] = (feats.cpu().numpy(), lbls.cpu().numpy(), set(train_classes))
-                
+                known_classes_set = set(train_classes) if train_classes is not None else set()
+                extracted_data[row.ckpt_path] = (feats.cpu().numpy(), lbls.cpu().numpy(), species_preds.cpu().numpy(), known_classes_set)                
+               
                 del model
                 torch.cuda.empty_cache()
 
@@ -468,7 +576,7 @@ def main(args):
         with ProcessPoolExecutor(max_workers=args.parallel_workers, mp_context=spawn_context) as executor:
             tsne_futures = []
             for row in top_models.itertuples():
-                feats_np, lbls_np = extracted_data[row.ckpt_path]
+                feats_np, lbls_np, species_preds_np, _ = extracted_data[row.ckpt_path]                
                 tsne_futures.append(
                     executor.submit(generate_tsne_worker, row.ckpt_path, feats_np, lbls_np, args, eval_out_dir)
                 )
@@ -497,13 +605,18 @@ if __name__ == "__main__":
     parser.add_argument("--data_mode", type=str, default="auto", choices=["auto", "memory", "lazy"], help="Data load mode")
     parser.add_argument("--batch_size", type=int, default=128, help="Evaluation batch size")
     parser.add_argument("--workers", type=int, default=4, help="CPU workers for DataLoader")
-    
+    #parser.add_argument("--n_hops", type=int, default=1, help="Number of hops for edge connections (1 = direct neighbors, 2 = neighbors of neighbors)")
+
     # Evaluation specifics
     parser.add_argument("--top_k_detailed", type=int, default=5, help="Generate t-SNE embeddings and extra graphs for top K models")
     parser.add_argument("--use_existing_csv", action="store_true", help="Skip evaluation and plot t-SNE directly from benchmark_stats.csv")
     parser.add_argument("--parallel_workers", type=int, default=4, help="Number of CPU/Evaluation processes to run concurrently")
     
+    # Add this down with your other argparse definitions
+    parser.add_argument("--max_images_per_id", type=int, default=None, help="Maximum number of images to keep per identity to prevent vector space clutter")
     parser.add_argument("--features", nargs="+", default=["color", "pos", "hog", "lbp", "texture"], help="List of node features to extract")
+    #TODO CHANGE THIS SO ITS LOADED FROM THE SAVED MODEL
+    parser.add_argument("--n_hops", type=int, default=1, help="Number of hops for edge connections (1 = direct neighbors, 2 = neighbors of neighbors)")
 
     args = parser.parse_args()
     main(args)
