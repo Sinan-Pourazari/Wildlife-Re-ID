@@ -4,27 +4,51 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
+
 class PKBatchSampler(Sampler):
-    def __init__(self, labels, P=8, K=4, drop_last=True):
+    def __init__(self, labels, P=8, K=4, drop_last=True, alpha = 0.5):
         self.labels = np.asarray(labels)
         self.P = P
         self.K = K
         self.drop_last = drop_last
+        # alpha = penalty factor for IDs with many occurancess
+        self.alpha = alpha
 
         self.label_to_indices = {}
         for i, y in enumerate(self.labels):
             self.label_to_indices.setdefault(int(y), []).append(i)
+
         self.unique_labels = list(self.label_to_indices.keys())
+
+        # --- WEIGHT CALCULATION ---
+        # Count the number of images each identity has
+        counts = np.array([len(self.label_to_indices[y]) for y in self.unique_labels])
+
+        # Apply the penalty: 1 / (count^alpha)
+        # use a small epsilon to prevent any theoretical division by zero
+        weights = 1.0 / ((counts ** self.alpha) + 1e-8)
+
+        # Normalize weights so they sum to 1.0 (creating a valid probability distribution)
+        self.probabilities = weights / weights.sum()
 
     def __iter__(self):
         n_batches = len(self)
-
         for _ in range(n_batches):
-            # sample P identities
+            # Sample P identities using our calculated probability distribution
             if len(self.unique_labels) >= self.P:
-                chosen = random.sample(self.unique_labels, self.P)
+                chosen = np.random.choice(
+                    self.unique_labels, 
+                    size=self.P, 
+                    replace=False, 
+                    p=self.probabilities
+                )
             else:
-                chosen = random.choices(self.unique_labels, k=self.P)
+                chosen = np.random.choice(
+                    self.unique_labels, 
+                    size=self.P, 
+                    replace=True, 
+                    p=self.probabilities
+                )
 
             batch = []
             for y in chosen:
