@@ -104,7 +104,7 @@ class GraphImageDataset(PyGDataset):
         return graph
     
 class ReIDModel(nn.Module):
-    def __init__(self, num_classes, in_dim=14, hidden_dim=256, gnn_out_dim=256, emb_dim=512, use_hybrid_pooling=True):
+    def __init__(self, num_classes, num_species, in_dim=14, hidden_dim=256, gnn_out_dim=256, emb_dim=512, use_hybrid_pooling=True):
         super().__init__()
         self.save_params = {
             'num_classes': num_classes,
@@ -129,8 +129,11 @@ class ReIDModel(nn.Module):
             nn.Linear(hidden_dim, emb_dim),
         )
 
-        # Classification head (Used ONLY during training for CE loss)
+        # ID Classification head (Used ONLY during training for CE loss)
         self.classifier = nn.Linear(emb_dim, num_classes)
+
+        # Species Classification head
+        self.species_classifier = nn.Linear(emb_dim, num_species)
 
     def forward(self, data):
         # 1. Extract graph-level features
@@ -145,12 +148,19 @@ class ReIDModel(nn.Module):
         if self.training:
             # Return both for the dual-loss training loop
             logits = self.classifier(features) # Use un-normalized features for CE
-            return embeddings, logits ,features
-        
+            if self.species_classifier is not None:
+                species_logits = self.species_classifier(features)
+                return embeddings, logits, species_logits ,features
+            
+            return embeddings, logits, features
+        elif self.species_classifier is not None:
+            species_logits = self.species_classifier(features)
+            return embeddings, species_logits
+
         return embeddings
     
     # --- CHANGE 1: Accept train_classes instead of label_encoder ---
-    def save(self, args, epoch, optimizer, train_classes=None):
+    def save(self, args, epoch, optimizer, train_classes=None, species_classes = None):
         """Saves weights, metadata, and hyperparameters with attribute safety."""
         if not os.path.exists(args.checkpoint_dir):
             os.makedirs(args.checkpoint_dir)
@@ -182,7 +192,8 @@ class ReIDModel(nn.Module):
             'epoch': epoch,                                 
             'args': vars(args) if hasattr(args, '__dict__') else args,
             # --- CHANGE 2: Save the raw list directly ---
-            'label_encoder_classes': train_classes, 
+            'label_encoder_classes': train_classes,
+            'species_classes': species_classes, 
             'timestamp': timestamp
         }
     
@@ -208,6 +219,11 @@ class ReIDModel(nn.Module):
         if 'num_classes' not in hyperparams:
             hyperparams['num_classes'] = 1
 
+        species_classes = checkpoint.get('species_classes', None)
+        if species_classes is not None:
+            hyperparams['num_species'] = len(species_classes)
+        else:
+            hyperparams['num_species'] = None # Fallback for your old models
         model = ReIDModel(**hyperparams)
         
         # FILTER OUT THE CLASSIFIER
@@ -228,24 +244,26 @@ def train_one_epoch(loader, model, optimizer, margin=1.0):
     total_triplet = 0.0
     total_ce = 0.0
     total_compact = 0.0
+    total_species = 0.0
     criterion_ce = nn.CrossEntropyLoss()
     for data in loader:
         data = data.to(device)
-        labels = data.y.view(-1).to(device)
 
+        # reshape(-1, 2) ensures it splits the pairs correctly, then we separate them
+        y_stacked = data.y.view(-1, 2).to(device) 
+        labels = y_stacked[:, 0]          # Identity labels
+        species_labels = y_stacked[:, 1]  # Species labels
         # Unpack the two outputs
-        emb, logits, features = model(data)
+        emb, logits, species_logits, features = model(data)
 
         # Calculate losses
         #loss_triplet = batch_hard_triplet_loss(emb, labels, margin=margin)
         loss_triplet = batch_topk_triplet_loss(emb, labels, margin=margin, k_pos=1, k_neg=10)
         loss_ce = 0.25 * criterion_ce(logits, labels)
-
-        
-        loss_compact = 6 * batch_compactness_loss(features, labels)
-
+        loss_compact = 4 * batch_compactness_loss(features, labels)
+        loss_ce_species = 1 * criterion_ce(species_logits, species_labels)
         # Combined Loss
-        loss = loss_triplet + loss_ce + loss_compact
+        loss = loss_triplet + loss_ce + loss_compact + loss_ce_species
 
         optimizer.zero_grad()
         loss.backward()
@@ -255,16 +273,17 @@ def train_one_epoch(loader, model, optimizer, margin=1.0):
         total_triplet += loss_triplet
         total_ce += loss_ce
         total_compact += loss_compact
+        total_species += loss_ce_species
 
-    return total / len(loader), total_triplet / len(loader), total_ce / len(loader), total_compact / len(loader) 
+    return total / len(loader), total_triplet / len(loader), total_ce / len(loader), total_compact / len(loader), total_species / len(loader)
 
 
-def train(loader, model, optimizer, num_epochs, start_epoch=0, args=None, train_classes = None):
+def train(loader, model, optimizer, num_epochs, start_epoch=0, args=None, train_classes = None, species_classes = None):
     for i in range(start_epoch, num_epochs):
-        total_batchloss, triplet, ce, compact = train_one_epoch(loader, model, optimizer, margin=1)
-        print(f"epoch {i} batchloss: {total_batchloss}, triplet loss: {triplet}, cross entropy loss: {ce}, compactness loss: {compact}")
+        total_batchloss, triplet, ce, compact, species = train_one_epoch(loader, model, optimizer, margin=1)
+        print(f"epoch {i} batchloss: {total_batchloss}, triplet loss: {triplet}, cross entropy loss: {ce}, compactness loss: {compact}, ce species loss {species}")
         if i % 2 ==0:
-            _=model.save(args,epoch=i, optimizer=optimizer, train_classes=train_classes )
+            _ = model.save(args, epoch=i, optimizer=optimizer, train_classes=train_classes, species_classes=species_classes)
 
 
 def knn_accuracy(embeddings, labels, k=4):
@@ -447,7 +466,7 @@ def main(args):
         # Standard Open-Set Split on the whole universe
         print("--> Standard Open-Set Split (No Holdout)")
         unique_labels = df["global_label"].unique()
-        train_labels, test_labels = train_test_split(unique_labels, test_size=0.1, random_state=42)
+        train_labels, test_labels = train_test_split(unique_labels, test_size=0.2, random_state=42)
         train_df = df[df["global_label"].isin(train_labels)].reset_index(drop=True)
         test_df = df[df["global_label"].isin(test_labels)].reset_index(drop=True)
         os.mkdir(args.checkpoint_dir)
@@ -458,24 +477,32 @@ def main(args):
     # are strictly 0 to (N-1) for the Cross Entropy classifier.
     print("\n[ Processing Labels ]")
     train_le = LabelEncoder()
+    species_le = LabelEncoder()
+    df['species_label'] = species_le.fit_transform(df['species'])
     train_df['contiguous_label'] = train_le.fit_transform(train_df['global_label'])
     
+    train_df['species_label'] = species_le.transform(train_df['species'])
+    test_df['species_label'] = species_le.transform(test_df['species'])
+
     # Calculate the number of classes for the model init
     num_train_classes = len(train_le.classes_)
+    num_species = len(species_le.classes_)
     print(f"--> Active Training Classes: {num_train_classes}")
+    print(f"--> Active Species Classes: {num_species}")
 
     # 4. Create Sample Lists (mapping path -> label)
     # Train uses the NEW contiguous labels
-    train_samples = list(zip(train_df["path"], train_df["contiguous_label"]))
+    train_samples = list(zip(train_df["path"], train_df["contiguous_label"], train_df["species_label"]))
     
     # Test uses the global_labels (Evaluation and Triplet loss don't care about gaps)
-    test_samples = list(zip(test_df["path"], test_df["global_label"]))
+    test_samples = list(zip(test_df["path"], test_df["global_label"], test_df["species_label"]))
 
     print(f"Train size: {len(train_samples)} images | Test size: {len(test_samples)} images")
     # --- Initialize Universal Datasets ---
     print("\n[ Preparing Training Data ]")
     train_dataset = UniversalGraphDataset(
         num_train_classes = num_train_classes,
+        n_hops= args.n_hops,
         samples=train_samples, 
         root_dir=img_root, 
         cache_dir=cache_pool, 
@@ -499,7 +526,8 @@ def main(args):
         cache_dir=cache_pool, 
         mode=args.data_mode, 
         n_segments=args.segments,
-        features= args.features
+        features= args.features,
+        n_hops= args.n_hops
         )
 
     # DataLoaders
@@ -514,7 +542,7 @@ def main(args):
     print(f"--> Dynamically detected Node Feature Dimension (in_dim): {dynamic_in_dim}")
 
     # Model & Optimizer (Notice in_dim is now dynamic)
-    model = ReIDModel(num_classes=num_train_classes, in_dim=dynamic_in_dim, hidden_dim=512, gnn_out_dim=256, emb_dim=512).to(device)
+    model = ReIDModel(num_classes=num_train_classes, num_species= num_species,in_dim=dynamic_in_dim, hidden_dim=512, gnn_out_dim=256, emb_dim=512).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
     # --- RESUME LOGIC ---
@@ -541,7 +569,8 @@ def main(args):
 
     # Train & Evaluate
     # Pass the start_epoch and args into the train loop
-    train(train_loader, model, optimizer, num_epochs=args.epochs, start_epoch=start_epoch, args=args, train_classes=train_labels.tolist())
+    train(train_loader, model, optimizer, num_epochs=args.epochs, start_epoch=start_epoch, args=args, train_classes=train_labels.tolist(), \
+           species_classes=species_le.classes_.tolist())
     # --- Saving the Results ---
     print("\n[ Saving Model ]")
     save_dir = "checkpoints"
@@ -565,6 +594,8 @@ if __name__ == "__main__":
     parser.add_argument("--img_size", type=int, default=1024, help="Max dimension (width or height) for images before graph creation")
     parser.add_argument("--subset_fraction", type=float, default=1.0, help="Fraction of identities to keep (e.g., 0.1 for 10%)")
     parser.add_argument("--species", type=str, nargs="+", default=None, help="List of specific species to use (e.g., --species tiger fox wolf)")
+    parser.add_argument("--n_hops", type=int, default=1, help="Number of hops for edge connections (1 = direct neighbors, 2 = neighbors of neighbors)")
+
     # Hardware settings
     parser.add_argument("--workers", type=int, default=4, help="Number of CPU workers for DataLoader")
     
