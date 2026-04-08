@@ -14,7 +14,7 @@ from gnn.gnn import image_to_superpixel_graph
 from PIL import ImageOps
 import numpy as np
 
-def process_for_lmdb(filename, root_dir, n_segments, features, max_size=1024):
+def process_for_lmdb(filename, root_dir, n_segments, features, max_size, n_hops):
     img_path = os.path.join(root_dir, filename)
     img = Image.open(img_path).convert("RGB")
 
@@ -27,7 +27,7 @@ def process_for_lmdb(filename, root_dir, n_segments, features, max_size=1024):
 
     from gnn.gnn import image_to_superpixel_graph
     # Pass the mask in to keep the graph safe from black edges
-    graph = image_to_superpixel_graph(img, mask=np.array(mask), n_segments=n_segments, features=features)
+    graph = image_to_superpixel_graph(img, mask=np.array(mask), n_segments=n_segments, n_hops=n_hops, features=features)
         
     buffer = io.BytesIO()
     torch.save(graph, buffer)
@@ -248,7 +248,7 @@ class InMemoryGraphDataset(PyGDataset):
 
 class UniversalGraphDataset(PyGDataset):
     _shared_envs = {}
-    def __init__(self, samples, root_dir, cache_dir, mode='auto', n_segments=300, rebuild_cache=False, img_size=1024, num_train_classes=None, features=['color', 'pos', 'hog']):
+    def __init__(self, samples, root_dir, cache_dir, n_hops, mode='auto', n_segments=300, rebuild_cache=False, img_size=1024, num_train_classes=None, features=['color', 'pos', 'hog']):
         super().__init__()
         self.samples = samples
         self.root_dir = root_dir
@@ -257,7 +257,8 @@ class UniversalGraphDataset(PyGDataset):
         self.img_size = img_size
         self.graphs = []
         self.features = features
-        
+        self.n_hops = n_hops
+
         if mode == 'auto':
             self.mode = 'memory' if len(samples) <= 8000 else 'lazy'
         else:
@@ -313,8 +314,9 @@ class UniversalGraphDataset(PyGDataset):
 
     def _get_key(self, filename):
         """Standardized byte-key generator for LMDB, now feature-aware."""
-        feature_str = "-".join(sorted(self.features)) # e.g., "color-hog-lbp-pos"
-        return f"seg{self.n_segments}_{feature_str}_{filename}".encode('utf-8')
+        feature_str = "-".join(sorted(self.features)) 
+        # FIX: Added img_size so 512 and 1024 are treated as completely different files!
+        return f"res{self.img_size}_seg{self.n_segments}_hops{self.n_hops}_{feature_str}_{filename}".encode('utf-8')
 
     def _warmup_cache(self, rebuild):
         print(f"\n[ CACHE WARMUP ] Checking {len(self.samples)} samples against LMDB...")
@@ -328,7 +330,7 @@ class UniversalGraphDataset(PyGDataset):
 
         # Filter down to tasks that actually need processing
         tasks = []
-        for filename, _ in self.samples:
+        for filename, _, _ in self.samples:
             key = self._get_key(filename)
             if not rebuild and key in existing_keys:
                 continue
@@ -346,7 +348,7 @@ class UniversalGraphDataset(PyGDataset):
             torch.set_num_threads(1)  # <--- STOPS CPU THRASHING
             
             key, filename = task
-            success, result = process_for_lmdb(filename, self.root_dir, self.n_segments, self.features, self.img_size)
+            success, result = process_for_lmdb(filename, self.root_dir, self.n_segments, self.n_hops, self.features, self.img_size)
             return key, success, result
         # return_as="generator" yields results as soon as workers finish them
         results_gen = Parallel(
@@ -393,7 +395,7 @@ class UniversalGraphDataset(PyGDataset):
         env = self._init_db(write=False)
         
         with env.begin() as txn:
-            for filename, label in tqdm(self.samples, desc="RAM Loading"):
+            for filename, label, species_label in tqdm(self.samples, desc="RAM Loading"):
                 key = self._get_key(filename)
                 graph_bytes = txn.get(key)
                 
@@ -402,7 +404,7 @@ class UniversalGraphDataset(PyGDataset):
                 
                 buffer = io.BytesIO(graph_bytes)
                 graph = torch.load(buffer, weights_only=False)
-                graph.y = torch.tensor([int(label)], dtype=torch.long)
+                graph.y = torch.tensor([int(label), int(species_label)], dtype=torch.long)
                 self.graphs.append(graph)
 
     def len(self):
@@ -415,7 +417,7 @@ class UniversalGraphDataset(PyGDataset):
             # Get the shared handle
             env = self._init_db(write=False)
             
-            filename, label = self.samples[idx]
+            filename, label, species_label = self.samples[idx]
             key = self._get_key(filename)
             
             with env.begin(write=False) as txn:
@@ -426,7 +428,7 @@ class UniversalGraphDataset(PyGDataset):
                 
             buffer = io.BytesIO(graph_bytes)
             graph = torch.load(buffer, weights_only=False)
-            graph.y = torch.tensor([int(label)], dtype=torch.long)
+            graph.y = torch.tensor([int(label), int(species_label)], dtype=torch.long)
             
             return graph
             

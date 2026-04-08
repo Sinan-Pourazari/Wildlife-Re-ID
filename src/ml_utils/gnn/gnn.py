@@ -13,7 +13,7 @@ from torch_geometric.nn import GATv2Conv, global_mean_pool, global_max_pool
 from PIL import Image
 from helper import per_pixel_hog_bins # Make sure this import is still correct for your project!
 
-def image_to_superpixel_graph(img, mask=None, n_segments=300, hog_bins=9, hog_signed=False, hog_l2norm=True, features=['color', 'pos', 'hog']):
+def image_to_superpixel_graph(img, mask=None, n_segments=300, hog_bins=9, hog_signed=False, hog_l2norm=True, features=['color', 'pos', 'hog'], n_hops = 1):
     if isinstance(img, Image.Image):
         img = np.array(img)
     
@@ -148,7 +148,28 @@ def image_to_superpixel_graph(img, mask=None, n_segments=300, hog_bins=9, hog_si
         edge_index = torch.tensor(list(edges), dtype=torch.long).t().contiguous()
         data = Data(x=x, edge_index=edge_index)
         
+    if n_hops > 1:
+        actual_nodes = data.x.size(0)
+        
+        # 1. Create a dense adjacency matrix
+        adj = torch.zeros((actual_nodes, actual_nodes), dtype=torch.float)
+        adj[data.edge_index[0], data.edge_index[1]] = 1.0
+        
+        # 2. Add self-loops (This ensures 1-hop edges aren't lost when finding 2-hop edges)
+        adj.fill_diagonal_(1.0)
+        
+        # 3. Multiply matrix by itself 'n' times
+        adj_n = torch.matrix_power(adj, n_hops)
+        
+        # 4. Remove self-loops (GNNs handle this internally usually, but best to be clean)
+        adj_n.fill_diagonal_(0.0)
+        
+        # 5. Convert back to PyG edge_index format
+        new_edge_index = (adj_n > 0).nonzero(as_tuple=False).t().contiguous()
+        data.edge_index = new_edge_index
+        
     return data
+
 
 # ==========================================
 # --- Restored GNN Encoder ---
