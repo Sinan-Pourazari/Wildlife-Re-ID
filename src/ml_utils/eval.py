@@ -572,8 +572,18 @@ def main(args):
     else:
         print(f"\n--- PHASE 1: SEQUENTIAL GPU FEATURE EXTRACTION ---")
         test_dataset = UniversalGraphDataset(
-            samples=test_samples, root_dir=args.root_dir, cache_dir=args.cache_dir, n_hops= args.n_hops,
-            mode=args.data_mode, n_segments=args.segments, rebuild_cache=False, features=args.features 
+            samples=test_samples, 
+            root_dir=args.root_dir, 
+            cache_dir=args.cache_dir, 
+            n_hops=args.n_hops,
+            mode=args.data_mode, 
+            n_segments=args.segments, 
+            rebuild_cache=False, 
+            features=args.features,
+            img_size=args.img_size,                  # <-- Added
+            cae_version=args.cae_version,            # <-- Added
+            cae_weights_path=args.cae_weights_path,  # <-- Added
+            cae_latent_dim=args.cae_latent_dim       # <-- Added
         )
         test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, 
                                  num_workers=args.workers, persistent_workers=True)
@@ -634,9 +644,19 @@ def main(args):
         if args.use_existing_csv and not extracted_data:
             print("Re-extracting features sequentially for Top-K models...")
             test_dataset = UniversalGraphDataset(
-                samples=test_samples, root_dir=args.root_dir, cache_dir=args.cache_dir,
-                mode=args.data_mode, n_segments=args.segments, rebuild_cache=False, features=args.features 
-            )
+            samples=test_samples, 
+            root_dir=args.root_dir, 
+            cache_dir=args.cache_dir, 
+            n_hops=args.n_hops,
+            mode=args.data_mode, 
+            n_segments=args.segments, 
+            rebuild_cache=False, 
+            features=args.features,
+            img_size=args.img_size,                 
+            cae_version=args.cae_version,            # <--- ADD THIS
+            cae_weights_path=args.cae_weights_path,  # <--- ADD THIS
+            cae_latent_dim=args.cae_latent_dim
+        )
             test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers)
             for row in top_models.itertuples():
                 model, train_classes = ReIDModel.load(row.ckpt_path, device=main_device)
@@ -692,6 +712,10 @@ if __name__ == "__main__":
     parser.add_argument("--features", nargs="+", default=["color", "pos", "hog", "lbp", "texture"], help="List of node features to extract")
     #TODO CHANGE THIS SO ITS LOADED FROM THE SAVED MODEL
     parser.add_argument("--n_hops", type=int, default=1, help="Number of hops for edge connections (1 = direct neighbors, 2 = neighbors of neighbors)")
-
+    
+    parser.add_argument("--cae_latent_dim", type=int, default=64, help="Dimensionality of the CAE texture vector")
+    parser.add_argument("--cae_version", type=str, default="none", help="Version string of the CAE model")
+    parser.add_argument("--cae_weights_path", type=str, default=None, help="Path to the trained CAE weights")
+    parser.add_argument("--img_size", type=int, default=1024, help="Image resolution used during training")
     args = parser.parse_args()
     main(args)

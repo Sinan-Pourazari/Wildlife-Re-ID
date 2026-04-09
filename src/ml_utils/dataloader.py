@@ -14,7 +14,7 @@ from gnn.gnn import image_to_superpixel_graph
 from PIL import ImageOps
 import numpy as np
 
-def process_for_lmdb(filename, root_dir, n_segments, features, max_size, n_hops):
+def process_for_lmdb(filename, root_dir, n_segments, features, max_size, n_hops, cae_weights_path, cae_latent_dim):
     img_path = os.path.join(root_dir, filename)
     img = Image.open(img_path).convert("RGB")
 
@@ -26,7 +26,12 @@ def process_for_lmdb(filename, root_dir, n_segments, features, max_size, n_hops)
     mask = Image.new('L', img.size, color=255)
 
     # Pass the mask in to keep the graph safe from black edges
-    graph = image_to_superpixel_graph(img, mask=np.array(mask), n_segments=n_segments, n_hops=n_hops, features=features)
+    graph = image_to_superpixel_graph(
+        img, mask=np.array(mask), n_segments=n_segments, 
+        n_hops=n_hops, features=features, 
+        cae_weights_path=cae_weights_path,
+        cae_latent_dim=cae_latent_dim 
+    )
         
     buffer = io.BytesIO()
     torch.save(graph, buffer)
@@ -247,7 +252,8 @@ class InMemoryGraphDataset(PyGDataset):
 
 class UniversalGraphDataset(PyGDataset):
     _shared_envs = {}
-    def __init__(self, samples, root_dir, cache_dir, n_hops, mode='auto', n_segments=300, rebuild_cache=False, img_size=1024, num_train_classes=None, features=['color', 'pos', 'hog']):
+    def __init__(self, samples, root_dir, cache_dir, n_hops, mode='auto', n_segments=300, rebuild_cache=False, img_size=1024,
+                  num_train_classes=None, features=['color', 'pos', 'hog'], cae_version="none", cae_weights_path=None, cae_latent_dim = None):
         super().__init__()
         self.samples = samples
         self.root_dir = root_dir
@@ -257,6 +263,9 @@ class UniversalGraphDataset(PyGDataset):
         self.graphs = []
         self.features = features
         self.n_hops = n_hops
+        self.cae_version = cae_version
+        self.cae_weights_path = cae_weights_path
+        self.cae_latent_dim = cae_latent_dim
 
         if mode == 'auto':
             self.mode = 'memory' if len(samples) <= 8000 else 'lazy'
@@ -314,12 +323,16 @@ class UniversalGraphDataset(PyGDataset):
     def _get_key(self, filename):
         """Standardized byte-key generator for LMDB, now feature-aware."""
         feature_str = "-".join(sorted(self.features)) 
-        # FIX: Added img_size so 512 and 1024 are treated as completely different files!
+        
+        # If 'cae' is in the features, append the model version!
+        if 'cae' in self.features and hasattr(self, 'cae_version'):
+            feature_str += f"_CAE-{self.cae_version}"
+            
         return f"res{self.img_size}_seg{self.n_segments}_hops{self.n_hops}_{feature_str}_{filename}".encode('utf-8')
 
     def _warmup_cache(self, rebuild):
         print(f"\n[ CACHE WARMUP ] Checking {len(self.samples)} samples against LMDB...")
-        
+        # If texture is requested, bake the CAE version right into the key!
         # 100GB map size. (This is virtual memory, it won't actually consume 100GB of disk space)
         env = self._init_db(write=True)
 
@@ -342,12 +355,23 @@ class UniversalGraphDataset(PyGDataset):
         print(f"--> Launching Parallel Warmup for {len(tasks)} missing graphs...")
         
         # Helper to wrap the task for Joblib
+        # Inside _warmup_cache in dataloader.py
         def wrapper(task):
             import torch
             torch.set_num_threads(1)  # <--- STOPS CPU THRASHING
-            
             key, filename = task
-            success, result = process_for_lmdb(filename, self.root_dir, self.n_segments, self.n_hops, self.features, self.img_size)
+            
+                    # Use explicit keywords to prevent positional mismatches!
+            success, result = process_for_lmdb(
+                filename=filename, 
+                root_dir=self.root_dir, 
+                n_segments=self.n_segments, 
+                features=self.features, 
+                max_size=self.img_size, 
+                n_hops=self.n_hops, 
+                cae_weights_path=self.cae_weights_path,
+                cae_latent_dim=self.cae_latent_dim # <--- ADD THIS
+            )
             return key, success, result
         # return_as="generator" yields results as soon as workers finish them
         results_gen = Parallel(

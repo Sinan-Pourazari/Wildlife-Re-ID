@@ -21,6 +21,8 @@ import numpy as np
 from sklearn.preprocessing import LabelEncoder
 import argparse
 from  pytorch_metric_learning.losses import ArcFaceLoss 
+from gnn.cae import train_and_save_cae
+
 #device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu" 
 if torch.cuda.is_available():
     device = "cuda"
@@ -408,11 +410,13 @@ def accuracy_to_color(acc_percent: float) -> str:
 
 def main(args):
     # Setup Paths
-    csv_path = "src/images/reid-10k/metadata.csv"
-    img_root = "src/images/reid-10k"  # Base directory where dataset folders live
-    cache_pool = "src/images/reid-10k/graph_cache_pool"
+    csv_path = args.csv_path
+    img_root = args.root_dir
+    cache_pool = args.cache_dir
+    
     # 1. Load the Universal Metadata
     print("\n[ Loading Metadata ]")
+    df = pd.read_csv(csv_path)
     df = pd.read_csv(csv_path)
     
     # --- FILTER BY SPECIFIC SPECIES ---
@@ -501,6 +505,22 @@ def main(args):
     test_samples = list(zip(test_df["path"], test_df["global_label"], test_df["species_label"]))
 
     print(f"Train size: {len(train_samples)} images | Test size: {len(test_samples)} images")
+
+    if 'latent' in args.features:
+        # Create a highly specific filename based on the current run's parameters
+        cae_filename = f"texture_encoder_seg{args.segments}_dim{args.cae_latent_dim}_size{args.img_size}.pth"
+        cae_path = os.path.join(args.checkpoint_dir, cae_filename)
+        
+        # Save the path to args so the DataLoader can access it later!
+        args.cae_path = cae_path 
+        
+        # If it doesn't exist, or the user forces a rebuild, train it now!
+        if not os.path.exists(cae_path) or args.rebuild:
+            print(f"\n[ TRIGGER: Missing Texture Encoder ({cae_filename}). Initiating Training Sequence ]")
+            train_and_save_cae(train_df, args, cae_path, device)
+        else:
+            print(f"\n[ Found pre-trained Texture Encoder at {cae_path} ]")
+
     # --- Initialize Universal Datasets ---
     print("\n[ Preparing Training Data ]")
     train_dataset = UniversalGraphDataset(
@@ -513,8 +533,11 @@ def main(args):
         n_segments=args.segments,
         img_size= args.img_size,
         rebuild_cache=args.rebuild,
-        features=args.features
-    )
+        features=args.features,
+        cae_version=args.cae_version,            
+        cae_weights_path=args.cae_weights_path ,
+        cae_latent_dim=args.cae_latent_dim 
+            )
 
     # Look at the very first graph in the dataset to see how wide the features are
     first_graph = train_dataset[0]
@@ -523,16 +546,19 @@ def main(args):
     print("\n[ Preparing Test/Holdout Data ]")
 
     test_dataset = UniversalGraphDataset(
-        num_train_classes = num_train_classes,
-        samples=test_samples, 
-        root_dir=img_root, 
-        cache_dir=cache_pool, 
-        mode=args.data_mode, 
+        samples=test_samples,
+        root_dir=img_root,       
+        cache_dir=cache_pool,
+        n_hops=args.n_hops,
+        mode=args.data_mode,
         n_segments=args.segments,
-        features= args.features,
-        n_hops= args.n_hops
-        )
-
+        rebuild_cache=args.rebuild,
+        features=args.features,
+        img_size=args.img_size,
+        num_train_classes=num_train_classes,
+        cae_version=args.cae_version,
+        cae_weights_path=args.cae_weights_path,
+        cae_latent_dim=args.cae_latent_dim )
     # DataLoaders
     batch_sampler = PKBatchSampler(train_df["global_label"].values, P=64, K=2)
     train_loader = DataLoader(train_dataset, batch_sampler=batch_sampler, num_workers=args.workers, persistent_workers=True, prefetch_factor=4)
@@ -614,9 +640,21 @@ if __name__ == "__main__":
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint .pth file to resume training")
 
     # Feature extractor settings:
-    parser.add_argument("--features", nargs="+", default=["color", "pos", "hog", "lbp", "texture"], help="List of node features to extract (color pos hog lbp texture)")
-    args = parser.parse_args()
+    parser.add_argument("--features", nargs="+", default=["color", "pos", "hog", "lbp", "cae", "texture"], help="List of node features to extract (color pos hog lbp texture)")
     
+    # CAE settings
+    parser.add_argument("--cae_latent_dim", type=int, default=64, help="Dimensionality of the CAE learned texture vector")
+    parser.add_argument("--cae_epochs", type=int, default=10, help="Epochs to train the Texture Encoder")
+    parser.add_argument("--cae_margin", type=float, default=0.5, help="Triplet loss margin for the Texture Encoder")
+    
+    parser.add_argument("--cae_version", type=str, default="v1_dim128", help="Version string of the CAE model (used for LMDB cache versioning)")
+    parser.add_argument("--cae_weights_path", type=str, default="models/cae/v1_dim128/weights.pth", help="Path to the trained CAE weights")
+    parser.add_argument("--root_dir", type=str, default="src/images/reid-10k", help="Base directory for images")
+    parser.add_argument("--csv_path", type=str, default="src/images/reid-10k/metadata.csv", help="Path to metadata CSV")
+    parser.add_argument("--cache_dir", type=str, default="src/images/reid-10k/graph_cache_pool", help="Cache directory for graphs")
+
+    args = parser.parse_args()
+
     main(args)
 
 

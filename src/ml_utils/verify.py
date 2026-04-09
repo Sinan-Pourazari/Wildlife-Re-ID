@@ -58,8 +58,8 @@ def verify_lmdb_cache(cache_dir):
             parts = key_str.split('_')
             
             # We assume the first 3 chunks (res, seg, features) define the configuration
-            if len(parts) >= 3 and parts[0].startswith('res'):
-                config_name = f"{parts[0]}_{parts[1]}_{parts[2]}"
+            if len(parts) >= 4 and parts[0].startswith('res'):
+                config_name = f"{parts[0]}_{parts[1]}_{parts[2]}_{parts[3]}"
             else:
                 config_name = "unknown_config"
                 

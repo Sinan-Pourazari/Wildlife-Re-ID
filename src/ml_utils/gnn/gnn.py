@@ -12,8 +12,10 @@ from torch_geometric.data import Data
 from torch_geometric.nn import GATv2Conv, global_mean_pool, global_max_pool
 from PIL import Image
 from helper import per_pixel_hog_bins # Make sure this import is still correct for your project!
+from gnn.cae import TextureEncoder
+from torchvision import transforms
 
-def image_to_superpixel_graph(img, mask=None, n_segments=300, hog_bins=9, hog_signed=False, hog_l2norm=True, features=['color', 'pos', 'hog'], n_hops = 1):
+def image_to_superpixel_graph(img, mask=None, n_segments=300, hog_bins=9, hog_signed=False, hog_l2norm=True, features=['color', 'pos', 'hog'], n_hops=1, cae_weights_path=None, cae_latent_dim=64):
     if isinstance(img, Image.Image):
         img = np.array(img)
     
@@ -26,13 +28,26 @@ def image_to_superpixel_graph(img, mask=None, n_segments=300, hog_bins=9, hog_si
     
     x_list = []
 
-    # --- 2. Color, Position, and HOG (Original Loop Logic) ---
-    if any(f in features for f in ['color', 'pos', 'hog']):
+# --- CAE SETUP ---
+    if 'cae' in features:
+        if cae_weights_path is None:
+            raise ValueError("Requested 'cae' features but no cae_weights_path provided!")
+        cae_model = get_cae_model(cae_weights_path, cae_latent_dim)
+        
+        cae_transform = transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.Resize((32, 32)), # <--- CHANGE THIS FROM 64 TO 32
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+
+    # --- 2. Color, Position, HOG, and CAE Loop ---
+    if any(f in features for f in ['color', 'pos', 'hog', 'cae']):
         img_lab = rgb2lab(img)
         if 'hog' in features:
             pix_bin_idx, pix_mag = per_pixel_hog_bins(img, n_bins=hog_bins, signed=hog_signed)
 
-        colors, positions, hogs = [], [], []
+        colors, positions, hogs, cae_features = [], [], [], []
 
         for sp in range(num_nodes):
             mask_sp = (segments == sp)
@@ -55,15 +70,36 @@ def image_to_superpixel_graph(img, mask=None, n_segments=300, hog_bins=9, hog_si
                 if hog_l2norm:
                     hog_hist /= (np.linalg.norm(hog_hist, ord=2) + 1e-6)
                 hogs.append(hog_hist)
+                
+            # --- NEW: CAE Feature Extraction ---
+            if 'cae' in features:
+                # 1. Find the Bounding Box of the superpixel
+                ymin, ymax = coords[:, 0].min(), coords[:, 0].max()
+                xmin, xmax = coords[:, 1].min(), coords[:, 1].max()
+                
+                # 2. Crop the original RGB image to that box
+                crop_img = img[ymin:ymax+1, xmin:xmax+1]
+                
+                # 3. Apply the transform and add batch dimension [1, C, H, W]
+                crop_tensor = cae_transform(crop_img).unsqueeze(0)
+                
+                # 4. Push through the encoder
+                with torch.no_grad():
+                    latent_vector = cae_model.encoder(crop_tensor).squeeze(0)
+                    
+                cae_features.append(latent_vector.numpy())
 
+        # Append extracted loop features to main list
         if 'color' in features:
             x_list.append(torch.tensor(np.array(colors), dtype=torch.float))
         if 'pos' in features:
             x_list.append(torch.tensor(np.array(positions), dtype=torch.float))
         if 'hog' in features:
             x_list.append(torch.tensor(np.array(hogs), dtype=torch.float))
+        if 'cae' in features:
+            x_list.append(torch.tensor(np.array(cae_features), dtype=torch.float))
 
-   # --- 3. NEW: Local Binary Patterns (LBP) Histogram ---
+    # --- 3. NEW: Local Binary Patterns (LBP) Histogram ---
     if 'lbp' in features:
         # Multiply by 255 and convert to 8-bit integer to safely calculate LBP
         gray = (rgb2gray(img) * 255).astype(np.uint8)
@@ -228,3 +264,18 @@ class GeMPooling(nn.Module):
         x_pool = x_pool.pow(1.0 / self.p)
         
         return x_pool
+    
+_WORKER_CAE_CACHE = {}  
+def get_cae_model(weights_path, latent_dim):
+    """Loads the CAE once per worker process and keeps it in RAM."""
+    global _WORKER_CAE_CACHE
+    if weights_path not in _WORKER_CAE_CACHE:
+        # Pass the dynamic latent_dim to the architecture
+        model = TextureEncoder(latent_dim=latent_dim) 
+        
+        # Load weights
+        model.load_state_dict(torch.load(weights_path, map_location='cpu'))
+        model.eval()
+        _WORKER_CAE_CACHE[weights_path] = model
+        
+    return _WORKER_CAE_CACHE[weights_path]
