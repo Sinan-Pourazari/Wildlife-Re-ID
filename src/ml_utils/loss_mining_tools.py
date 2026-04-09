@@ -110,8 +110,8 @@ def batch_topk_triplet_loss(embeddings, labels, margin=1.0, k_pos=1, k_neg=10):
     mean_hard_neg = (top_neg_dists * valid_neg).sum(dim=1) / valid_neg.sum(dim=1).clamp(min=1)
 
     # 5. COMPUTE TRIPLET LOSS
-    losses = F.relu(mean_hard_pos - mean_hard_neg + margin)
-    
+    #losses = F.relu(mean_hard_pos - mean_hard_neg + margin)
+    losses = F.softplus(mean_hard_pos - mean_hard_neg)
     return losses.mean()
     
 def batch_hard_triplet_loss(emb, labels, margin=1.0):
