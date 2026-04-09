@@ -171,9 +171,6 @@ def image_to_superpixel_graph(img, mask=None, n_segments=300, hog_bins=9, hog_si
     return data
 
 
-# ==========================================
-# --- Restored GNN Encoder ---
-# ==========================================
 class GNNEncoder(nn.Module):
     def __init__(self, in_dim=14, hidden_dim=512, out_dim=512):
         super().__init__()
@@ -185,7 +182,9 @@ class GNNEncoder(nn.Module):
 
         self.conv3 = GATv2Conv(hidden_dim, out_dim // 8, heads=8)
         self.norm3 = nn.LayerNorm(out_dim)
-
+        
+        # Initialize the GeM Pooling layer here
+        self.gem_pool = GeMPooling(p=3.0)
     def forward(self, data):
         x, edge_index, batch = data.x, data.edge_index, data.batch
 
@@ -201,7 +200,31 @@ class GNNEncoder(nn.Module):
         x = self.norm3(F.elu(self.conv3(x, edge_index)))
 
         # Pooling
-        pooled_mean = global_mean_pool(x, batch) 
-        pooled_max = global_max_pool(x, batch)   
+        #pooled_mean = global_mean_pool(x, batch) 
+        #pooled_max = global_max_pool(x, batch)   
+        pooled = self.gem_pool(x, batch)
+        return pooled
+        #return torch.cat([pooled_mean, pooled_max], dim=1)
+    
+class GeMPooling(nn.Module):
+    def __init__(self, p=3.0, eps=1e-6):
+        super(GeMPooling, self).__init__()
+        # 'p' is instantiated as a learnable PyTorch Parameter.
+        # It initializes at 3.0 but the optimizer will update it during training.
+        self.p = nn.Parameter(torch.ones(1) * p) 
+        self.eps = eps
+
+    def forward(self, x, batch):
+        # 1. Clamp to ensure all values are strictly positive
+        x = x.clamp(min=self.eps)
         
-        return torch.cat([pooled_mean, pooled_max], dim=1)
+        # 2. Raise all features to the power of p
+        x = x.pow(self.p)
+        
+        # 3. Perform standard Average Pooling (accounting for graph batches)
+        x_pool = global_mean_pool(x, batch)
+        
+        # 4. Take the p-th root
+        x_pool = x_pool.pow(1.0 / self.p)
+        
+        return x_pool
