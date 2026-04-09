@@ -20,7 +20,7 @@ from dataloader import InMemoryGraphDataset, UniversalGraphDataset
 import numpy as np
 from sklearn.preprocessing import LabelEncoder
 import argparse
-
+from  pytorch_metric_learning.losses import ArcFaceLoss 
 #device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu" 
 if torch.cuda.is_available():
     device = "cuda"
@@ -116,10 +116,10 @@ class ReIDModel(nn.Module):
         }
         # Initialize the GNN Encoder with provided params
         self.encoder = GNNEncoder(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=gnn_out_dim)
-        
         # Calculate the actual size coming out of the GNN
         # If pooling Mean + Max, the dimension is doubled
         self.gnn_feature_size = gnn_out_dim * 2 if use_hybrid_pooling else gnn_out_dim
+        
 
         self.head = nn.Sequential(
             nn.Linear(self.gnn_feature_size, hidden_dim),
@@ -238,14 +238,15 @@ class ReIDModel(nn.Module):
         
         return model, checkpoint.get('label_encoder_classes')
 
-def train_one_epoch(loader, model, optimizer, margin=1.0):
+def train_one_epoch(loader, model, arcface_loss, optimizer, margin=1.0):
     model.train()
     total = 0.0
     total_triplet = 0.0
     total_ce = 0.0
     total_compact = 0.0
     total_species = 0.0
-    criterion_ce = nn.CrossEntropyLoss()
+    criterion_ce = nn.CrossEntropyLoss(label_smoothing =0.025)
+
     for data in loader:
         data = data.to(device)
 
@@ -259,11 +260,13 @@ def train_one_epoch(loader, model, optimizer, margin=1.0):
         # Calculate losses
         #loss_triplet = batch_hard_triplet_loss(emb, labels, margin=margin)
         loss_triplet = batch_topk_triplet_loss(emb, labels, margin=margin, k_pos=1, k_neg=10)
-        loss_ce = 0.25 * criterion_ce(logits, labels)
+        #TODO add args to change betwen arcface and cross entorpy
+        #loss_ce = 0.25 * criterion_ce(logits, labels)
+        loss_arc = 0.2 * arcface_loss(emb,labels)
         loss_compact = 4 * batch_compactness_loss(features, labels)
         loss_ce_species = 1 * criterion_ce(species_logits, species_labels)
         # Combined Loss
-        loss = loss_triplet + loss_ce + loss_compact + loss_ce_species
+        loss = loss_triplet + loss_arc + loss_ce_species #+ loss_compact
 
         optimizer.zero_grad()
         loss.backward()
@@ -271,17 +274,17 @@ def train_one_epoch(loader, model, optimizer, margin=1.0):
 
         total += float(loss.item())
         total_triplet += loss_triplet
-        total_ce += loss_ce
+        total_ce += loss_arc
         total_compact += loss_compact
         total_species += loss_ce_species
 
     return total / len(loader), total_triplet / len(loader), total_ce / len(loader), total_compact / len(loader), total_species / len(loader)
 
 
-def train(loader, model, optimizer, num_epochs, start_epoch=0, args=None, train_classes = None, species_classes = None):
+def train(loader, model, optimizer, num_epochs, arcface_loss, start_epoch=0, args=None, train_classes = None, species_classes = None):
     for i in range(start_epoch, num_epochs):
-        total_batchloss, triplet, ce, compact, species = train_one_epoch(loader, model, optimizer, margin=1)
-        print(f"epoch {i} batchloss: {total_batchloss}, triplet loss: {triplet}, cross entropy loss: {ce}, compactness loss: {compact}, ce species loss {species}")
+        total_batchloss, triplet, ce, compact, species = train_one_epoch(loader, model, arcface_loss, optimizer, margin=1)
+        print(f"epoch {i} batchloss: {total_batchloss}, triplet loss: {triplet}, Arcface loss: {ce}, compactness loss: {compact}, ce species loss {species}")
         if i % 2 ==0:
             _ = model.save(args, epoch=i, optimizer=optimizer, train_classes=train_classes, species_classes=species_classes)
 
@@ -542,8 +545,9 @@ def main(args):
     print(f"--> Dynamically detected Node Feature Dimension (in_dim): {dynamic_in_dim}")
 
     # Model & Optimizer (Notice in_dim is now dynamic)
-    model = ReIDModel(num_classes=num_train_classes, num_species= num_species,in_dim=dynamic_in_dim, hidden_dim=512, gnn_out_dim=256, emb_dim=512).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    model = ReIDModel(num_classes=num_train_classes, num_species= num_species,in_dim=dynamic_in_dim, hidden_dim=512, gnn_out_dim=256, emb_dim=512, use_hybrid_pooling = False).to(device)
+    arcface = ArcFaceLoss(num_classes=num_train_classes, embedding_size=512, margin=28.6, scale= 64).to(device)
+    optimizer = torch.optim.Adam(list(model.parameters()) + list(arcface.parameters()), lr=1e-3)
 
     # --- RESUME LOGIC ---
     start_epoch = 0
@@ -569,7 +573,7 @@ def main(args):
 
     # Train & Evaluate
     # Pass the start_epoch and args into the train loop
-    train(train_loader, model, optimizer, num_epochs=args.epochs, start_epoch=start_epoch, args=args, train_classes=train_labels.tolist(), \
+    train(train_loader, model, optimizer,arcface_loss=arcface, num_epochs=args.epochs, start_epoch=start_epoch, args=args, train_classes=train_labels.tolist(), \
            species_classes=species_le.classes_.tolist())
     # --- Saving the Results ---
     print("\n[ Saving Model ]")
