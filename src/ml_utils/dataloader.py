@@ -25,7 +25,6 @@ def process_for_lmdb(filename, root_dir, n_segments, features, max_size, n_hops)
     # 2. Create the white mask to match the (now smaller) image
     mask = Image.new('L', img.size, color=255)
 
-    from gnn.gnn import image_to_superpixel_graph
     # Pass the mask in to keep the graph safe from black edges
     graph = image_to_superpixel_graph(img, mask=np.array(mask), n_segments=n_segments, n_hops=n_hops, features=features)
         
