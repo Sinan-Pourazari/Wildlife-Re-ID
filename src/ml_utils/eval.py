@@ -18,13 +18,79 @@ import plotly.express as px
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components
 import torch.nn.functional as F
-
+from sklearn.metrics import accuracy_score # Add this to your imports at the top
 # Import from your existing modules
 from train_test_prototype import ReIDModel, reduce_to_nd
 from dataloader import UniversalGraphDataset
 import numpy as np
 from sklearn.metrics import balanced_accuracy_score
 
+def compute_best_clustering_metrics(args, embeddings, labels, species_preds):
+    features = torch.tensor(embeddings, dtype=torch.float32)
+    features = F.normalize(features, p=2, dim=1)
+    
+    sim_matrix = torch.mm(features, features.t()).numpy()
+    
+    species_preds_t = torch.tensor(species_preds)
+    cross_species_mask = (species_preds_t.unsqueeze(1) != species_preds_t.unsqueeze(0)).numpy()
+    sim_matrix[cross_species_mask] = -float('inf')
+    
+    best_score = -1
+    best_metrics = None
+    
+    # Test thresholds from 0.65 to 0.95 in steps of 0.02
+    for thresh in np.arange(0.65, 0.95, 0.02):
+        adj_matrix = (sim_matrix > thresh).astype(int)
+        graph = csr_matrix(adj_matrix)
+        n_components, predicted_ids = connected_components(csgraph=graph, directed=False)
+        
+        ari = adjusted_rand_score(labels, predicted_ids)
+        nmi = normalized_mutual_info_score(labels, predicted_ids)
+        
+        # Optimize for the average of both metrics to prevent fragmentation
+        combined_score = (ari + nmi) / 2.0 
+        
+        if combined_score > best_score:
+            best_score = combined_score
+            best_metrics = (ari, nmi, n_components, thresh)
+            
+    print(f"Optimal Threshold found at: {best_metrics[3]:.2f} (Discovered IDs: {best_metrics[2]})")
+    return best_metrics[0], best_metrics[1], best_metrics[2]
+from sklearn.metrics import silhouette_score
+
+def compute_unsupervised_clustering(args, embeddings, species_preds):
+    # Notice: 'labels' is completely gone from the inputs!
+    features = torch.tensor(embeddings, dtype=torch.float32)
+    features = F.normalize(features, p=2, dim=1)
+    
+    sim_matrix = torch.mm(features, features.t()).numpy()
+    
+    species_preds_t = torch.tensor(species_preds)
+    cross_species_mask = (species_preds_t.unsqueeze(1) != species_preds_t.unsqueeze(0)).numpy()
+    sim_matrix[cross_species_mask] = -float('inf')
+    
+    best_score = -1
+    best_thresh = 0.8
+    best_n_components = 0
+    
+    for thresh in np.arange(0.50, 0.95, 0.02):
+        adj_matrix = (sim_matrix > thresh).astype(int)
+        graph = csr_matrix(adj_matrix)
+        n_components, predicted_ids = connected_components(csgraph=graph, directed=False)
+        
+        # Silhouette Score requires at least 2 clusters to calculate
+        if 1 < n_components < len(embeddings):
+            # We measure the geometry using the raw embeddings and the predicted IDs
+            score = silhouette_score(embeddings, predicted_ids, metric='cosine')
+            
+            if score > best_score:
+                best_score = score
+                best_thresh = thresh
+                best_n_components = n_components
+                
+    print(f"--> Blindly Optimized Threshold: {best_thresh:.2f} (Estimated IDs: {best_n_components})")
+    
+    return best_thresh, best_n_components
 def calculate_baks(y_true: np.ndarray, y_pred: np.ndarray, known_classes: set) -> float:
     """
     Calculates the Balanced Accuracy on Known Samples (BaKS).
@@ -111,11 +177,12 @@ def plot_interactive_3d_tsne(xyz, labels, title, save_path):
     fig.update_layout(showlegend=False, margin=dict(l=0, r=0, b=0, t=40))
     fig.write_html(save_path)
 
-def extract_features(model, dataloader, device, species_confidence_thresh = 0.6):
+def extract_features(model, dataloader, device, species_confidence_thresh = 0.8):
     model.eval()
     all_emb = []
     all_labels = []
     all_species_preds = []
+    all_species_labels = []
     with torch.no_grad():
         for data in tqdm(dataloader, desc="Extracting Features", leave=False):
             data = data.to(device)
@@ -141,11 +208,13 @@ def extract_features(model, dataloader, device, species_confidence_thresh = 0.6)
                 # Fallback for older models without a species head
                 all_species_preds.append(torch.zeros(emb.size(0), dtype=torch.long))
             labels = data.y.view(emb.size(0), -1)[:, 0]
+            species_labels = data.y.view(emb.size(0), -1)[:, 1] 
             all_emb.append(emb.cpu())
+            #TODO check this, seems redundant
+            all_species_labels.append(species_labels.cpu())
             all_labels.append(labels.cpu())
             
-    return torch.cat(all_emb), torch.cat(all_labels), torch.cat(all_species_preds)
-            
+    return torch.cat(all_emb), torch.cat(all_labels), torch.cat(all_species_preds), torch.cat(all_species_labels)            
 
 def compute_reid_metrics(features, labels, known_classes, device='cpu', sim_thresh=0.6):
     features = features.to(device)
@@ -250,7 +319,7 @@ def compute_clustering_metrics_hdbscan(args, embeddings, labels, species_preds, 
     
     return ari, nmi, discovered_ids
 
-def compute_clustering_metrics(args, embeddings, labels, species_preds, sim_thresh=0.8):
+def compute_clustering_metrics(args, embeddings, labels, species_preds, sim_thresh=0.6):
     """
     Replaces HDBSCAN with Rank-1 Graph Clustering (Connected Components).
     """
@@ -379,15 +448,13 @@ def plot_detailed_tsne(features_nd, labels, title, save_path):
     plt.close()
 
 def get_test_samples(args):
-    df = pd.read_csv(args.csv_path).dropna(subset=['identity'])
+    # low_memory=False to stop the DtypeWarning in pandas
+    df = pd.read_csv(args.csv_path, low_memory=False).dropna(subset=['identity'])
     df['global_identity'] = df['dataset'] + "_" + df['identity'].astype(str)
     
     counts = df['global_identity'].value_counts()
     df = df[df['global_identity'].isin(counts[counts > 1].index)].reset_index(drop=True)
     
-    from sklearn.preprocessing import LabelEncoder
-    df['global_label'] = LabelEncoder().fit_transform(df['global_identity'])
-
     if args.holdout_species:
         test_df = df[df['species'] == args.holdout_species].reset_index(drop=True)
     elif args.holdout_dataset:
@@ -399,26 +466,28 @@ def get_test_samples(args):
         test_df = test_df[test_df['species'] == args.eval_filter_species].reset_index(drop=True)
         if len(test_df) == 0:
             raise ValueError(f"No images found for species '{args.eval_filter_species}'!")
+            
     if hasattr(args, 'max_images_per_id') and args.max_images_per_id is not None:
-        # Determine the column to group by based on what split was loaded
         group_col = 'global_label' if 'global_label' in test_df.columns else 'identity'
-        
-        # Randomly sample 'max_images_per_id' from each group, using a fixed seed for reproducibility
         test_df = test_df.groupby(group_col, group_keys=False).apply(
             lambda x: x.sample(min(len(x), args.max_images_per_id), random_state=42)
         ).reset_index(drop=True)
-        
         print(f"Downsampled test set to a maximum of {args.max_images_per_id} images per identity.")
-        print(f"New test set size: {len(test_df)} images")
 
-    #TODO CHANGE THIS WE LATER WANT THE SPECIES ID TOO
-    return list(zip(test_df["path"], test_df["global_label"], [0] * len(test_df)))
+    # FIX: Guarantee these columns exist right before returning!
+    from sklearn.preprocessing import LabelEncoder
+    if 'global_identity' not in test_df.columns:
+        test_df['global_identity'] = test_df['dataset'] + "_" + test_df['identity'].astype(str)
+    test_df['global_label'] = LabelEncoder().fit_transform(test_df['global_identity'])
+    test_df['species_label'] = LabelEncoder().fit_transform(test_df['species'].astype(str))
+
+    return list(zip(test_df["path"], test_df["global_label"], test_df["species_label"]))
 
 # ==========================================
-# PARALLEL WORKER FUNCTIONS (PURE CPU)
+# PARALLEL WORKER FUNCTIONS (CPU)
 # ==========================================
 
-def evaluate_metrics_worker(ckpt_path, feats_np, labels_np, species_preds_np,known_classes, args):
+def evaluate_metrics_worker(ckpt_path, feats_np, labels_np, species_preds_np,known_classes, args, species_labels_np):
     """Worker function to compute metrics purely from numpy arrays on CPU"""
     model_name = os.path.basename(ckpt_path)
     
@@ -428,18 +497,26 @@ def evaluate_metrics_worker(ckpt_path, feats_np, labels_np, species_preds_np,kno
     
     # Pass known_classes down!
     r1, r5, r10, map_val, baks, baus = compute_reid_metrics(features, labels, known_classes, device='cpu', sim_thresh=0.6)
-    ari, nmi, discovered_ids = compute_clustering_metrics_hdbscan(args, feats_np, labels_np, species_preds_np, sim_thresh = 0.8)
-    
+    #thesh, comp = compute_unsupervised_clustering(args,feats_np, species_preds_np)
+    ari, nmi, discovered_ids = compute_clustering_metrics(args, feats_np, labels_np, species_preds_np, sim_thresh = 0.35)
+
+    #ari, nmi, discovered_ids =compute_best_clustering_metrics(args, feats_np, labels_np, species_preds_np)
     harmonic_score = np.sqrt(baks * baus)
+
+    #specues metrics
+    # Note: Predictions of -1 (low confidence) will automatically count as incorrect here, which is intended.
+    species_acc = accuracy_score(species_labels_np, species_preds_np) * 100
+    species_bacc = balanced_accuracy_score(species_labels_np, species_preds_np) * 100
 
     return {
         'Model Name': model_name.replace('.pth', ''),
         'Rank-1 (%)': r1, 'Rank-5 (%)': r5, 'Rank-10 (%)': r10, 'mAP (%)': map_val,
-        'BaKS': baks, 'BAUS': baus, 'H-Score': harmonic_score, # <--- NEW METRICS ADDED HERE
+        'BaKS': baks, 'BAUS': baus, 'H-Score': harmonic_score, 
         'ARI': ari, 'NMI': nmi, 'Discovered IDs': discovered_ids,
+        'Species Acc (%)': species_acc,    
+        'Species BAcc (%)': species_bacc,  
         'ckpt_path': ckpt_path 
     }
-
 def generate_tsne_worker(ckpt_path, feats_np, labels_np, args, eval_out_dir):
     """Worker function to compute and plot t-SNE from numpy arrays on CPU"""
     model_name = os.path.basename(ckpt_path).replace('.pth', '')
@@ -507,12 +584,12 @@ def main(args):
             model_name = os.path.basename(ckpt)
             print(f"Processing: {model_name}")
             try:
-                # Capture the second return value (train_classes)
                 model, train_classes = ReIDModel.load(ckpt, device=main_device)
-                features, labels, species_preds = extract_features(model, test_loader, main_device)
+                # Capture the second return value (train_classes)
+                features, labels, species_preds, species_labels = extract_features(model, test_loader, main_device)
                 known_classes_set = set(train_classes) if train_classes is not None else set()                
                 # CRITICAL: Store the known classes as a set alongside the numpy arrays
-                extracted_data[ckpt] = (features.cpu().numpy(), labels.cpu().numpy(), species_preds.cpu().numpy(), known_classes_set)
+                extracted_data[ckpt] = (features.cpu().numpy(), labels.cpu().numpy(), species_preds.cpu().numpy(), species_labels.cpu().numpy(), known_classes_set)
                 
                 # Free VRAM immediately
                 del model
@@ -529,9 +606,9 @@ def main(args):
         with ProcessPoolExecutor(max_workers=args.parallel_workers, mp_context=spawn_context) as executor:
             futures = {}
             # Unpack the known_classes here
-            for ckpt, (feats_np, lbls_np, species_preds_np, known_classes) in extracted_data.items():                
+            for ckpt, (feats_np, lbls_np, species_preds_np, species_labels_np, known_classes) in extracted_data.items():                
                 # Send raw numpy arrays AND known_classes to the worker
-                future = executor.submit(evaluate_metrics_worker, ckpt, feats_np, lbls_np, species_preds_np, known_classes, args)                
+                future = executor.submit(evaluate_metrics_worker, ckpt, feats_np, lbls_np, species_preds_np, known_classes, args, species_labels_np) 
                 futures[future] = ckpt
                 
             for future in tqdm(as_completed(futures), total=len(futures), desc="Computing Metrics"):
@@ -562,12 +639,10 @@ def main(args):
             )
             test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers)
             for row in top_models.itertuples():
-                # --- FIX: Capture train_classes here ---
                 model, train_classes = ReIDModel.load(row.ckpt_path, device=main_device)
-                feats, lbls, species_preds = extract_features(model, test_loader, main_device)                
-                # --- FIX: Store train_classes in the tuple ---
+                feats, lbls, species_preds_np, species_labels_np, _ = extracted_data[row.ckpt_path]
                 known_classes_set = set(train_classes) if train_classes is not None else set()
-                extracted_data[row.ckpt_path] = (feats.cpu().numpy(), lbls.cpu().numpy(), species_preds.cpu().numpy(), known_classes_set)                
+                extracted_data[row.ckpt_path] = (feats.cpu().numpy(), lbls.cpu().numpy(), species_preds.cpu().numpy(), species_labels.cpu().numpy(), known_classes_set)                
                
                 del model
                 torch.cuda.empty_cache()
@@ -576,7 +651,7 @@ def main(args):
         with ProcessPoolExecutor(max_workers=args.parallel_workers, mp_context=spawn_context) as executor:
             tsne_futures = []
             for row in top_models.itertuples():
-                feats_np, lbls_np, species_preds_np, _ = extracted_data[row.ckpt_path]                
+                feats_np, lbls_np, species_preds_np, species_labels_np, _ = extracted_data[row.ckpt_path]           
                 tsne_futures.append(
                     executor.submit(generate_tsne_worker, row.ckpt_path, feats_np, lbls_np, args, eval_out_dir)
                 )
