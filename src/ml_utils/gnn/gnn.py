@@ -1,6 +1,6 @@
 import torch
 import numpy as np
-from skimage.segmentation import slic
+from skimage.segmentation import slic, felzenszwalb
 from skimage.color import rgb2lab, rgb2gray
 from skimage.io import imread
 from skimage.feature import local_binary_pattern
@@ -9,20 +9,21 @@ from skimage.morphology import disk
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.data import Data
-from torch_geometric.nn import GATv2Conv, global_mean_pool, global_max_pool
+from torch_geometric.nn import GATv2Conv, global_mean_pool, global_max_pool, knn_graph
 from PIL import Image
 from helper import per_pixel_hog_bins # Make sure this import is still correct for your project!
 from gnn.cae import TextureEncoder
 from torchvision import transforms
-
-def image_to_superpixel_graph(img, mask=None, n_segments=300, hog_bins=9, hog_signed=False, hog_l2norm=True, features=['color', 'pos', 'hog'], n_hops=1, cae_weights_path=None, cae_latent_dim=64):
+from skimage.measure import regionprops
+import math
+def image_to_superpixel_graph(img, mask=None, n_segments=300, hog_bins=9, hog_signed=False, hog_l2norm=True, features=['color', 'pos', 'hog'], n_hops=1, cae_weights_path=None, cae_latent_dim=64, return_segments=False):   
     if isinstance(img, Image.Image):
         img = np.array(img)
     
     h, w, _ = img.shape
 
     # --- 1. Standard SLIC ---
-    segments = slic(img, n_segments=n_segments, compactness=10, start_label=0)
+    segments = felzenszwalb(img, scale=70.0, sigma=0.65, min_size=150)
     num_nodes = segments.max() + 1
     seg_flat = torch.tensor(segments, dtype=torch.long).view(-1)
     
@@ -42,7 +43,7 @@ def image_to_superpixel_graph(img, mask=None, n_segments=300, hog_bins=9, hog_si
         ])
 
     # --- 2. Color, Position, HOG, and CAE Loop ---
-    if any(f in features for f in ['color', 'pos', 'hog', 'cae']):
+    if any(f in features for f in ['color', 'pos', 'hog', 'cae', 'shape']):
         img_lab = rgb2lab(img)
         if 'hog' in features:
             pix_bin_idx, pix_mag = per_pixel_hog_bins(img, n_bins=hog_bins, signed=hog_signed)
@@ -88,6 +89,55 @@ def image_to_superpixel_graph(img, mask=None, n_segments=300, hog_bins=9, hog_si
                     latent_vector = cae_model.encoder(crop_tensor).squeeze(0)
                     
                 cae_features.append(latent_vector.numpy())
+            if 'shape' in features:
+                # regionprops ignores 0, so we add 1 to the segments array
+                props = regionprops(segments + 1)
+                total_area = h * w
+                max_perimeter = 2 * (h + w)
+
+        colors, positions, hogs, cae_features, shape_features = [], [], [], [], []
+
+        for sp in range(num_nodes):
+            mask_sp = (segments == sp)
+            coords = np.column_stack(np.nonzero(mask_sp))
+            vals = img_lab[mask_sp]
+            
+            # ... [Keep your existing 'color', 'pos', 'hog', and 'cae' extraction here] ...
+            
+            # --- NEW: Shape Extraction ---
+        if 'shape' in features:
+                prop = props[sp]
+                
+                # 1. Basic Geometry (Normalized to image size)
+                area = prop.area / total_area
+                perimeter = prop.perimeter / max_perimeter
+                
+                # Bounding Box -> Aspect Ratio
+                min_y, min_x, max_y, max_x = prop.bbox
+                bb_h = max(max_y - min_y, 1)
+                bb_w = max(max_x - min_x, 1)
+                aspect_ratio = bb_w / bb_h
+                
+                # 2. Shape Ratios & Structural Descriptors
+                circularity = (4 * math.pi * prop.area) / ((prop.perimeter ** 2) + 1e-6)
+                solidity = prop.solidity
+                extent = prop.extent
+                eccentricity = prop.eccentricity
+                
+                # 3. Mathematical Transforms (Hu Moments)
+                hu_moments = prop.moments_hu
+                log_hu = []
+                for hu in hu_moments:
+                    val = -1 * math.copysign(1.0, hu) * math.log10(abs(hu) + 1e-6)
+                    log_hu.append(val)
+                    
+                # Combine into a 14-dimensional shape vector
+                node_shape_vec = [
+                    area, perimeter, aspect_ratio, circularity, 
+                    solidity, extent, eccentricity
+                ] + log_hu
+                
+                shape_features.append(node_shape_vec)
 
         # Append extracted loop features to main list
         if 'color' in features:
@@ -98,6 +148,11 @@ def image_to_superpixel_graph(img, mask=None, n_segments=300, hog_bins=9, hog_si
             x_list.append(torch.tensor(np.array(hogs), dtype=torch.float))
         if 'cae' in features:
             x_list.append(torch.tensor(np.array(cae_features), dtype=torch.float))
+        if 'shape' in features:
+            x_shape = torch.tensor(np.array(shape_features), dtype=torch.float)
+            # L2 Normalize the whole column to ensure stability alongside other features
+            x_shape = F.normalize(x_shape, p=2, dim=0) 
+            x_list.append(x_shape)
 
     # --- 3. NEW: Local Binary Patterns (LBP) Histogram ---
     if 'lbp' in features:
@@ -204,12 +259,29 @@ def image_to_superpixel_graph(img, mask=None, n_segments=300, hog_bins=9, hog_si
         new_edge_index = (adj_n > 0).nonzero(as_tuple=False).t().contiguous()
         data.edge_index = new_edge_index
         
+    # Return the map if viz.py asks for it
+    if return_segments:
+        return data, segments
+        
     return data
 
 
 class GNNEncoder(nn.Module):
-    def __init__(self, in_dim=14, hidden_dim=512, out_dim=512):
+    def __init__(self, in_dim=14, hidden_dim=512, out_dim=512, edge_strategy="spatial", k_neighbors=1):
         super().__init__()
+        # The number of attention-based semantic edges to create per node
+        self.k_neighbors = k_neighbors
+        self.edge_strategy = edge_strategy
+        # Learned Attention Projection
+        # Projects raw features into a specific "Edge Similarity" space.
+        # This acts like the Query/Key transformations in standard Transformers.
+        if self.edge_strategy in ["attention", "hybrid"]:
+            self.edge_proj = nn.Sequential(
+                nn.Linear(in_dim, hidden_dim // 2),
+                nn.LayerNorm(hidden_dim // 2),
+                nn.ReLU(),
+                nn.Linear(hidden_dim // 2, hidden_dim // 2)
+            )
         self.conv1 = GATv2Conv(in_dim, hidden_dim//8, heads=8)
         self.norm1 = nn.LayerNorm(hidden_dim)
 
@@ -221,19 +293,37 @@ class GNNEncoder(nn.Module):
         
         # Initialize the GeM Pooling layer here
         self.gem_pool = GeMPooling(p=3.0)
-    def forward(self, data):
-        x, edge_index, batch = data.x, data.edge_index, data.batch
 
+    def forward(self, data):
+        x, spatial_edge_index, batch = data.x, data.edge_index, data.batch
+        
+        if self.edge_strategy == "spatial":
+            # Baseline: Use only the CPU-generated LMDB edges
+            final_edge_index = spatial_edge_index
+            
+        else:
+            # Generate Attention Edges
+            queries_keys = self.edge_proj(x)
+            semantic_edge_index = knn_graph(
+                x=queries_keys, k=self.k_neighbors, batch=batch, loop=False, cosine=True
+            )
+            
+            if self.edge_strategy == "attention":
+                # Pure semantic approach (ignores physical layout)
+                final_edge_index = semantic_edge_index
+            elif self.edge_strategy == "hybrid":
+                # Best of both worlds: Anatomy + Texture Matching
+                final_edge_index = torch.cat([spatial_edge_index, semantic_edge_index], dim=1)
         # Layer 1
-        x = self.norm1(F.elu(self.conv1(x, edge_index)))
+        x = self.norm1(F.elu(self.conv1(x, final_edge_index)))
 
         # Layer 2 (with Residual)
         identity = x
-        x = self.norm2(F.elu(self.conv2(x, edge_index)))
+        x = self.norm2(F.elu(self.conv2(x, final_edge_index)))
         x = x + identity
 
         # Layer 3
-        x = self.norm3(F.elu(self.conv3(x, edge_index)))
+        x = self.norm3(F.elu(self.conv3(x, final_edge_index)))
 
         # Pooling
         #pooled_mean = global_mean_pool(x, batch) 

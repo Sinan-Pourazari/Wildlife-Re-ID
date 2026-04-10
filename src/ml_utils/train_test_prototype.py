@@ -106,7 +106,7 @@ class GraphImageDataset(PyGDataset):
         return graph
     
 class ReIDModel(nn.Module):
-    def __init__(self, num_classes, num_species, in_dim=14, hidden_dim=256, gnn_out_dim=256, emb_dim=512, use_hybrid_pooling=True):
+    def __init__(self, num_classes, num_species, in_dim=14, hidden_dim=256, gnn_out_dim=256, emb_dim=512, use_hybrid_pooling=True, edge_strategy="spatial", k_neighbors=10):
         super().__init__()
         self.save_params = {
             'num_classes': num_classes,
@@ -114,7 +114,9 @@ class ReIDModel(nn.Module):
             'hidden_dim': hidden_dim,
             'gnn_out_dim': gnn_out_dim,
             'emb_dim': emb_dim,
-            'use_hybrid_pooling': use_hybrid_pooling
+            'use_hybrid_pooling': use_hybrid_pooling,
+            'edge_strategy': edge_strategy,
+            'k_neighbors': k_neighbors 
         }
         # Initialize the GNN Encoder with provided params
         self.encoder = GNNEncoder(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=gnn_out_dim)
@@ -161,7 +163,7 @@ class ReIDModel(nn.Module):
 
         return embeddings
     
-    # --- CHANGE 1: Accept train_classes instead of label_encoder ---
+    # --- Accept train_classes instead of label_encoder ---
     def save(self, args, epoch, optimizer, train_classes=None, species_classes = None):
         """Saves weights, metadata, and hyperparameters with attribute safety."""
         if not os.path.exists(args.checkpoint_dir):
@@ -193,7 +195,6 @@ class ReIDModel(nn.Module):
             'optimizer_state_dict': optimizer.state_dict(), 
             'epoch': epoch,                                 
             'args': vars(args) if hasattr(args, '__dict__') else args,
-            # --- CHANGE 2: Save the raw list directly ---
             'label_encoder_classes': train_classes,
             'species_classes': species_classes, 
             'timestamp': timestamp
@@ -215,7 +216,9 @@ class ReIDModel(nn.Module):
                 'in_dim': checkpoint.get('in_dim', 14),
                 'hidden_dim': checkpoint.get('hidden_dim', 512),
                 'gnn_out_dim': checkpoint.get('gnn_out_dim', 256),
-                'emb_dim': checkpoint.get('emb_dim', 512)
+                'emb_dim': checkpoint.get('emb_dim', 512),
+                'edge_strategy': checkpoint.get('edge_strategy', 'spatial'),
+                'k_neighbors': checkpoint.get('k_neighbors', 10)
             }
 
         if 'num_classes' not in hyperparams:
@@ -247,7 +250,7 @@ def train_one_epoch(loader, model, arcface_loss, optimizer, margin=1.0):
     total_ce = 0.0
     total_compact = 0.0
     total_species = 0.0
-    criterion_ce = nn.CrossEntropyLoss(label_smoothing =0.025)
+    criterion_ce = nn.CrossEntropyLoss(label_smoothing =0.009)
 
     for data in loader:
         data = data.to(device)
@@ -261,14 +264,14 @@ def train_one_epoch(loader, model, arcface_loss, optimizer, margin=1.0):
 
         # Calculate losses
         #loss_triplet = batch_hard_triplet_loss(emb, labels, margin=margin)
-        loss_triplet = batch_topk_triplet_loss(emb, labels, margin=margin, k_pos=1, k_neg=10)
+        loss_triplet = batch_topk_triplet_loss(emb, labels, margin=margin, k_pos=3, k_neg=10)
         #TODO add args to change betwen arcface and cross entorpy
         #loss_ce = 0.25 * criterion_ce(logits, labels)
         loss_arc = 0.2 * arcface_loss(emb,labels)
-        loss_compact = 4 * batch_compactness_loss(features, labels)
+        #loss_compact = 3 * batch_compactness_loss(features, labels)
         loss_ce_species = 1 * criterion_ce(species_logits, species_labels)
         # Combined Loss
-        loss = loss_triplet + loss_arc + loss_ce_species #+ loss_compact
+        loss = loss_triplet + loss_arc + loss_ce_species # loss_compact
 
         optimizer.zero_grad()
         loss.backward()
@@ -277,7 +280,7 @@ def train_one_epoch(loader, model, arcface_loss, optimizer, margin=1.0):
         total += float(loss.item())
         total_triplet += loss_triplet
         total_ce += loss_arc
-        total_compact += loss_compact
+        #total_compact += loss_compact
         total_species += loss_ce_species
 
     return total / len(loader), total_triplet / len(loader), total_ce / len(loader), total_compact / len(loader), total_species / len(loader)
@@ -413,7 +416,28 @@ def main(args):
     csv_path = args.csv_path
     img_root = args.root_dir
     cache_pool = args.cache_dir
+    #for resume only
+    print(f"\n[ Setting up Output Directory: {args.checkpoint_dir} ]")
     
+    if os.path.exists(args.checkpoint_dir):
+        if args.resume:
+            # logic constraint met: directory exists AND resume is set. Safe to continue.
+            print(f"--> Directory exists. Resuming training.")
+        else:
+            # logic constraint violated: directory exists but we aren't resuming.
+            # Abort to prevent accidental overwriting of a previous run's results.
+            print(f"\n[ERROR] The checkpoint directory '{args.checkpoint_dir}' already exists.")
+            print("To prevent accidental overwriting of previous results, this script is aborting.")
+            print("\nTo fix this:")
+            print("1. If you want to RESUME, add '--resume path/to/previous/checkpoint.pth'")
+            print("2. If you want a FRESH run, change '--checkpoint_dir' to a new name in your command.")
+            return # Exit the main function 
+    else:
+        # Directory doesn't exist, this is a normal fresh run. Create it.
+        print(f"--> Creating new directory.")
+        # Use makedirs just in case parent directories are needed, exist_ok handled by logic above
+        os.makedirs(args.checkpoint_dir, exist_ok=True) 
+    # ------------------------------------------------------------
     # 1. Load the Universal Metadata
     print("\n[ Loading Metadata ]")
     df = pd.read_csv(csv_path)
@@ -476,7 +500,6 @@ def main(args):
         train_labels, test_labels = train_test_split(unique_labels, test_size=0.2, random_state=42)
         train_df = df[df["global_label"].isin(train_labels)].reset_index(drop=True)
         test_df = df[df["global_label"].isin(test_labels)].reset_index(drop=True)
-        os.mkdir(args.checkpoint_dir)
         test_df.to_csv(f"{args.checkpoint_dir}/current_test_split.csv", index=False)
 
     
@@ -560,7 +583,7 @@ def main(args):
         cae_weights_path=args.cae_weights_path,
         cae_latent_dim=args.cae_latent_dim )
     # DataLoaders
-    batch_sampler = PKBatchSampler(train_df["global_label"].values, P=64, K=2)
+    batch_sampler = PKBatchSampler(train_df["global_label"].values, P=16, K=8)
     train_loader = DataLoader(train_dataset, batch_sampler=batch_sampler, num_workers=args.workers, persistent_workers=True, prefetch_factor=4)
     #test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=args.workers)
 
@@ -571,7 +594,9 @@ def main(args):
     print(f"--> Dynamically detected Node Feature Dimension (in_dim): {dynamic_in_dim}")
 
     # Model & Optimizer (Notice in_dim is now dynamic)
-    model = ReIDModel(num_classes=num_train_classes, num_species= num_species,in_dim=dynamic_in_dim, hidden_dim=512, gnn_out_dim=256, emb_dim=512, use_hybrid_pooling = False).to(device)
+    model = ReIDModel(num_classes=num_train_classes, num_species= num_species,in_dim=dynamic_in_dim, hidden_dim=512, gnn_out_dim=256, emb_dim=512, 
+                      use_hybrid_pooling = False, edge_strategy=args.edge_strategy,k_neighbors=args.k_neighbors).to(device)
+    
     arcface = ArcFaceLoss(num_classes=num_train_classes, embedding_size=512, margin=28.6, scale= 64).to(device)
     optimizer = torch.optim.Adam(list(model.parameters()) + list(arcface.parameters()), lr=1e-3)
 
@@ -625,6 +650,9 @@ if __name__ == "__main__":
     parser.add_argument("--subset_fraction", type=float, default=1.0, help="Fraction of identities to keep (e.g., 0.1 for 10%)")
     parser.add_argument("--species", type=str, nargs="+", default=None, help="List of specific species to use (e.g., --species tiger fox wolf)")
     parser.add_argument("--n_hops", type=int, default=1, help="Number of hops for edge connections (1 = direct neighbors, 2 = neighbors of neighbors)")
+    # --- NEW: Graph Structure Settings ---
+    parser.add_argument("--edge_strategy", type=str, default="spatial", choices=["spatial", "attention", "hybrid"], help="How to build GNN edges: 'spatial' (LMDB), 'attention' (GPU KNN), or 'hybrid' (Both).")
+    parser.add_argument("--k_neighbors", type=int, default=10, help="Number of dynamic attention edges per node (if using attention or hybrid).")
 
     # Hardware settings
     parser.add_argument("--workers", type=int, default=4, help="Number of CPU workers for DataLoader")
@@ -646,9 +674,10 @@ if __name__ == "__main__":
     parser.add_argument("--cae_latent_dim", type=int, default=64, help="Dimensionality of the CAE learned texture vector")
     parser.add_argument("--cae_epochs", type=int, default=10, help="Epochs to train the Texture Encoder")
     parser.add_argument("--cae_margin", type=float, default=0.5, help="Triplet loss margin for the Texture Encoder")
-    
     parser.add_argument("--cae_version", type=str, default="v1_dim128", help="Version string of the CAE model (used for LMDB cache versioning)")
     parser.add_argument("--cae_weights_path", type=str, default="models/cae/v1_dim128/weights.pth", help="Path to the trained CAE weights")
+
+
     parser.add_argument("--root_dir", type=str, default="src/images/reid-10k", help="Base directory for images")
     parser.add_argument("--csv_path", type=str, default="src/images/reid-10k/metadata.csv", help="Path to metadata CSV")
     parser.add_argument("--cache_dir", type=str, default="src/images/reid-10k/graph_cache_pool", help="Cache directory for graphs")

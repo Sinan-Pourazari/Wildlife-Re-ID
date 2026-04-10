@@ -46,9 +46,71 @@ def extract_patches_from_image(row_tuple, root_dir, img_size, n_segments, patche
         # Run SLIC
         segments = slic(img, n_segments=n_segments, compactness=10, start_label=0)
         unique_segs = np.unique(segments)
+        
+        # Find the center of the image
+        img_cy, img_cx = img.shape[0] / 2, img.shape[1] / 2
+        
+        probabilities = []
+        valid_segs = []
+        
+        for sp in unique_segs:
+            mask = (segments == sp)
+            coords = np.column_stack(np.nonzero(mask))
+            if len(coords) < 10: continue
+            
+            cy, cx = coords.mean(axis=0)
+            
+            # Calculate distance from center of the image
+            dist = np.sqrt((cy - img_cy)**2 + (cx - img_cx)**2)
+            
+            # Inverse distance weighting (closer to center = higher weight)
+            # Add a small epsilon to avoid division by zero
+            weight = 1.0 / (dist + 1.0) 
+            
+            valid_segs.append(sp)
+            probabilities.append(weight)
+            
+        # Normalize weights into a probability distribution
+        probabilities = np.array(probabilities)
+        probabilities /= probabilities.sum()
+        
+        # Pick superpixels, heavily favoring the center of the image
+        chosen_segs = np.random.choice(valid_segs, min(patches_per_image, len(valid_segs)), replace=False, p=probabilities)
+        unique_segs = np.unique(segments)
 
-        # Randomly pick superpixels
-        chosen_segs = np.random.choice(unique_segs, min(patches_per_image, len(unique_segs)), replace=False)
+
+        ######## center weighting ########
+        
+        # Find the center of the image
+        img_cy, img_cx = img.shape[0] / 2, img.shape[1] / 2
+        
+        probabilities = []
+        valid_segs = []
+        
+        for sp in unique_segs:
+            mask = (segments == sp)
+            coords = np.column_stack(np.nonzero(mask))
+            if len(coords) < 10: continue
+            
+            cy, cx = coords.mean(axis=0)
+            
+            # Calculate distance from center of the image
+            dist = np.sqrt((cy - img_cy)**2 + (cx - img_cx)**2)
+            
+            # Inverse distance weighting (closer to center = higher weight)
+            # Add a small epsilon to avoid division by zero
+            weight = 1.0 / (dist + 1.0) 
+            
+            valid_segs.append(sp)
+            probabilities.append(weight)
+            
+        # Normalize weights into a probability distribution
+        probabilities = np.array(probabilities)
+        probabilities /= probabilities.sum()
+        ##########
+
+        # Pick superpixels, heavily favoring the center of the image
+        chosen_segs = np.random.choice(valid_segs, min(patches_per_image, len(valid_segs)), replace=False, p=probabilities)
 
         for sp in chosen_segs:
             mask = (segments == sp)
@@ -81,30 +143,63 @@ def extract_patches_from_image(row_tuple, root_dir, img_size, n_segments, patche
     return local_patches, local_labels
 
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 class TextureEncoder(nn.Module):
-    def __init__(self, latent_dim=64):
+    def __init__(self, latent_dim=16): # Default reduced to 16
         super().__init__()
+        
         # --- ENCODER ---
-        self.enc_conv1 = nn.Conv2d(3, 32, kernel_size=3, padding=1)
-        self.enc_conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
-        self.enc_conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
-        self.pool = nn.MaxPool2d(2, 2)
-        self.fc_enc = nn.Linear(128 * 4 * 4, latent_dim)
+        # 32x32 -> 16x16
+        self.enc_conv1 = nn.Conv2d(3, 32, kernel_size=3, padding=1, stride=2)
+        self.enc_bn1 = nn.BatchNorm2d(32)
+        
+        # 16x16 -> 8x8
+        self.enc_conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1, stride=2)
+        self.enc_bn2 = nn.BatchNorm2d(64)
+        
+        # 8x8 -> 4x4
+        self.enc_conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1, stride=2)
+        self.enc_bn3 = nn.BatchNorm2d(128)
+        
+        # 4x4 -> 2x2
+        self.enc_conv4 = nn.Conv2d(128, 256, kernel_size=3, padding=1, stride=2)
+        self.enc_bn4 = nn.BatchNorm2d(256)
+        
+        self.fc_enc = nn.Linear(256 * 2 * 2, latent_dim)
 
         # --- DECODER ---
-        self.fc_dec = nn.Linear(latent_dim, 128 * 4 * 4)
-        # ConvTranspose2d is the opposite of Pooling; it doubles the resolution
-        self.dec_conv1 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
-        self.dec_conv2 = nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2)
-        self.dec_conv3 = nn.ConvTranspose2d(32, 3, kernel_size=2, stride=2)
+        self.fc_dec = nn.Linear(latent_dim, 256 * 2 * 2)
+        
+        # 2x2 -> 4x4
+        self.dec_conv1 = nn.ConvTranspose2d(256, 128, kernel_size=3, stride=2, padding=1, output_padding=1)
+        self.dec_bn1 = nn.BatchNorm2d(128)
+        
+        # 4x4 -> 8x8
+        self.dec_conv2 = nn.ConvTranspose2d(128, 64, kernel_size=3, stride=2, padding=1, output_padding=1)
+        self.dec_bn2 = nn.BatchNorm2d(64)
+        
+        # 8x8 -> 16x16
+        self.dec_conv3 = nn.ConvTranspose2d(64, 32, kernel_size=3, stride=2, padding=1, output_padding=1)
+        self.dec_bn3 = nn.BatchNorm2d(32)
+        
+        # 16x16 -> 32x32
+        self.dec_conv4 = nn.ConvTranspose2d(32, 3, kernel_size=3, stride=2, padding=1, output_padding=1)
 
     def encoder(self, x):
-        """Used later by the GNN to get the 64-dim texture vector."""
-        x = self.pool(F.relu(self.enc_conv1(x)))
-        x = self.pool(F.relu(self.enc_conv2(x)))
-        x = self.pool(F.relu(self.enc_conv3(x)))
+        """Used later by the GNN to get the 16-dim texture vector."""
+        x = F.gelu(self.enc_bn1(self.enc_conv1(x)))
+        x = F.gelu(self.enc_bn2(self.enc_conv2(x)))
+        x = F.gelu(self.enc_bn3(self.enc_conv3(x)))
+        x = F.gelu(self.enc_bn4(self.enc_conv4(x)))
+        
         x = x.view(x.size(0), -1)
-        return self.fc_enc(x)
+        z = self.fc_enc(x)
+        
+        # Crucial for Metric Learning/GNN stability: project to unit hypersphere
+        return F.normalize(z, p=2, dim=1)
 
     def forward(self, x):
         """Used during training to reconstruct the image."""
@@ -112,13 +207,16 @@ class TextureEncoder(nn.Module):
         z = self.encoder(x)
         
         # 2. Decompress
-        x_recon = F.relu(self.fc_dec(z))
-        x_recon = x_recon.view(x_recon.size(0), 128, 4, 4) # Reshape back to 4x4 image
-        x_recon = F.relu(self.dec_conv1(x_recon))
-        x_recon = F.relu(self.dec_conv2(x_recon))
+        x_recon = F.gelu(self.fc_dec(z))
+        x_recon = x_recon.view(x_recon.size(0), 256, 2, 2) # Reshape back to 2x2 image
         
-        # Sigmoid pushes final pixels to be between 0.0 and 1.0 (matching your input)
-        x_recon = torch.sigmoid(self.dec_conv3(x_recon)) 
+        x_recon = F.gelu(self.dec_bn1(self.dec_conv1(x_recon)))
+        x_recon = F.gelu(self.dec_bn2(self.dec_conv2(x_recon)))
+        x_recon = F.gelu(self.dec_bn3(self.dec_conv3(x_recon)))
+        
+        # Sigmoid pushes final pixels to be between 0.0 and 1.0
+        x_recon = torch.sigmoid(self.dec_conv4(x_recon)) 
+        
         return x_recon
     
 class SuperpixelPatchDataset(TorchDataset):
@@ -132,7 +230,7 @@ class SuperpixelPatchDataset(TorchDataset):
         print("\n[CAE Phase] Extracting Texture Patches from Images (Parallelized)...")
 
         # Sample a subset to prevent taking hours
-        sample_df = df.sample(min(2000, len(df)), random_state=42)
+        sample_df = df.sample(min(4000, len(df)), random_state=42)
 
         # Launch Parallel Workers! (n_jobs=-1 uses all available CPU cores)
         # return_as="generator" allows tqdm to update the progress bar in real-time
@@ -180,7 +278,8 @@ def train_and_save_cae(df, args, save_path, device):
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     
     # We use Mean Squared Error (MSE) to measure how perfectly it rebuilds the image
-    criterion = nn.MSELoss()
+    criterion_mse = nn.MSELoss()
+    criterion_l1 = nn.L1Loss()
     
     epochs = args.cae_epochs
     print(f"\n[CAE Phase] Training Autoencoder for {epochs} epochs (Latent Dim: {args.cae_latent_dim})...")
@@ -195,7 +294,9 @@ def train_and_save_cae(df, args, save_path, device):
             reconstruction = model(patches)
             
             # Calculate how far off the pixels are
-            loss = criterion(reconstruction, patches)
+            loss_mse = criterion_mse(reconstruction, patches)
+            loss_l1 = criterion_l1(reconstruction, patches)
+            loss = loss_mse + (0.5 * loss_l1) # Blend them
             
             optimizer.zero_grad()
             loss.backward()
