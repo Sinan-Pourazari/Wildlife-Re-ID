@@ -47,8 +47,12 @@ def image_to_superpixel_graph(img, mask=None, n_segments=300, hog_bins=9, hog_si
         img_lab = rgb2lab(img)
         if 'hog' in features:
             pix_bin_idx, pix_mag = per_pixel_hog_bins(img, n_bins=hog_bins, signed=hog_signed)
-
-        colors, positions, hogs, cae_features = [], [], [], []
+        
+        if 'shape' in features:
+            props = regionprops(segments + 1)
+            total_area = h * w
+            max_perimeter = 2 * (h + w)
+        colors, positions, hogs, cae_features, shape_features = [], [], [], [], []
 
         for sp in range(num_nodes):
             mask_sp = (segments == sp)
@@ -72,7 +76,7 @@ def image_to_superpixel_graph(img, mask=None, n_segments=300, hog_bins=9, hog_si
                     hog_hist /= (np.linalg.norm(hog_hist, ord=2) + 1e-6)
                 hogs.append(hog_hist)
                 
-            # --- NEW: CAE Feature Extraction ---
+            # CAE Feature Extraction ---
             if 'cae' in features:
                 # 1. Find the Bounding Box of the superpixel
                 ymin, ymax = coords[:, 0].min(), coords[:, 0].max()
@@ -89,49 +93,29 @@ def image_to_superpixel_graph(img, mask=None, n_segments=300, hog_bins=9, hog_si
                     latent_vector = cae_model.encoder(crop_tensor).squeeze(0)
                     
                 cae_features.append(latent_vector.numpy())
+                
             if 'shape' in features:
-                # regionprops ignores 0, so we add 1 to the segments array
-                props = regionprops(segments + 1)
-                total_area = h * w
-                max_perimeter = 2 * (h + w)
-
-        colors, positions, hogs, cae_features, shape_features = [], [], [], [], []
-
-        for sp in range(num_nodes):
-            mask_sp = (segments == sp)
-            coords = np.column_stack(np.nonzero(mask_sp))
-            vals = img_lab[mask_sp]
-            
-            # ... [Keep your existing 'color', 'pos', 'hog', and 'cae' extraction here] ...
-            
-            # --- NEW: Shape Extraction ---
-        if 'shape' in features:
                 prop = props[sp]
                 
-                # 1. Basic Geometry (Normalized to image size)
                 area = prop.area / total_area
                 perimeter = prop.perimeter / max_perimeter
                 
-                # Bounding Box -> Aspect Ratio
                 min_y, min_x, max_y, max_x = prop.bbox
                 bb_h = max(max_y - min_y, 1)
                 bb_w = max(max_x - min_x, 1)
                 aspect_ratio = bb_w / bb_h
                 
-                # 2. Shape Ratios & Structural Descriptors
                 circularity = (4 * math.pi * prop.area) / ((prop.perimeter ** 2) + 1e-6)
                 solidity = prop.solidity
                 extent = prop.extent
                 eccentricity = prop.eccentricity
                 
-                # 3. Mathematical Transforms (Hu Moments)
                 hu_moments = prop.moments_hu
                 log_hu = []
                 for hu in hu_moments:
                     val = -1 * math.copysign(1.0, hu) * math.log10(abs(hu) + 1e-6)
                     log_hu.append(val)
                     
-                # Combine into a 14-dimensional shape vector
                 node_shape_vec = [
                     area, perimeter, aspect_ratio, circularity, 
                     solidity, extent, eccentricity
@@ -154,7 +138,7 @@ def image_to_superpixel_graph(img, mask=None, n_segments=300, hog_bins=9, hog_si
             x_shape = F.normalize(x_shape, p=2, dim=0) 
             x_list.append(x_shape)
 
-    # --- 3. NEW: Local Binary Patterns (LBP) Histogram ---
+    # --- 3. Local Binary Patterns (LBP) Histogram ---
     if 'lbp' in features:
         # Multiply by 255 and convert to 8-bit integer to safely calculate LBP
         gray = (rgb2gray(img) * 255).astype(np.uint8)

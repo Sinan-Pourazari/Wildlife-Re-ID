@@ -102,7 +102,7 @@ python .\src\ml_utils\eval.py ^
     --parallel_workers 14 ^
     --checkpoints_dir %CHECKPOINT_DIR% ^
     --batch_size 128 ^
-    --features color pos hog cae ^
+    --features color pos hog cae shape lbp ^
     --cae_weights_path %CAE_WEIGHTS_PATH% ^
     --cae_version %CAE_NAME% ^
     --cae_latent_dim %CAE_LATENT_DIM%

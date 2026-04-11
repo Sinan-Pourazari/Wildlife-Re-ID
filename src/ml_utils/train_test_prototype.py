@@ -547,7 +547,7 @@ def main(args):
     # --- Initialize Universal Datasets ---
     print("\n[ Preparing Training Data ]")
     train_dataset = UniversalGraphDataset(
-        num_train_classes = num_train_classes,
+        um_train_classes = num_train_classes,
         n_hops= args.n_hops,
         samples=train_samples, 
         root_dir=img_root, 
@@ -557,8 +557,8 @@ def main(args):
         img_size= args.img_size,
         rebuild_cache=args.rebuild,
         features=args.features,
-        cae_version=args.cae_version,            
-        cae_weights_path=args.cae_weights_path ,
+        cae_version=args.cae_version,
+        cae_weights_path=args.cae_weights_path,
         cae_latent_dim=args.cae_latent_dim 
             )
 
@@ -569,19 +569,20 @@ def main(args):
     print("\n[ Preparing Test/Holdout Data ]")
 
     test_dataset = UniversalGraphDataset(
-        samples=test_samples,
-        root_dir=img_root,       
-        cache_dir=cache_pool,
-        n_hops=args.n_hops,
+        num_train_classes = num_train_classes,
+        n_hops= args.n_hops,
+        samples=train_samples, 
+        root_dir=img_root, 
+        cache_dir=cache_pool, 
         mode=args.data_mode,
         n_segments=args.segments,
+        img_size= args.img_size,
         rebuild_cache=args.rebuild,
         features=args.features,
-        img_size=args.img_size,
-        num_train_classes=num_train_classes,
         cae_version=args.cae_version,
         cae_weights_path=args.cae_weights_path,
-        cae_latent_dim=args.cae_latent_dim )
+        cae_latent_dim=args.cae_latent_dim 
+        )
     # DataLoaders
     batch_sampler = PKBatchSampler(train_df["global_label"].values, P=16, K=8)
     train_loader = DataLoader(train_dataset, batch_sampler=batch_sampler, num_workers=args.workers, persistent_workers=True, prefetch_factor=4)
@@ -797,3 +798,4 @@ def plot_embedding_2d(
 #TODO for IDs with only one image, add on the fly rdm iamge argumentation for positive pairs, should be fine with batch pre fetch enabled
 #TODO add another Linear layer after the last to give the seperator head a chance to repopulate the dorpout neurons
 #TODO indenity aware pk triplet mining ( long taile dists.)
+#TODO Triplet tracker evaluator

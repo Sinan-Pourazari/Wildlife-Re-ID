@@ -322,35 +322,40 @@ def compute_clustering_metrics_hdbscan(args, embeddings, labels, species_preds, 
 def compute_clustering_metrics(args, embeddings, labels, species_preds, sim_thresh=0.6):
     """
     Replaces HDBSCAN with Rank-1 Graph Clustering (Connected Components).
+    Enforces a strict species boundary.
     """
     # 1. Convert numpy array back to tensor for fast similarity math
     features = torch.tensor(embeddings, dtype=torch.float32)
     features = F.normalize(features, p=2, dim=1)
     
-    # 2. Compute the same Cosine Similarity matrix used for retrieval
-    sim_matrix = torch.mm(features, features.t()).numpy()
+    # 2. Compute Cosine Similarity matrix
+    sim_matrix = torch.mm(features, features.t())
+    
+    # 3. Apply the Species Mask!
+    # Create a boolean mask: True where species are DIFFERENT
     species_preds_t = torch.tensor(species_preds)
     cross_species_mask = species_preds_t.unsqueeze(1) != species_preds_t.unsqueeze(0)
     
-    # set similarity scores between different species to inf
-    sim_matrix = torch.mm(features, features.t())
+    # Force the similarity between different species to -1.0 (completely dissimilar)
+    # This guarantees they will never pass the sim_thresh
+    sim_matrix[cross_species_mask] = -1.0 
+    
     sim_matrix_np = sim_matrix.numpy()
-    # 3. Create the Adjacency Graph
-    # If the similarity between two images is higher than our threshold, connect them!
+    
+    # 4. Create the Adjacency Graph
+    # Only connect images if similarity > threshold AND they are the same species
     adj_matrix = (sim_matrix_np > sim_thresh).astype(int)
     
-    # 4. Find the Clusters (Connected Components)
+    # 5. Find the Clusters (Connected Components)
     graph = csr_matrix(adj_matrix)
     n_components, predicted_ids = connected_components(csgraph=graph, directed=False, return_labels=True)
     
-    # 5. Compute Metrics
+    # 6. Compute Metrics
     ari = adjusted_rand_score(labels, predicted_ids)
     nmi = normalized_mutual_info_score(labels, predicted_ids)
     
-    # The number of components IS the number of discovered IDs
-    discovered_ids = n_components
-    
-    return ari, nmi, discovered_ids
+    return ari, nmi, n_components
+
 def plot_benchmark_results(results_df, save_dir):
     x = np.arange(len(results_df))
     
@@ -498,7 +503,7 @@ def evaluate_metrics_worker(ckpt_path, feats_np, labels_np, species_preds_np,kno
     # Pass known_classes down!
     r1, r5, r10, map_val, baks, baus = compute_reid_metrics(features, labels, known_classes, device='cpu', sim_thresh=0.6)
     #thesh, comp = compute_unsupervised_clustering(args,feats_np, species_preds_np)
-    ari, nmi, discovered_ids = compute_clustering_metrics(args, feats_np, labels_np, species_preds_np, sim_thresh = 0.35)
+    ari, nmi, discovered_ids = compute_clustering_metrics(args, feats_np, labels_np, species_preds_np, sim_thresh = 0.4)
 
     #ari, nmi, discovered_ids =compute_best_clustering_metrics(args, feats_np, labels_np, species_preds_np)
     harmonic_score = np.sqrt(baks * baus)
@@ -580,10 +585,10 @@ def main(args):
             n_segments=args.segments, 
             rebuild_cache=False, 
             features=args.features,
-            img_size=args.img_size,                  # <-- Added
-            cae_version=args.cae_version,            # <-- Added
-            cae_weights_path=args.cae_weights_path,  # <-- Added
-            cae_latent_dim=args.cae_latent_dim       # <-- Added
+            img_size=args.img_size,
+            cae_version=args.cae_version,  
+            cae_weights_path=args.cae_weights_path,
+            cae_latent_dim=args.cae_latent_dim 
         )
         test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, 
                                  num_workers=args.workers, persistent_workers=True)
