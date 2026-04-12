@@ -483,7 +483,9 @@ def get_test_samples(args):
     from sklearn.preprocessing import LabelEncoder
     if 'global_identity' not in test_df.columns:
         test_df['global_identity'] = test_df['dataset'] + "_" + test_df['identity'].astype(str)
-    test_df['global_label'] = LabelEncoder().fit_transform(test_df['global_identity'])
+    
+    #TODO What the fuck was my intuition here?
+    test_df['global_label'] = LabelEncoder().fit_transform(test_df['global_identity']) + 999999
     test_df['species_label'] = LabelEncoder().fit_transform(test_df['species'].astype(str))
 
     return list(zip(test_df["path"], test_df["global_label"], test_df["species_label"]))
@@ -501,9 +503,9 @@ def evaluate_metrics_worker(ckpt_path, feats_np, labels_np, species_preds_np,kno
     labels = torch.from_numpy(labels_np)
     
     # Pass known_classes down!
-    r1, r5, r10, map_val, baks, baus = compute_reid_metrics(features, labels, known_classes, device='cpu', sim_thresh=0.6)
+    r1, r5, r10, map_val, baks, baus = compute_reid_metrics(features, labels, known_classes, device='cpu', sim_thresh=0.4)
     #thesh, comp = compute_unsupervised_clustering(args,feats_np, species_preds_np)
-    ari, nmi, discovered_ids = compute_clustering_metrics(args, feats_np, labels_np, species_preds_np, sim_thresh = 0.4)
+    ari, nmi, discovered_ids = compute_clustering_metrics(args, feats_np, labels_np, species_preds_np, sim_thresh = 0.5)
 
     #ari, nmi, discovered_ids =compute_best_clustering_metrics(args, feats_np, labels_np, species_preds_np)
     harmonic_score = np.sqrt(baks * baus)
@@ -599,7 +601,8 @@ def main(args):
             model_name = os.path.basename(ckpt)
             print(f"Processing: {model_name}")
             try:
-                model, train_classes = ReIDModel.load(ckpt, device=main_device)
+                #TODO change so relevant args part is saved in model file
+                model, train_classes = ReIDModel.load(ckpt, args = args, device=main_device)
                 # Capture the second return value (train_classes)
                 features, labels, species_preds, species_labels = extract_features(model, test_loader, main_device)
                 known_classes_set = set(train_classes) if train_classes is not None else set()                
@@ -658,13 +661,14 @@ def main(args):
             rebuild_cache=False, 
             features=args.features,
             img_size=args.img_size,                 
-            cae_version=args.cae_version,            # <--- ADD THIS
-            cae_weights_path=args.cae_weights_path,  # <--- ADD THIS
+            cae_version=args.cae_version,            
+            cae_weights_path=args.cae_weights_path,
             cae_latent_dim=args.cae_latent_dim
         )
             test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers)
             for row in top_models.itertuples():
-                model, train_classes = ReIDModel.load(row.ckpt_path, device=main_device)
+                #TODO change so relevant args part is saved in model file
+                model, train_classes = ReIDModel.load(row.ckpt_path,args= args, device=main_device)
                 feats, lbls, species_preds_np, species_labels_np, _ = extracted_data[row.ckpt_path]
                 known_classes_set = set(train_classes) if train_classes is not None else set()
                 extracted_data[row.ckpt_path] = (feats.cpu().numpy(), lbls.cpu().numpy(), species_preds.cpu().numpy(), species_labels.cpu().numpy(), known_classes_set)                
