@@ -216,7 +216,7 @@ def extract_features(model, dataloader, device, species_confidence_thresh = 0.8)
             
     return torch.cat(all_emb), torch.cat(all_labels), torch.cat(all_species_preds), torch.cat(all_species_labels)            
 
-def compute_reid_metrics(features, labels, known_classes, device='cpu', sim_thresh=0.6):
+def compute_reid_metrics(features, labels, known_classes, device='cpu', sim_thresh=0.7):
     features = features.to(device)
     labels = labels.to(device)
     

@@ -313,6 +313,8 @@ class GNNEncoder(nn.Module):
         # Layer 3
         x = self.norm3(F.elu(self.conv3(x, final_edge_index)))
         x = F.softplus(x)
+        # --- OVERSMOOTHING CHECK ---
+
         # Pooling
         #pooled_mean = global_mean_pool(x, batch) 
         #pooled_max = global_max_pool(x, batch)   

@@ -273,7 +273,7 @@ class UniversalGraphDataset(PyGDataset):
         self.cae_latent_dim = cae_latent_dim
         self.min_size = min_size
         self.num_bins = num_bins
-
+        self.base_key_bytes = self._generate_base_key()
         if mode == 'auto':
             self.mode = 'memory' if len(samples) <= 8000 else 'lazy'
         else:
@@ -328,20 +328,26 @@ class UniversalGraphDataset(PyGDataset):
             pass
         return UniversalGraphDataset._shared_envs[env_key]
 
-    def _get_key(self, filename):
-        """Standardized byte-key generator for LMDB, now feature-aware."""
+    def _generate_base_key(self):
+        """Calculates the static configuration string once."""
         feature_str = "-".join(sorted(self.features)) 
         
-        # If 'cae' is in the features, append the model version!
         if 'cae' in self.features:
             dim = getattr(self, 'cae_latent_dim')
             version = getattr(self, 'cae_version')
             feature_str += f"-CAE-v{version}-dim{dim}"
+            
         if 'hog' in self.features:
             feature_str += f"hogb-{self.num_bins}"    
-        return f"res{self.img_size}_felzscale{self.felz_scale}_felzsigma{self.felz_sigma}_{self.min_size}_hops{self.n_hops}_{feature_str}_{filename}".encode('utf-8')
+            
+        base_str = f"res{self.img_size}_felzscale{self.felz_scale}_felzsigma{self.felz_sigma}_{self.min_size}_hops{self.n_hops}_{feature_str}_"
+        return base_str.encode('utf-8')
 
+    def _get_key(self, filename):
+        """fast byte concatenation for rappid itteration."""
+        return self.base_key_bytes + filename.encode('utf-8')
     def _warmup_cache(self, rebuild):
+
         print(f"\n[ CACHE WARMUP ] Checking {len(self.samples)} samples against LMDB...")
         # If texture is requested, bake the CAE version right into the key!
         # 100GB map size. (This is virtual memory, it won't actually consume 100GB of disk space)
