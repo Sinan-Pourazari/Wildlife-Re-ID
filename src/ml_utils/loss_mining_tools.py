@@ -172,6 +172,60 @@ def batch_semi_hard_triplet_loss(emb, labels, margin=0.2):
 
     return F.relu(hardest_pos - chosen_neg + margin).mean()
 
+def batch_topk_semi_hard_triplet_loss(emb, labels, margin=0.2, k_neg=3):
+    dist = pairwise_dist(emb)
+
+    labels = labels.view(-1, 1)
+    same = (labels == labels.t())
+    diff = ~same
+
+    eye = torch.eye(dist.size(0), device=dist.device, dtype=torch.bool)
+    same = same & ~eye
+
+    # 1. Find the hardest positive for each anchor
+    pos = dist.clone()
+    pos[~same] = -1.0
+    hardest_pos, _ = pos.max(dim=1)
+    ap = hardest_pos.view(-1, 1)
+
+    # 2. Identify the Semi-Hard Zone: d(ap) < d(an) < d(ap)+margin
+    semi = diff & (dist > ap) & (dist < (ap + margin))
+
+    # 3. Mask out everything that isn't semi-hard
+    semi_neg = dist.clone()
+    semi_neg[~semi] = 1e9
+
+    # 4. Grab the Top K closest semi-hard negatives
+    # (Using largest=False because smaller distance = harder)
+    closest_k_semi, _ = semi_neg.topk(k_neg, dim=1, largest=False)
+    
+    # 5. Create a boolean mask of which ones are actually valid 
+    # (in case there were fewer than K semi-hards available)
+    valid_semi = closest_k_semi < 1e8
+
+    # 6. Fallback: Identify the absolute closest negative overall
+    neg = dist.clone()
+    neg[~diff] = 1e9
+    closest_neg, _ = neg.min(dim=1)
+
+    losses = []
+    
+    # 7. Calculate the loss per anchor
+    for i in range(dist.size(0)):
+        # Extract only the valid semi-hard distances for this anchor
+        valid_dists = closest_k_semi[i][valid_semi[i]]
+        
+        if len(valid_dists) > 0:
+            # Average the loss over the 1 to K available semi-hard negatives
+            loss_i = F.relu(hardest_pos[i] - valid_dists + margin).mean()
+        else:
+            # Fallback: If no semi-hards exist, just use the single hardest negative
+            loss_i = F.relu(hardest_pos[i] - closest_neg[i] + margin)
+            
+        losses.append(loss_i)
+
+    return torch.stack(losses).mean()
+
 def batch_compactness_loss(embeddings, labels):
     """
     Calculates the variance of embeddings from their class centers within a single batch.

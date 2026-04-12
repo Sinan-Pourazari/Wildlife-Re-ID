@@ -10,7 +10,7 @@ from sklearn.neighbors import NearestNeighbors
 from sklearn.model_selection import train_test_split
 import embedding_clusterings as ec
 from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
-from loss_mining_tools import batch_hard_triplet_loss, PKBatchSampler, batch_semi_hard_triplet_loss, batch_compactness_loss, batch_topk_triplet_loss
+from loss_mining_tools import batch_hard_triplet_loss, PKBatchSampler, batch_semi_hard_triplet_loss, batch_compactness_loss, batch_topk_triplet_loss, batch_topk_semi_hard_triplet_loss
 from PIL import Image
 from torch_geometric.loader import DataLoader
 from torch_geometric.data import Dataset as PyGDataset
@@ -106,7 +106,7 @@ class GraphImageDataset(PyGDataset):
         return graph
     
 class ReIDModel(nn.Module):
-    def __init__(self, num_classes, num_species, in_dim=14, hidden_dim=256, gnn_out_dim=256, emb_dim=512, use_hybrid_pooling=True, edge_strategy="spatial", k_neighbors=10):
+    def __init__(self,args, num_classes, num_species, in_dim=14, hidden_dim=256, gnn_out_dim=256, emb_dim=512, use_hybrid_pooling=True, edge_strategy="spatial", k_neighbors=10):
         super().__init__()
         self.save_params = {
             'num_classes': num_classes,
@@ -119,7 +119,7 @@ class ReIDModel(nn.Module):
             'k_neighbors': k_neighbors 
         }
         # Initialize the GNN Encoder with provided params
-        self.encoder = GNNEncoder(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=gnn_out_dim)
+        self.encoder = GNNEncoder(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=gnn_out_dim, args= args)
         # Calculate the actual size coming out of the GNN
         # If pooling Mean + Max, the dimension is doubled
         self.gnn_feature_size = gnn_out_dim * 2 if use_hybrid_pooling else gnn_out_dim
@@ -164,6 +164,7 @@ class ReIDModel(nn.Module):
         return embeddings
     
     # --- Accept train_classes instead of label_encoder ---
+    # TODO save relevant args parts
     def save(self, args, epoch, optimizer, train_classes=None, species_classes = None):
         """Saves weights, metadata, and hyperparameters with attribute safety."""
         if not os.path.exists(args.checkpoint_dir):
@@ -206,7 +207,7 @@ class ReIDModel(nn.Module):
         return save_path
 
     @staticmethod
-    def load(checkpoint_path, device='cpu'):
+    def load(checkpoint_path, args, device='cpu'):
         """Reconstructs the model, handling both old and new checkpoint formats."""
         checkpoint = torch.load(checkpoint_path, map_location=device)
         
@@ -229,7 +230,7 @@ class ReIDModel(nn.Module):
             hyperparams['num_species'] = len(species_classes)
         else:
             hyperparams['num_species'] = None # Fallback for your old models
-        model = ReIDModel(**hyperparams)
+        model = ReIDModel(**hyperparams, args=args)
         
         # FILTER OUT THE CLASSIFIER
         state_dict = checkpoint['model_state_dict']
@@ -264,7 +265,7 @@ def train_one_epoch(loader, model, arcface_loss, optimizer, margin=1.0):
 
         # Calculate losses
         #loss_triplet = batch_hard_triplet_loss(emb, labels, margin=margin)
-        loss_triplet = batch_topk_triplet_loss(emb, labels, margin=margin, k_pos=3, k_neg=10)
+        loss_triplet = batch_topk_semi_hard_triplet_loss(emb, labels, margin=margin, k_neg=8)
         #TODO add args to change betwen arcface and cross entorpy
         #loss_ce = 0.25 * criterion_ce(logits, labels)
         loss_arc = 0.2 * arcface_loss(emb,labels)
@@ -547,7 +548,7 @@ def main(args):
     # --- Initialize Universal Datasets ---
     print("\n[ Preparing Training Data ]")
     train_dataset = UniversalGraphDataset(
-        um_train_classes = num_train_classes,
+        num_train_classes = num_train_classes,
         n_hops= args.n_hops,
         samples=train_samples, 
         root_dir=img_root, 
@@ -595,10 +596,10 @@ def main(args):
     print(f"--> Dynamically detected Node Feature Dimension (in_dim): {dynamic_in_dim}")
 
     # Model & Optimizer (Notice in_dim is now dynamic)
-    model = ReIDModel(num_classes=num_train_classes, num_species= num_species,in_dim=dynamic_in_dim, hidden_dim=512, gnn_out_dim=256, emb_dim=512, 
+    model = ReIDModel(args= args,num_classes=num_train_classes, num_species= num_species,in_dim=dynamic_in_dim, hidden_dim=512, gnn_out_dim=256, emb_dim=512, 
                       use_hybrid_pooling = False, edge_strategy=args.edge_strategy,k_neighbors=args.k_neighbors).to(device)
     
-    arcface = ArcFaceLoss(num_classes=num_train_classes, embedding_size=512, margin=28.6, scale= 64).to(device)
+    arcface = ArcFaceLoss(num_classes=num_train_classes, embedding_size=512, margin=15, scale= 64).to(device)
     optimizer = torch.optim.Adam(list(model.parameters()) + list(arcface.parameters()), lr=1e-3)
 
     # --- RESUME LOGIC ---
