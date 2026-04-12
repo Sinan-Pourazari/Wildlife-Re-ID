@@ -5,6 +5,7 @@ import os
 import collections
 from tqdm import tqdm
 from torch_geometric.data import Data
+
 def peek_at_unknowns(cache_dir, num_samples=15):
     print(f"Peeking at 'unknown' keys in LMDB: {cache_dir}...\n")
     env = lmdb.open(cache_dir, readonly=True, lock=False)
@@ -54,12 +55,12 @@ def verify_lmdb_cache(cache_dir):
             key_str = key.decode('utf-8')
             
             # --- EXTRACT CONFIGURATION ---
-            # Keys look like: res1024_seg300_color-pos-hog_filename.jpg
+            # Keys NOW look like: res512_felzscale70.0_felzsigma0.65_hops1_cae-color-hog-pos-CAE-v7-dim16_filename.jpg
             parts = key_str.split('_')
             
-            # We assume the first 3 chunks (res, seg, features) define the configuration
-            if len(parts) >= 4 and parts[0].startswith('res'):
-                config_name = f"{parts[0]}_{parts[1]}_{parts[2]}_{parts[3]}"
+            # We assume the first 5 chunks define the configuration now
+            if len(parts) >= 6 and parts[0].startswith('res'):
+                config_name = f"{parts[0]}_{parts[1]}_{parts[2]}_{parts[3]}_{parts[4]}"
             else:
                 config_name = "unknown_config"
                 
@@ -101,17 +102,17 @@ def verify_lmdb_cache(cache_dir):
     
     # Sort the dictionary so the output is neat and readable
     for config, count in sorted(config_counts.items()):
-        print(f"  • {config:<30} : {count} graphs")
+        print(f"  • {config:<60} : {count} graphs")
         
-    print("-" * 40)
+    print("-" * 60)
     
     if empty == 0 and corrupted == 0:
         print("--> [STATUS] Database is HEALTHY.")
     else:
         print("--> [STATUS] Issues detected. Recommend running with --rebuild.")
-    print("="*40)
+    print("="*60)
 
 # Run it
 if __name__ == "__main__":
     verify_lmdb_cache("src/images/reid-10k/graph_cache_pool")
-    peek_at_unknowns("src/images/reid-10k/graph_cache_pool")
+    # peek_at_unknowns("src/images/reid-10k/graph_cache_pool") # Uncomment to see old keys

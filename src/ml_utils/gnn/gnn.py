@@ -16,14 +16,14 @@ from gnn.cae import TextureEncoder
 from torchvision import transforms
 from skimage.measure import regionprops
 import math
-def image_to_superpixel_graph(img, mask=None, n_segments=300, hog_bins=9, hog_signed=False, hog_l2norm=True, features=['color', 'pos', 'hog'], n_hops=1, cae_weights_path=None, cae_latent_dim=64, return_segments=False):   
+def image_to_superpixel_graph(img, scale, sigma, min_size, hog_bins, mask=None , hog_signed=False, hog_l2norm=True, features=['color', 'pos', 'hog'], n_hops=1, cae_weights_path=None, cae_latent_dim=64, return_segments=False):   
     if isinstance(img, Image.Image):
         img = np.array(img)
     
     h, w, _ = img.shape
 
-    # --- 1. Standard SLIC ---
-    segments = felzenszwalb(img, scale=10.0, sigma=0.65, min_size=150)
+    # --- 1. Standard felzenszwalb ---
+    segments = felzenszwalb(img, scale=scale, sigma=sigma, min_size=min_size)
     num_nodes = segments.max() + 1
     seg_flat = torch.tensor(segments, dtype=torch.long).view(-1)
     
@@ -251,12 +251,13 @@ def image_to_superpixel_graph(img, mask=None, n_segments=300, hog_bins=9, hog_si
 
 
 class GNNEncoder(nn.Module):
-    def __init__(self, args , in_dim=14, hidden_dim=512, out_dim=512, edge_strategy="spatial", k_neighbors=5):
+    def __init__(self, features, cae_latent_dim , in_dim=14, hidden_dim=512, out_dim=512, edge_strategy="spatial", k_neighbors=5):
         super().__init__()
         # The number of attention-based semantic edges to create per node
         self.k_neighbors = k_neighbors
         self.edge_strategy = edge_strategy
-        self.args = args
+        self.features = features
+        self.cae_latent_dim = cae_latent_dim
         # Learned Attention Projection
         # Projects raw features into a specific "Edge Similarity" space.
         # This acts like the Query/Key transformations in standard Transformers.
@@ -297,6 +298,7 @@ class GNNEncoder(nn.Module):
             if self.edge_strategy == "attention":
                 # Pure semantic approach (ignores physical layout)
                 final_edge_index = semantic_edge_index
+
             elif self.edge_strategy == "hybrid":
                 # Best of both worlds: Anatomy + Texture Matching
                 final_edge_index = torch.cat([spatial_edge_index, semantic_edge_index], dim=1)
@@ -339,9 +341,8 @@ class GNNEncoder(nn.Module):
             'texture': 1
         }
         
-        # Dynamically pull the CAE size from args if it exists, otherwise default to 16
-        cae_dim = getattr(self.args, 'cae_latent_dim', 16)
-        feature_block_sizes['cae'] = cae_dim
+        # Dynamically pull the CAE size  if it exists, otherwise default to 16
+        feature_block_sizes['cae'] = self.cae_latent_dim
 
         # 2. STRICT order they are appended in image_to_superpixel_graph
         extraction_order = ['color', 'pos', 'hog', 'cae', 'shape', 'lbp', 'texture']
@@ -351,7 +352,7 @@ class GNNEncoder(nn.Module):
         
         # 3. Build the dynamic index map based ONLY on what is active
         for feat in extraction_order:
-            if feat in self.args.features:
+            if feat in self.features:
                 size = feature_block_sizes[feat]
                 # Map the feature to its start and end indices
                 feature_blocks[feat] = (curr_indx, curr_indx + size)

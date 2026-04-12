@@ -106,10 +106,14 @@ class GraphImageDataset(PyGDataset):
         return graph
     
 class ReIDModel(nn.Module):
-    def __init__(self,args, num_classes, num_species, in_dim=14, hidden_dim=256, gnn_out_dim=256, emb_dim=512, use_hybrid_pooling=True, edge_strategy="spatial", k_neighbors=10):
+    def __init__(self,features, cae_latent_dim, num_classes, num_species, in_dim \
+        , hidden_dim=256, gnn_out_dim=256, emb_dim=512, use_hybrid_pooling=True, edge_strategy="spatial", k_neighbors=5):
         super().__init__()
         self.save_params = {
+            'features': features,
             'num_classes': num_classes,
+            'cae_latent_dim': cae_latent_dim,
+            'num_species': num_species,
             'in_dim': in_dim,
             'hidden_dim': hidden_dim,
             'gnn_out_dim': gnn_out_dim,
@@ -119,7 +123,7 @@ class ReIDModel(nn.Module):
             'k_neighbors': k_neighbors 
         }
         # Initialize the GNN Encoder with provided params
-        self.encoder = GNNEncoder(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=gnn_out_dim, args= args)
+        self.encoder = GNNEncoder(features=features,cae_latent_dim=cae_latent_dim, in_dim=in_dim, hidden_dim=hidden_dim, out_dim=gnn_out_dim, edge_strategy=edge_strategy, k_neighbors=k_neighbors)
         # Calculate the actual size coming out of the GNN
         # If pooling Mean + Max, the dimension is doubled
         self.gnn_feature_size = gnn_out_dim * 2 if use_hybrid_pooling else gnn_out_dim
@@ -210,27 +214,24 @@ class ReIDModel(nn.Module):
     def load(checkpoint_path, args, device='cpu'):
         """Reconstructs the model, handling both old and new checkpoint formats."""
         checkpoint = torch.load(checkpoint_path, map_location=device)
-        
         hyperparams = checkpoint.get('hyperparameters', {})
         if not hyperparams:
-            hyperparams = {
-                'in_dim': checkpoint.get('in_dim', 14),
-                'hidden_dim': checkpoint.get('hidden_dim', 512),
-                'gnn_out_dim': checkpoint.get('gnn_out_dim', 256),
-                'emb_dim': checkpoint.get('emb_dim', 512),
-                'edge_strategy': checkpoint.get('edge_strategy', 'spatial'),
-                'k_neighbors': checkpoint.get('k_neighbors', 10)
-            }
-
+            raise ValueError(f"Checkpoint {checkpoint_path} is missing 'hyperparameters'. It is too old to be loaded.")
+        # Safe fallbacks for older models that didn't save these parameters
+        hyperparams['features'] = hyperparams.get('features', args.features)
+        hyperparams['cae_latent_dim'] = hyperparams.get('cae_latent_dim', args.cae_latent_dim)
+        hyperparams['edge_strategy'] = hyperparams.get('edge_strategy', 'spatial')
+        hyperparams['k_neighbors'] = hyperparams.get('k_neighbors', 10)
+        
         if 'num_classes' not in hyperparams:
             hyperparams['num_classes'] = 1
-
+            
+        # Species handling
         species_classes = checkpoint.get('species_classes', None)
-        if species_classes is not None:
-            hyperparams['num_species'] = len(species_classes)
-        else:
-            hyperparams['num_species'] = None # Fallback for your old models
-        model = ReIDModel(**hyperparams, args=args)
+        hyperparams['num_species'] = len(species_classes) if species_classes is not None else 1
+
+        # Instantiate the model with the exact hyperparams it was trained with
+        model = ReIDModel(**hyperparams) 
         
         # FILTER OUT THE CLASSIFIER
         state_dict = checkpoint['model_state_dict']
@@ -279,10 +280,10 @@ def train_one_epoch(loader, model, arcface_loss, optimizer, margin=1.0):
         optimizer.step()
 
         total += float(loss.item())
-        total_triplet += loss_triplet
-        total_ce += loss_arc
+        total_triplet += loss_triplet.item()
+        total_ce += loss_arc.item()
         #total_compact += loss_compact
-        total_species += loss_ce_species
+        total_species += loss_ce_species.item()
 
     return total / len(loader), total_triplet / len(loader), total_ce / len(loader), total_compact / len(loader), total_species / len(loader)
 
@@ -554,13 +555,16 @@ def main(args):
         root_dir=img_root, 
         cache_dir=cache_pool, 
         mode=args.data_mode,
-        n_segments=args.segments,
         img_size= args.img_size,
         rebuild_cache=args.rebuild,
         features=args.features,
         cae_version=args.cae_version,
         cae_weights_path=args.cae_weights_path,
-        cae_latent_dim=args.cae_latent_dim 
+        cae_latent_dim=args.cae_latent_dim,
+        felz_sigma= args.felz_sigma,
+        felz_scale= args.felz_scale,
+        num_bins= args.num_hog_bins,
+        min_size= args.felz_min_size
             )
 
     # Look at the very first graph in the dataset to see how wide the features are
@@ -572,17 +576,20 @@ def main(args):
     test_dataset = UniversalGraphDataset(
         num_train_classes = num_train_classes,
         n_hops= args.n_hops,
-        samples=train_samples, 
+        samples=test_samples, 
         root_dir=img_root, 
         cache_dir=cache_pool, 
         mode=args.data_mode,
-        n_segments=args.segments,
         img_size= args.img_size,
         rebuild_cache=args.rebuild,
         features=args.features,
         cae_version=args.cae_version,
         cae_weights_path=args.cae_weights_path,
-        cae_latent_dim=args.cae_latent_dim 
+        cae_latent_dim=args.cae_latent_dim,
+        felz_sigma= args.felz_sigma,
+        felz_scale= args.felz_scale,
+        num_bins= args.num_hog_bins,
+        min_size= args.felz_min_size
         )
     # DataLoaders
     batch_sampler = PKBatchSampler(train_df["global_label"].values, P=16, K=8)
@@ -596,8 +603,8 @@ def main(args):
     print(f"--> Dynamically detected Node Feature Dimension (in_dim): {dynamic_in_dim}")
 
     # Model & Optimizer (Notice in_dim is now dynamic)
-    model = ReIDModel(args= args,num_classes=num_train_classes, num_species= num_species,in_dim=dynamic_in_dim, hidden_dim=512, gnn_out_dim=256, emb_dim=512, 
-                      use_hybrid_pooling = False, edge_strategy=args.edge_strategy,k_neighbors=args.k_neighbors).to(device)
+    model = ReIDModel(num_classes=num_train_classes, num_species= num_species,in_dim=dynamic_in_dim, hidden_dim=512, gnn_out_dim=256, emb_dim=512, 
+                      use_hybrid_pooling = False, edge_strategy=args.edge_strategy,k_neighbors=args.k_neighbors, features=args.features, cae_latent_dim=args.cae_latent_dim).to(device)
     
     arcface = ArcFaceLoss(num_classes=num_train_classes, embedding_size=512, margin=15, scale= 64).to(device)
     optimizer = torch.optim.Adam(list(model.parameters()) + list(arcface.parameters()), lr=1e-3)
@@ -646,16 +653,21 @@ if __name__ == "__main__":
     
     # Dataset scaling settings
     parser.add_argument("--data_mode", type=str, default="auto", choices=["auto", "memory", "lazy"], help="How to load graphs. 'auto' chooses based on dataset size.")
-    parser.add_argument("--segments", type=int, default=300, help="Number of superpixels (SLIC segments)")
+    #parser.add_argument("--segments", type=int, default=300, help="Number of superpixels (SLIC segments)")
     parser.add_argument("--rebuild", action="store_true", help="Force rebuild of graph cache (ignore existing .pt files)")
     parser.add_argument("--img_size", type=int, default=1024, help="Max dimension (width or height) for images before graph creation")
     parser.add_argument("--subset_fraction", type=float, default=1.0, help="Fraction of identities to keep (e.g., 0.1 for 10%)")
     parser.add_argument("--species", type=str, nargs="+", default=None, help="List of specific species to use (e.g., --species tiger fox wolf)")
-    parser.add_argument("--n_hops", type=int, default=1, help="Number of hops for edge connections (1 = direct neighbors, 2 = neighbors of neighbors)")
-    # --- NEW: Graph Structure Settings ---
-    parser.add_argument("--edge_strategy", type=str, default="spatial", choices=["spatial", "attention", "hybrid"], help="How to build GNN edges: 'spatial' (LMDB), 'attention' (GPU KNN), or 'hybrid' (Both).")
-    parser.add_argument("--k_neighbors", type=int, default=10, help="Number of dynamic attention edges per node (if using attention or hybrid).")
 
+    
+    parser.add_argument("--n_hops", type=int, default=1, help="Number of hops for edge connections (1 = direct neighbors, 2 = neighbors of neighbors)")
+    
+    # Graph Structure Settings
+    parser.add_argument("--edge_strategy", type=str, default="spatial", choices=["spatial", "attention", "hybrid"], help="How to build GNN edges: 'spatial' (LMDB), 'attention' (GPU KNN), or 'hybrid' (Both).")
+    parser.add_argument("--k_neighbors", type=int, default=5, help="Number of dynamic attention edges per node (if using attention or hybrid).")
+    parser.add_argument("--felz_sigma", type=float, default=0.65, help = "")
+    parser.add_argument("--felz_scale", type= float, default = 70, help = "")
+    parser.add_argument("--felz_min_size", type= int, default = 150, help = "")
     # Hardware settings
     parser.add_argument("--workers", type=int, default=4, help="Number of CPU workers for DataLoader")
     
@@ -671,7 +683,7 @@ if __name__ == "__main__":
 
     # Feature extractor settings:
     parser.add_argument("--features", nargs="+", default=["color", "pos", "hog", "lbp", "cae", "texture"], help="List of node features to extract (color pos hog lbp texture)")
-    
+    parser.add_argument("--num_hog_bins", type=int, help="Historgram of oriented gradients bin size")
     # CAE settings
     parser.add_argument("--cae_latent_dim", type=int, default=64, help="Dimensionality of the CAE learned texture vector")
     parser.add_argument("--cae_epochs", type=int, default=10, help="Epochs to train the Texture Encoder")

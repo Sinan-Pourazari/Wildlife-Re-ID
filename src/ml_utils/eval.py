@@ -505,7 +505,7 @@ def evaluate_metrics_worker(ckpt_path, feats_np, labels_np, species_preds_np,kno
     # Pass known_classes down!
     r1, r5, r10, map_val, baks, baus = compute_reid_metrics(features, labels, known_classes, device='cpu', sim_thresh=0.4)
     #thesh, comp = compute_unsupervised_clustering(args,feats_np, species_preds_np)
-    ari, nmi, discovered_ids = compute_clustering_metrics(args, feats_np, labels_np, species_preds_np, sim_thresh = 0.5)
+    ari, nmi, discovered_ids = compute_clustering_metrics(args, feats_np, labels_np, species_preds_np, sim_thresh = 0.6)
 
     #ari, nmi, discovered_ids =compute_best_clustering_metrics(args, feats_np, labels_np, species_preds_np)
     harmonic_score = np.sqrt(baks * baus)
@@ -577,41 +577,59 @@ def main(args):
         print(f"\n[ PHASE 1 SKIPPED: Using existing benchmark results ]")
         df = pd.read_csv(csv_path)
     else:
+        # --- PHASE 1: SEQUENTIAL GPU FEATURE EXTRACTION ---
         print(f"\n--- PHASE 1: SEQUENTIAL GPU FEATURE EXTRACTION ---")
-        test_dataset = UniversalGraphDataset(
+        
+        # 1. Initialize the dataset and loader EXACTLY ONCE before the loop
+        print(f"--> Initializing shared evaluation dataset...")
+        shared_dataset = UniversalGraphDataset(
             samples=test_samples, 
             root_dir=args.root_dir, 
             cache_dir=args.cache_dir, 
-            n_hops=args.n_hops,
             mode=args.data_mode, 
-            n_segments=args.segments, 
             rebuild_cache=False, 
-            features=args.features,
             img_size=args.img_size,
-            cae_version=args.cae_version,  
+            n_hops=args.n_hops,
+            features=args.features,
+            cae_version=args.cae_version,
             cae_weights_path=args.cae_weights_path,
-            cae_latent_dim=args.cae_latent_dim 
+            cae_latent_dim=args.cae_latent_dim,
+            felz_scale=args.felz_scale,
+            felz_sigma=args.felz_sigma,
+            min_size=args.felz_min_size,
+            num_bins=args.num_hog_bins
         )
-        test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, 
-                                 num_workers=args.workers, persistent_workers=True)
+        
+        shared_loader = DataLoader(
+            shared_dataset, batch_size=args.batch_size, 
+            shuffle=False, num_workers=args.workers, persistent_workers=True
+        )
 
-# --- PHASE 1: SEQUENTIAL GPU FEATURE EXTRACTION ---
-        # ... (loader setup code) ...
+        # 2. Loop through the checkpoints and infer using the shared loader
         for ckpt in sorted(pth_files):
             model_name = os.path.basename(ckpt)
-            print(f"Processing: {model_name}")
+            print(f"\nProcessing: {model_name}")
             try:
-                #TODO change so relevant args part is saved in model file
-                model, train_classes = ReIDModel.load(ckpt, args = args, device=main_device)
-                # Capture the second return value (train_classes)
-                features, labels, species_preds, species_labels = extract_features(model, test_loader, main_device)
-                known_classes_set = set(train_classes) if train_classes is not None else set()                
-                # CRITICAL: Store the known classes as a set alongside the numpy arrays
-                extracted_data[ckpt] = (features.cpu().numpy(), labels.cpu().numpy(), species_preds.cpu().numpy(), species_labels.cpu().numpy(), known_classes_set)
+                # Load the model (Called only once now)
+                model, train_classes = ReIDModel.load(ckpt, args=args, device=main_device)
                 
-                # Free VRAM immediately
+                # Extract features using the shared dataloader
+                features, labels, species_preds, species_labels = extract_features(model, shared_loader, main_device)
+                
+                # Store the results
+                known_classes_set = set(train_classes) if train_classes is not None else set()                
+                extracted_data[ckpt] = (
+                    features.cpu().numpy(), 
+                    labels.cpu().numpy(), 
+                    species_preds.cpu().numpy(), 
+                    species_labels.cpu().numpy(), 
+                    known_classes_set
+                )
+                
+                # Free VRAM immediately for the next checkpoint
                 del model
                 torch.cuda.empty_cache()
+                
             except Exception as e:
                 print(f"Failed to infer {model_name}: {e}")
 
@@ -651,25 +669,37 @@ def main(args):
         # Catch for use_existing_csv scenario
         if args.use_existing_csv and not extracted_data:
             print("Re-extracting features sequentially for Top-K models...")
-            test_dataset = UniversalGraphDataset(
-            samples=test_samples, 
-            root_dir=args.root_dir, 
-            cache_dir=args.cache_dir, 
-            n_hops=args.n_hops,
-            mode=args.data_mode, 
-            n_segments=args.segments, 
-            rebuild_cache=False, 
-            features=args.features,
-            img_size=args.img_size,                 
-            cae_version=args.cae_version,            
-            cae_weights_path=args.cae_weights_path,
-            cae_latent_dim=args.cae_latent_dim
-        )
-            test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers)
+            
             for row in top_models.itertuples():
-                #TODO change so relevant args part is saved in model file
-                model, train_classes = ReIDModel.load(row.ckpt_path,args= args, device=main_device)
-                feats, lbls, species_preds_np, species_labels_np, _ = extracted_data[row.ckpt_path]
+                # 1. Load Model and get specific saved args
+                checkpoint_data = torch.load(row.ckpt_path, map_location=main_device)
+                saved_args = checkpoint_data.get('args', vars(args) if hasattr(args, '__dict__') else args)
+                model, train_classes = ReIDModel.load(row.ckpt_path, args=args, device=main_device)
+                
+                # 2. Build the dataset EXACTLY for this model
+                test_dataset = UniversalGraphDataset(
+                    samples=test_samples, 
+                    root_dir=args.root_dir, 
+                    cache_dir=args.cache_dir, 
+                    mode=args.data_mode, 
+                    rebuild_cache=False, 
+                    img_size=saved_args.get('img_size', args.img_size),
+                    felz_scale=saved_args.get('felz_scale', args.felz_scale),
+                    felz_sigma=saved_args.get('felz_sigma', args.felz_sigma),
+                    min_size=saved_args.get('felz_min_size', args.felz_min_size),
+                    num_bins=saved_args.get('num_hog_bins', args.num_hog_bins),
+                    n_hops=saved_args.get('n_hops', args.n_hops),
+                    features=saved_args.get('features', args.features),
+                    cae_version=saved_args.get('cae_version', args.cae_version),
+                    cae_weights_path=saved_args.get('cae_weights_path', args.cae_weights_path),
+                    cae_latent_dim=saved_args.get('cae_latent_dim', args.cae_latent_dim)
+                )
+                
+                test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers)
+                
+                # 3. Extract using this specific setup
+                feats, lbls, species_preds, species_labels = extract_features(model, test_loader, main_device)
+                
                 known_classes_set = set(train_classes) if train_classes is not None else set()
                 extracted_data[row.ckpt_path] = (feats.cpu().numpy(), lbls.cpu().numpy(), species_preds.cpu().numpy(), species_labels.cpu().numpy(), known_classes_set)                
                
@@ -709,6 +739,9 @@ if __name__ == "__main__":
     parser.add_argument("--data_mode", type=str, default="auto", choices=["auto", "memory", "lazy"], help="Data load mode")
     parser.add_argument("--batch_size", type=int, default=128, help="Evaluation batch size")
     parser.add_argument("--workers", type=int, default=4, help="CPU workers for DataLoader")
+    parser.add_argument("--felz_sigma", type=float, default=0.65, help = "")
+    parser.add_argument("--felz_scale", type= float, default = 70, help = "")
+    parser.add_argument("--felz_min_size", type= int, default = 150, help = "")
     #parser.add_argument("--n_hops", type=int, default=1, help="Number of hops for edge connections (1 = direct neighbors, 2 = neighbors of neighbors)")
 
     # Evaluation specifics
@@ -721,7 +754,8 @@ if __name__ == "__main__":
     parser.add_argument("--features", nargs="+", default=["color", "pos", "hog", "lbp", "texture"], help="List of node features to extract")
     #TODO CHANGE THIS SO ITS LOADED FROM THE SAVED MODEL
     parser.add_argument("--n_hops", type=int, default=1, help="Number of hops for edge connections (1 = direct neighbors, 2 = neighbors of neighbors)")
-    
+    parser.add_argument("--num_hog_bins", type=int, help="Historgram of oriented gradients bin size")
+
     parser.add_argument("--cae_latent_dim", type=int, default=64, help="Dimensionality of the CAE texture vector")
     parser.add_argument("--cae_version", type=str, default="none", help="Version string of the CAE model")
     parser.add_argument("--cae_weights_path", type=str, default=None, help="Path to the trained CAE weights")

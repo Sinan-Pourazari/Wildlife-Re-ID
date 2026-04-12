@@ -14,7 +14,7 @@ from gnn.gnn import image_to_superpixel_graph
 from PIL import ImageOps
 import numpy as np
 
-def process_for_lmdb(filename, root_dir, n_segments, features, max_size, n_hops, cae_weights_path, cae_latent_dim):
+def process_for_lmdb(filename, root_dir, felz_scale, felz_sigma, min_size, num_bins, features, max_size, n_hops, cae_weights_path, cae_latent_dim):
     img_path = os.path.join(root_dir, filename)
     img = Image.open(img_path).convert("RGB")
 
@@ -27,12 +27,16 @@ def process_for_lmdb(filename, root_dir, n_segments, features, max_size, n_hops,
 
     # Pass the mask in to keep the graph safe from black edges
     graph = image_to_superpixel_graph(
-        img, mask=np.array(mask), n_segments=n_segments, 
-        n_hops=n_hops, features=features, 
+        img, mask=np.array(mask), 
+        scale=felz_scale,        
+        sigma=felz_sigma,        
+        min_size=min_size,       
+        hog_bins=num_bins,      
+        n_hops=n_hops, 
+        features=features, 
         cae_weights_path=cae_weights_path,
-        cae_latent_dim=cae_latent_dim 
+        cae_latent_dim=cae_latent_dim
     )
-        
     buffer = io.BytesIO()
     torch.save(graph, buffer)
         
@@ -63,7 +67,7 @@ def process_single_image(filename, root_dir, cache_dir, n_segments, rebuild, max
 
         # Resize Mechanic
         # Force every single image to be exactly 512x512
-        # 1. Resize while keeping perfect aspect ratio, and pad the rest with black
+        # 1. Resize while keeping aspect ratio, and pad the rest with black
         img = ImageOps.pad(img, (max_size, max_size), color=(0, 0, 0), method=Image.Resampling.LANCZOS)
 
         from gnn.gnn import image_to_superpixel_graph
@@ -252,13 +256,14 @@ class InMemoryGraphDataset(PyGDataset):
 
 class UniversalGraphDataset(PyGDataset):
     _shared_envs = {}
-    def __init__(self, samples, root_dir, cache_dir, n_hops, mode='auto', n_segments=300, rebuild_cache=False, img_size=1024,
+    def __init__(self, samples, root_dir, cache_dir, n_hops, felz_scale, felz_sigma, min_size, num_bins, mode='auto', rebuild_cache=False, img_size=1024,
                   num_train_classes=None, features=['color', 'pos', 'hog'], cae_version="none", cae_weights_path=None, cae_latent_dim = None):
         super().__init__()
         self.samples = samples
         self.root_dir = root_dir
         self.cache_dir = os.path.abspath(cache_dir)  # This is now the directory holding data.mdb and lock.mdb
-        self.n_segments = n_segments
+        self.felz_scale = felz_scale
+        self.felz_sigma = felz_sigma
         self.img_size = img_size
         self.graphs = []
         self.features = features
@@ -266,6 +271,8 @@ class UniversalGraphDataset(PyGDataset):
         self.cae_version = cae_version
         self.cae_weights_path = cae_weights_path
         self.cae_latent_dim = cae_latent_dim
+        self.min_size = min_size
+        self.num_bins = num_bins
 
         if mode == 'auto':
             self.mode = 'memory' if len(samples) <= 8000 else 'lazy'
@@ -289,7 +296,8 @@ class UniversalGraphDataset(PyGDataset):
         # Tie the environment handle to the specific Process ID!
         env_key = (self.cache_dir, pid)
 
-        # FIXED: Now strictly using env_key instead of self.cache_dir
+        #TODO this seems like it wastes cpu cycles rework it!
+        # strictly using env_key instead of self.cache_dir
         if env_key not in UniversalGraphDataset._shared_envs:
             #print(f"{env_key=} does not exist!")
             inherited_keys = list(UniversalGraphDataset._shared_envs.keys())
@@ -325,10 +333,13 @@ class UniversalGraphDataset(PyGDataset):
         feature_str = "-".join(sorted(self.features)) 
         
         # If 'cae' is in the features, append the model version!
-        if 'cae' in self.features and hasattr(self, 'cae_version'):
-            feature_str += f"_CAE-{self.cae_version}"
-            
-        return f"res{self.img_size}_seg{self.n_segments}_hops{self.n_hops}_{feature_str}_{filename}".encode('utf-8')
+        if 'cae' in self.features:
+            dim = getattr(self, 'cae_latent_dim')
+            version = getattr(self, 'cae_version')
+            feature_str += f"-CAE-v{version}-dim{dim}"
+        if 'hog' in self.features:
+            feature_str += f"hogb-{self.num_bins}"    
+        return f"res{self.img_size}_felzscale{self.felz_scale}_felzsigma{self.felz_sigma}_{self.min_size}_hops{self.n_hops}_{feature_str}_{filename}".encode('utf-8')
 
     def _warmup_cache(self, rebuild):
         print(f"\n[ CACHE WARMUP ] Checking {len(self.samples)} samples against LMDB...")
@@ -365,9 +376,12 @@ class UniversalGraphDataset(PyGDataset):
             success, result = process_for_lmdb(
                 filename=filename, 
                 root_dir=self.root_dir, 
-                n_segments=self.n_segments, 
-                features=self.features, 
-                max_size=self.img_size, 
+                felz_scale=self.felz_scale,
+                felz_sigma=self.felz_sigma,
+                min_size=self.min_size,
+                num_bins=self.num_bins,
+                features=self.features,
+                max_size=self.img_size,
                 n_hops=self.n_hops, 
                 cae_weights_path=self.cae_weights_path,
                 cae_latent_dim=self.cae_latent_dim # <--- ADD THIS
