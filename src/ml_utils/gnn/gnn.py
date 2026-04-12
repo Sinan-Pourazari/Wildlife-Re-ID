@@ -23,7 +23,7 @@ def image_to_superpixel_graph(img, mask=None, n_segments=300, hog_bins=9, hog_si
     h, w, _ = img.shape
 
     # --- 1. Standard SLIC ---
-    segments = felzenszwalb(img, scale=70.0, sigma=0.65, min_size=150)
+    segments = felzenszwalb(img, scale=10.0, sigma=0.65, min_size=150)
     num_nodes = segments.max() + 1
     seg_flat = torch.tensor(segments, dtype=torch.long).view(-1)
     
@@ -152,7 +152,7 @@ def image_to_superpixel_graph(img, mask=None, n_segments=300, hog_bins=9, hog_si
         x_lbp = F.normalize(x_lbp, p=1, dim=1) 
         x_list.append(x_lbp)
 
-    # --- 4. NEW: Local Entropy (Chaos/Smoothness metric) ---
+    # --- 4. Local Entropy (Chaos/Smoothness metric) ---
     if 'texture' in features:
         gray_uint8 = (rgb2gray(img) * 255).astype(np.uint8)
         ent = entropy(gray_uint8, disk(3))
@@ -251,11 +251,12 @@ def image_to_superpixel_graph(img, mask=None, n_segments=300, hog_bins=9, hog_si
 
 
 class GNNEncoder(nn.Module):
-    def __init__(self, in_dim=14, hidden_dim=512, out_dim=512, edge_strategy="spatial", k_neighbors=1):
+    def __init__(self, args , in_dim=14, hidden_dim=512, out_dim=512, edge_strategy="spatial", k_neighbors=5):
         super().__init__()
         # The number of attention-based semantic edges to create per node
         self.k_neighbors = k_neighbors
         self.edge_strategy = edge_strategy
+        self.args = args
         # Learned Attention Projection
         # Projects raw features into a specific "Edge Similarity" space.
         # This acts like the Query/Key transformations in standard Transformers.
@@ -276,11 +277,12 @@ class GNNEncoder(nn.Module):
         self.norm3 = nn.LayerNorm(out_dim)
         
         # Initialize the GeM Pooling layer here
-        self.gem_pool = GeMPooling(p=3.0)
+        self.gem_pool = GeMPooling(p=1.5)
 
     def forward(self, data):
         x, spatial_edge_index, batch = data.x, data.edge_index, data.batch
         
+        x = self.apply_modality_dropout(x, p=0.30)
         if self.edge_strategy == "spatial":
             # Baseline: Use only the CPU-generated LMDB edges
             final_edge_index = spatial_edge_index
@@ -308,13 +310,65 @@ class GNNEncoder(nn.Module):
 
         # Layer 3
         x = self.norm3(F.elu(self.conv3(x, final_edge_index)))
-
+        x = F.softplus(x)
         # Pooling
         #pooled_mean = global_mean_pool(x, batch) 
         #pooled_max = global_max_pool(x, batch)   
         pooled = self.gem_pool(x, batch)
         return pooled
         #return torch.cat([pooled_mean, pooled_max], dim=1)
+
+    def apply_modality_dropout(self, x, p):
+        """
+        Randomly sets p percent of features of one modality (e.g. texture, cae, color) to zero per node.
+        Dynamically calculates indices based on args.features.
+        """
+        if not self.training or p <= 0.0:
+            return x
+
+        x_dropped = x.clone()
+        num_nodes = x.size(0) # Fixed typo 'sizze'
+
+        # 1. Define the sizes of each block
+        feature_block_sizes = {
+            'color': 3,
+            'pos':   2,
+            'hog':   9,
+            'shape': 14,
+            'lbp':   10,
+            'texture': 1
+        }
+        
+        # Dynamically pull the CAE size from args if it exists, otherwise default to 16
+        cae_dim = getattr(self.args, 'cae_latent_dim', 16)
+        feature_block_sizes['cae'] = cae_dim
+
+        # 2. STRICT order they are appended in image_to_superpixel_graph
+        extraction_order = ['color', 'pos', 'hog', 'cae', 'shape', 'lbp', 'texture']
+        
+        feature_blocks = {}
+        curr_indx = 0
+        
+        # 3. Build the dynamic index map based ONLY on what is active
+        for feat in extraction_order:
+            if feat in self.args.features:
+                size = feature_block_sizes[feat]
+                # Map the feature to its start and end indices
+                feature_blocks[feat] = (curr_indx, curr_indx + size)
+                curr_indx += size
+                
+        # 4. Apply the Dropout
+        for name, (start, end) in feature_blocks.items():
+            # True = Drop this modality for this node
+            drop_mask = torch.rand(num_nodes, 1, device=x.device) < p
+            
+            # Fill the selected feature columns with 0.0 where the mask is True
+            x_dropped[:, start:end].masked_fill_(drop_mask, 0.0)
+
+        # Missing in previous code: you must return the modified tensor!
+        return x_dropped
+    
+
     
 class GeMPooling(nn.Module):
     def __init__(self, p=3.0, eps=1e-6):
@@ -353,3 +407,4 @@ def get_cae_model(weights_path, latent_dim):
         _WORKER_CAE_CACHE[weights_path] = model
         
     return _WORKER_CAE_CACHE[weights_path]
+
