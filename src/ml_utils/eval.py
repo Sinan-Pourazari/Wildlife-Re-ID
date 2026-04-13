@@ -24,6 +24,57 @@ from train_test_prototype import ReIDModel, reduce_to_nd
 from dataloader import UniversalGraphDataset
 import numpy as np
 from sklearn.metrics import balanced_accuracy_score
+import igraph as ig
+import leidenalg as la
+def k_reciprocal_rerank(sim_matrix, k1=20, k2=6, lambda_value=0.3):
+    """
+    Blazing fast PyTorch implementation of k-reciprocal re-ranking.
+    Operates directly on a Cosine Similarity matrix.
+    """
+    device = sim_matrix.device
+    N = sim_matrix.size(0)
+    
+    # 1. Get Top-K1 neighbors for every image
+    # topk_indices shape: [N, k1]
+    _, topk_indices = torch.topk(sim_matrix, k=k1, dim=1)
+    
+    # 2. Build a boolean adjacency matrix of K-Nearest Neighbors
+    knn_matrix = torch.zeros((N, N), dtype=torch.bool, device=device)
+    knn_matrix.scatter_(1, topk_indices, True)
+    
+    # 3. Find Mutual (k-reciprocal) Neighbors
+    # Node A is in Node B's top-k AND Node B is in Node A's top-k
+    mutual_matrix = knn_matrix & knn_matrix.t()
+    
+    # 4. Calculate Jaccard Similarity for mutual neighbors
+    # This checks: "How many secondary neighbors do these two images share?"
+    # Convert to float for matrix multiplication
+    mutual_float = mutual_matrix.float()
+    
+    # Intersection = dot product of their mutual neighbor vectors
+    intersection = torch.mm(mutual_float, mutual_float.t())
+    
+    # Union = size(A) + size(B) - Intersection
+    sizes = mutual_float.sum(dim=1)
+    union = sizes.unsqueeze(1) + sizes.unsqueeze(0) - intersection
+    
+    # Avoid division by zero
+    union[union == 0] = 1e-9
+    jaccard_sim = intersection / union
+    
+    # 5. Local Query Expansion (Optional smoothing)
+    # If A and B are mutual, we spread A's similarity score to B's top neighbors (k2)
+    # This smooths out noise in the matrix.
+    weight = torch.exp(-sim_matrix) # Lower distance = higher weight
+    expansion_mask = torch.zeros((N, N), dtype=torch.float32, device=device)
+    _, topk2_indices = torch.topk(sim_matrix, k=k2, dim=1)
+    expansion_mask.scatter_(1, topk2_indices, 1.0)
+    
+    # 6. Combine the original similarity with the Jaccard structural similarity
+    # lambda_value dictates how much we trust the original CNN vs the Graph Structure
+    final_sim = (1 - lambda_value) * sim_matrix + lambda_value * jaccard_sim
+    
+    return final_sim
 
 def compute_best_clustering_metrics(args, embeddings, labels, species_preds):
     features = torch.tensor(embeddings, dtype=torch.float32)
@@ -356,6 +407,47 @@ def compute_clustering_metrics(args, embeddings, labels, species_preds, sim_thre
     
     return ari, nmi, n_components
 
+def compute_clustering_metrics_leiden(args, embeddings, labels, species_preds, sim_thresh=0.70):
+    """
+    Leiden Graph Clustering (Community Detection).
+    Uses actual cosine similarity scores as edge weights to sever weak bridges.
+    """
+    # 1. Convert to tensor and get cosine similarities
+    features = torch.tensor(embeddings, dtype=torch.float32)
+    features = F.normalize(features, p=2, dim=1)
+    sim_matrix = torch.mm(features, features.t())
+    sim_matrix = k_reciprocal_rerank(sim_matrix, k1=20, lambda_value=0.3)
+    # 2. Apply the Species Mask
+    species_preds_t = torch.tensor(species_preds)
+    cross_species_mask = species_preds_t.unsqueeze(1) != species_preds_t.unsqueeze(0)
+    sim_matrix[cross_species_mask] = -1.0 
+    
+    sim_matrix_np = sim_matrix.numpy()
+    
+    # 3. Extract Valid Edges and their Weights
+    # We only create edges where the similarity is above the threshold
+    sources, targets = np.where(sim_matrix_np > sim_thresh)
+    weights = sim_matrix_np[sources, targets]
+    
+    # 4. Build the iGraph
+    # We pass the number of nodes (images), the edges, and the weights
+    g = ig.Graph(n=len(embeddings), edges=list(zip(sources, targets)), directed=False)
+    g.es['weight'] = weights
+    
+    # 5. Run the Leiden Algorithm!
+    # ModularityVertexPartition automatically finds the optimal number of communities
+    # based on the density of the weighted edges.
+    partition = la.find_partition(g, la.ModularityVertexPartition, weights=g.es['weight'])
+    
+    # Extract the cluster ID for each image
+    predicted_ids = np.array(partition.membership)
+    n_components = len(partition)
+    
+    # 6. Compute Final Metrics
+    ari = adjusted_rand_score(labels, predicted_ids)
+    nmi = normalized_mutual_info_score(labels, predicted_ids)
+    
+    return ari, nmi, n_components
 def plot_benchmark_results(results_df, save_dir):
     x = np.arange(len(results_df))
     
@@ -505,8 +597,8 @@ def evaluate_metrics_worker(ckpt_path, feats_np, labels_np, species_preds_np,kno
     # Pass known_classes down!
     r1, r5, r10, map_val, baks, baus = compute_reid_metrics(features, labels, known_classes, device='cpu', sim_thresh=0.4)
     #thesh, comp = compute_unsupervised_clustering(args,feats_np, species_preds_np)
-    ari, nmi, discovered_ids = compute_clustering_metrics(args, feats_np, labels_np, species_preds_np, sim_thresh = 0.6)
-
+    #ari, nmi, discovered_ids = compute_clustering_metrics(args, feats_np, labels_np, species_preds_np, sim_thresh = 0.8)
+    ari, nmi, discovered_ids = compute_clustering_metrics_leiden(args, feats_np, labels_np, species_preds_np, sim_thresh = 0.65)
     #ari, nmi, discovered_ids =compute_best_clustering_metrics(args, feats_np, labels_np, species_preds_np)
     harmonic_score = np.sqrt(baks * baus)
 
@@ -664,8 +756,7 @@ def main(args):
     if args.top_k_detailed > 0:
         top_k = min(args.top_k_detailed, len(df))
         print(f"\n--- PHASE 3: PARALLEL t-SNE GENERATION (Top {top_k} Models) ---")
-        top_models = df.sort_values(by='H-Score', ascending=False).head(top_k)
-        
+        top_models = df.sort_values(by='ARI', ascending=False).head(top_k)        
         # Catch for use_existing_csv scenario
         if args.use_existing_csv and not extracted_data:
             print("Re-extracting features sequentially for Top-K models...")
