@@ -16,6 +16,8 @@ from gnn.cae import TextureEncoder
 from torchvision import transforms
 from skimage.measure import regionprops
 import math
+from torch_geometric.utils import dropout_edge, dropout_node
+
 def image_to_superpixel_graph(img, scale, sigma, min_size, hog_bins, mask=None , hog_signed=False, hog_l2norm=True, features=['color', 'pos', 'hog'], n_hops=1, cae_weights_path=None, cae_latent_dim=64, return_segments=False):   
     if isinstance(img, Image.Image):
         img = np.array(img)
@@ -251,13 +253,14 @@ def image_to_superpixel_graph(img, scale, sigma, min_size, hog_bins, mask=None ,
 
 
 class GNNEncoder(nn.Module):
-    def __init__(self, features, cae_latent_dim , in_dim=14, hidden_dim=512, out_dim=512, edge_strategy="spatial", k_neighbors=5):
+    def __init__(self, features, cae_latent_dim , num_hog_bins,in_dim=14, hidden_dim=512, out_dim=512, edge_strategy="spatial", k_neighbors=5):
         super().__init__()
         # The number of attention-based semantic edges to create per node
         self.k_neighbors = k_neighbors
         self.edge_strategy = edge_strategy
         self.features = features
         self.cae_latent_dim = cae_latent_dim
+        self.num_hog_bins = num_hog_bins
         # Learned Attention Projection
         # Projects raw features into a specific "Edge Similarity" space.
         # This acts like the Query/Key transformations in standard Transformers.
@@ -274,16 +277,27 @@ class GNNEncoder(nn.Module):
         self.conv2 = GATv2Conv(hidden_dim, hidden_dim // 8, heads=8)
         self.norm2 = nn.LayerNorm(hidden_dim)
 
-        self.conv3 = GATv2Conv(hidden_dim, out_dim // 8, heads=8)
-        self.norm3 = nn.LayerNorm(out_dim)
+        # todo look at out dim again / hidden dim
+        self.conv3 = GATv2Conv(hidden_dim, hidden_dim // 8, heads=8)
+        self.norm3 = nn.LayerNorm(hidden_dim)
         
+        
+        # Scores the 512-dim feature vectors to decide which layer is most useful
+        self.layer_scorer = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 4),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 4, 1)
+        )
+
         # Initialize the GeM Pooling layer here
         self.gem_pool = GeMPooling(p=1.5)
 
     def forward(self, data):
         x, spatial_edge_index, batch = data.x, data.edge_index, data.batch
         
-        x = self.apply_modality_dropout(x, p=0.30)
+        if self.training:
+            x = self.apply_modality_dropout(x, p=0.30)
+        
         if self.edge_strategy == "spatial":
             # Baseline: Use only the CPU-generated LMDB edges
             final_edge_index = spatial_edge_index
@@ -291,9 +305,7 @@ class GNNEncoder(nn.Module):
         else:
             # Generate Attention Edges
             queries_keys = self.edge_proj(x)
-            semantic_edge_index = knn_graph(
-                x=queries_keys, k=self.k_neighbors, batch=batch, loop=False, cosine=True
-            )
+            semantic_edge_index = knn_graph(x=queries_keys, k=self.k_neighbors, batch=batch, loop=False, cosine=True)
             
             if self.edge_strategy == "attention":
                 # Pure semantic approach (ignores physical layout)
@@ -302,23 +314,48 @@ class GNNEncoder(nn.Module):
             elif self.edge_strategy == "hybrid":
                 # Best of both worlds: Anatomy + Texture Matching
                 final_edge_index = torch.cat([spatial_edge_index, semantic_edge_index], dim=1)
-        # Layer 1
-        x = self.norm1(F.elu(self.conv1(x, final_edge_index)))
 
+       # Graph argumentations
+        if self.training:
+            # Node Dropout: Randomly isolate 10% of nodes (removes all their edges)
+            final_edge_index, _, _ = dropout_node(
+                final_edge_index, 
+                p=0.10, 
+                num_nodes=x.size(0)
+            )
+            
+            # Edge Dropout: Randomly drop 20% of individual edges
+            final_edge_index, _ = dropout_edge(
+                final_edge_index, 
+                p=0.20, 
+                force_undirected=True
+            )
+        
+        # Layer 1
+        x1 = self.norm1(F.elu(self.conv1(x, final_edge_index)))
+        
         # Layer 2 (with Residual)
-        identity = x
-        x = self.norm2(F.elu(self.conv2(x, final_edge_index)))
-        x = x + identity
+        x2 = self.norm2(F.elu(self.conv2(x1, final_edge_index)))
+        x2 = x2 + x1
 
         # Layer 3
-        x = self.norm3(F.elu(self.conv3(x, final_edge_index)))
-        x = F.softplus(x)
-        # --- OVERSMOOTHING CHECK ---
+        x3 = self.norm3(F.elu(self.conv3(x2, final_edge_index)))
+        x3 = F.softplus(x3)
 
+        # --- 4. dynamic jumping knowledge (like attention) ---
+        #reshape to [Num_Nodes, 3, 512]
+        x_stacked = torch.stack([x1, x2, x3], dim=1)
+        scores = self.layer_scorer(x_stacked)
+
+        #convert to percentage
+        score_weights = F.softmin(scores, dim = 1)
+
+        # Multiply and sum to get the final custom blend per node
+        x_dynamic = (x_stacked * score_weights).sum(dim=1)
         # Pooling
         #pooled_mean = global_mean_pool(x, batch) 
         #pooled_max = global_max_pool(x, batch)   
-        pooled = self.gem_pool(x, batch)
+        pooled = self.gem_pool(x_dynamic, batch)
         return pooled
         #return torch.cat([pooled_mean, pooled_max], dim=1)
 
@@ -337,7 +374,7 @@ class GNNEncoder(nn.Module):
         feature_block_sizes = {
             'color': 3,
             'pos':   2,
-            'hog':   9,
+            'hog':   self.num_hog_bins,
             'shape': 14,
             'lbp':   10,
             'texture': 1
