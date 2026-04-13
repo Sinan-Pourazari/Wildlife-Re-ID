@@ -6,7 +6,7 @@ import torch.nn.functional as F
 import torch.nn as nn
 
 class PKBatchSampler(Sampler):
-    def __init__(self, labels, P=8, K=4, drop_last=True, alpha = 0.5):
+    def __init__(self, labels, P=6, K=4, drop_last=True, alpha = 0.5):
         self.labels = np.asarray(labels)
         self.P = P
         self.K = K

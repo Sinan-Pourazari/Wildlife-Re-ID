@@ -35,8 +35,8 @@ else:
 print(f"Using {device} device")
 class SimpleDataset(TorchDataset):
     def __init__(self, features, labels):
-        self.features = torch.tensor(features, dtype=torch.float32).to(device) #TODO REM
-        self.labels   = torch.tensor(labels, dtype=torch.long).to(device) #TODO REM
+        self.features = torch.tensor(features, dtype=torch.float32).to(device)
+        self.labels   = torch.tensor(labels, dtype=torch.long).to(device) 
 
     def __len__(self):
         return len(self.features)
@@ -106,7 +106,7 @@ class GraphImageDataset(PyGDataset):
         return graph
     
 class ReIDModel(nn.Module):
-    def __init__(self,features, cae_latent_dim, num_classes, num_species, in_dim \
+    def __init__(self,features, cae_latent_dim, num_classes, num_species, in_dim, num_hog_bins \
         , hidden_dim=256, gnn_out_dim=256, emb_dim=512, use_hybrid_pooling=True, edge_strategy="spatial", k_neighbors=5):
         super().__init__()
         self.save_params = {
@@ -120,25 +120,31 @@ class ReIDModel(nn.Module):
             'emb_dim': emb_dim,
             'use_hybrid_pooling': use_hybrid_pooling,
             'edge_strategy': edge_strategy,
-            'k_neighbors': k_neighbors 
+            'k_neighbors': k_neighbors,
+            'num_hog_bins': num_hog_bins
         }
         # Initialize the GNN Encoder with provided params
-        self.encoder = GNNEncoder(features=features,cae_latent_dim=cae_latent_dim, in_dim=in_dim, hidden_dim=hidden_dim, out_dim=gnn_out_dim, edge_strategy=edge_strategy, k_neighbors=k_neighbors)
+        self.encoder = GNNEncoder(num_hog_bins = num_hog_bins,features=features,cae_latent_dim=cae_latent_dim, in_dim=in_dim, hidden_dim=hidden_dim, out_dim=gnn_out_dim, edge_strategy=edge_strategy, k_neighbors=k_neighbors)
         # Calculate the actual size coming out of the GNN
         # If pooling Mean + Max, the dimension is doubled
-        self.gnn_feature_size = gnn_out_dim * 2 if use_hybrid_pooling else gnn_out_dim
-        
+        #TODO check this see gnn
+        #self.gnn_feature_size = gnn_out_dim * 2 if use_hybrid_pooling else gnn_out_dim
+        self.gnn_feature_size = hidden_dim * 2 if use_hybrid_pooling else hidden_dim
 
         self.head = nn.Sequential(
             nn.Linear(self.gnn_feature_size, hidden_dim),
             nn.BatchNorm1d(hidden_dim), # Added for training stability at 140k scale
             nn.GELU(),
-            #nn.Dropout(p=0.1),
+            nn.Dropout(p=0.1),
             nn.Linear(hidden_dim, emb_dim),
         )
 
+        # --- BNNeck ---
+        self.bottleneck = nn.BatchNorm1d(emb_dim)
+        self.bottleneck.bias.requires_grad_(False) # No bias shift
+
         # ID Classification head (Used ONLY during training for CE loss)
-        self.classifier = nn.Linear(emb_dim, num_classes)
+        #self.classifier = nn.Linear(emb_dim, num_classes)
 
         # Species Classification head
         self.species_classifier = nn.Linear(emb_dim, num_species)
@@ -149,18 +155,19 @@ class ReIDModel(nn.Module):
         
         # 2. Project to Re-ID embedding space
         features = self.head(z)
-        
+        bn_features = self.bottleneck(features)
         # 3. L2 Normalize for Cosine Similarity / Metric Learning
-        embeddings = F.normalize(features, p=2, dim=1)
+        embeddings = F.normalize(bn_features, p=2, dim=1)
 
         if self.training:
             # Return both for the dual-loss training loop
-            logits = self.classifier(features) # Use un-normalized features for CE
+            #logits = self.classifier(features) # Use un-normalized features for CE
             if self.species_classifier is not None:
                 species_logits = self.species_classifier(features)
-                return embeddings, logits, species_logits ,features
+                return embeddings,  species_logits ,features
             
-            return embeddings, logits, features
+            return embeddings
+        
         elif self.species_classifier is not None:
             species_logits = self.species_classifier(features)
             return embeddings, species_logits
@@ -222,7 +229,7 @@ class ReIDModel(nn.Module):
         hyperparams['cae_latent_dim'] = hyperparams.get('cae_latent_dim', args.cae_latent_dim)
         hyperparams['edge_strategy'] = hyperparams.get('edge_strategy', 'spatial')
         hyperparams['k_neighbors'] = hyperparams.get('k_neighbors', 10)
-        
+        hyperparams['num_hog_bins'] = hyperparams.get('num_hog_bins', getattr(args, 'num_hog_bins', 9)) # <--- ADD THIS
         if 'num_classes' not in hyperparams:
             hyperparams['num_classes'] = 1
             
@@ -252,7 +259,7 @@ def train_one_epoch(loader, model, arcface_loss, optimizer, margin=1.0):
     total_ce = 0.0
     total_compact = 0.0
     total_species = 0.0
-    criterion_ce = nn.CrossEntropyLoss(label_smoothing =0.009)
+    criterion_ce = nn.CrossEntropyLoss(label_smoothing =0.001)
 
     for data in loader:
         data = data.to(device)
@@ -262,11 +269,11 @@ def train_one_epoch(loader, model, arcface_loss, optimizer, margin=1.0):
         labels = y_stacked[:, 0]          # Identity labels
         species_labels = y_stacked[:, 1]  # Species labels
         # Unpack the two outputs
-        emb, logits, species_logits, features = model(data)
+        emb, species_logits, features = model(data)
 
         # Calculate losses
         #loss_triplet = batch_hard_triplet_loss(emb, labels, margin=margin)
-        loss_triplet = batch_topk_semi_hard_triplet_loss(emb, labels, margin=margin, k_neg=8)
+        loss_triplet = batch_topk_semi_hard_triplet_loss(features, labels, margin=margin, k_neg=8)
         #TODO add args to change betwen arcface and cross entorpy
         #loss_ce = 0.25 * criterion_ce(logits, labels)
         loss_arc = 0.2 * arcface_loss(emb,labels)
@@ -592,8 +599,8 @@ def main(args):
         min_size= args.felz_min_size
         )
     # DataLoaders
-    batch_sampler = PKBatchSampler(train_df["global_label"].values, P=16, K=8)
-    train_loader = DataLoader(train_dataset, batch_sampler=batch_sampler, num_workers=args.workers, persistent_workers=True, prefetch_factor=4)
+    batch_sampler = PKBatchSampler(train_df["global_label"].values, P=12, K=8)
+    train_loader = DataLoader(train_dataset, batch_sampler=batch_sampler, num_workers=args.workers, persistent_workers=True, prefetch_factor=2)
     #test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=args.workers)
 
     # Model & Optimizer
@@ -604,9 +611,9 @@ def main(args):
 
     # Model & Optimizer (Notice in_dim is now dynamic)
     model = ReIDModel(num_classes=num_train_classes, num_species= num_species,in_dim=dynamic_in_dim, hidden_dim=512, gnn_out_dim=256, emb_dim=512, 
-                      use_hybrid_pooling = False, edge_strategy=args.edge_strategy,k_neighbors=args.k_neighbors, features=args.features, cae_latent_dim=args.cae_latent_dim).to(device)
+                      use_hybrid_pooling = False, edge_strategy=args.edge_strategy,k_neighbors=args.k_neighbors, features=args.features, cae_latent_dim=args.cae_latent_dim, num_hog_bins= args.num_hog_bins).to(device)
     
-    arcface = ArcFaceLoss(num_classes=num_train_classes, embedding_size=512, margin=15, scale= 64).to(device)
+    arcface = ArcFaceLoss(num_classes=num_train_classes, embedding_size=512, margin=28.6, scale= 64).to(device)
     optimizer = torch.optim.Adam(list(model.parameters()) + list(arcface.parameters()), lr=1e-3)
 
     # --- RESUME LOGIC ---
@@ -664,7 +671,7 @@ if __name__ == "__main__":
     
     # Graph Structure Settings
     parser.add_argument("--edge_strategy", type=str, default="spatial", choices=["spatial", "attention", "hybrid"], help="How to build GNN edges: 'spatial' (LMDB), 'attention' (GPU KNN), or 'hybrid' (Both).")
-    parser.add_argument("--k_neighbors", type=int, default=5, help="Number of dynamic attention edges per node (if using attention or hybrid).")
+    parser.add_argument("--k_neighbors", type=int, default=3, help="Number of dynamic attention edges per node (if using attention or hybrid).")
     parser.add_argument("--felz_sigma", type=float, default=0.65, help = "")
     parser.add_argument("--felz_scale", type= float, default = 70, help = "")
     parser.add_argument("--felz_min_size", type= int, default = 150, help = "")

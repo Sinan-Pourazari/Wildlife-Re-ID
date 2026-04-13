@@ -20,13 +20,13 @@ set "RESET=%ESC%[0m"
 :: ========================================================
 :: 1. Define all physical parameters first
 set IMG_SIZE=512
-set CAE_LATENT_DIM=32
+set CAE_LATENT_DIM=16
 set CAE_EPOCHS=15
 
 set FELZ_SCALE=70.0
 set FELZ_SIGMA=0.65
 set FELZ_MIN_SIZE=150
-set NUM_HOG_BINS=18
+set NUM_HOG_BINS=9
 set N_HOPS=1
 set EDGE_STRATEGY=hybrid
 
@@ -40,7 +40,7 @@ set CAE_NAME=cae_dim%CAE_LATENT_DIM%_size%IMG_SIZE%_scale%SAFE_SCALE%_sigma%SAFE
 
 :: 4. Assign Paths
 set CAE_WEIGHTS_PATH=models\cae\%CAE_NAME%.pth
-set CHECKPOINT_DIR=checkpoints_%IMG_SIZE%_scale%SAFE_SCALE%_sigma%SAFE_SIGMA%_hops%N_HOPS%_%EDGE_STRATEGY%_dim%CAE_LATENT_DIM%_v8
+set CHECKPOINT_DIR=checkpoints_%IMG_SIZE%_scale%SAFE_SCALE%_sigma%SAFE_SIGMA%_hops%N_HOPS%_%EDGE_STRATEGY%_dim%CAE_LATENT_DIM%_reg_v2
 ::set CHECKPOINT_DIR=debug
 set TRAIN_EPOCHS=150
 
@@ -83,7 +83,7 @@ echo %FOX_ORANGE%STEP 2: Building LMDB Cache and Training GNN%RESET%
 :: ========================================================
 echo %FOX_ORANGE%[TRAIN] Initiating GNN Training sequence...%RESET%
 python .\src\ml_utils\train_test_prototype.py ^
-    --workers 6 ^
+    --workers 2 ^
     --img_size %IMG_SIZE% ^
     --felz_scale %FELZ_SCALE% ^
     --felz_sigma %FELZ_SIGMA% ^
@@ -122,7 +122,7 @@ python .\src\ml_utils\eval.py ^
     --workers 4 ^
     --parallel_workers 14 ^
     --checkpoints_dir %CHECKPOINT_DIR% ^
-    --batch_size 256 ^
+    --batch_size 68 ^
     --features color pos hog cae shape lbp ^
     --cae_weights_path %CAE_WEIGHTS_PATH% ^
     --cae_version %CAE_NAME% ^
