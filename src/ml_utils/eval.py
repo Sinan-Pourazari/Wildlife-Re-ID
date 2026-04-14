@@ -1,4 +1,5 @@
 import os
+#os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
 import glob
 import argparse
 import multiprocessing as mp
@@ -26,9 +27,11 @@ import numpy as np
 from sklearn.metrics import balanced_accuracy_score
 import igraph as ig
 import leidenalg as la
+import warnings
+
 def k_reciprocal_rerank(sim_matrix, k1=20, k2=6, lambda_value=0.3):
     """
-    Blazing fast PyTorch implementation of k-reciprocal re-ranking.
+    fast PyTorch implementation of k-reciprocal re-ranking.
     Operates directly on a Cosine Similarity matrix.
     """
     device = sim_matrix.device
@@ -267,7 +270,7 @@ def extract_features(model, dataloader, device, species_confidence_thresh = 0.8)
             
     return torch.cat(all_emb), torch.cat(all_labels), torch.cat(all_species_preds), torch.cat(all_species_labels)            
 
-def compute_reid_metrics(features, labels, known_classes, device='cpu', sim_thresh=0.7):
+def compute_reid_metrics(features, labels, known_classes, device='cpu', sim_thresh=1.5):
     features = features.to(device)
     labels = labels.to(device)
     
@@ -571,13 +574,23 @@ def get_test_samples(args):
         ).reset_index(drop=True)
         print(f"Downsampled test set to a maximum of {args.max_images_per_id} images per identity.")
 
-    # FIX: Guarantee these columns exist right before returning!
+    # Guarantee these columns exist right before returning!
     from sklearn.preprocessing import LabelEncoder
     if 'global_identity' not in test_df.columns:
         test_df['global_identity'] = test_df['dataset'] + "_" + test_df['identity'].astype(str)
     
-    #TODO What the fuck was my intuition here?
-    test_df['global_label'] = LabelEncoder().fit_transform(test_df['global_identity']) + 999999
+    # FIX: Guarantee these columns exist right before returning!
+    if 'global_identity' not in test_df.columns:
+        test_df['global_identity'] = test_df['dataset'] + "_" + test_df['identity'].astype(str)
+    
+    # Check if the dataframe ALREADY has the correct global_labels from the training split
+    if 'global_label' not in test_df.columns:
+        # If it doesn't, this must be a completely unseen holdout dataset.
+        # We encode it, and offset it by a huge number so it strictly registers as "Unknown" 
+        print("Assigning novel labels for a completely unseen dataset...")
+        test_df['global_label'] = LabelEncoder().fit_transform(test_df['global_identity']) + 999999
+    
+    # We can safely re-encode species because it is evaluated separately
     test_df['species_label'] = LabelEncoder().fit_transform(test_df['species'].astype(str))
 
     return list(zip(test_df["path"], test_df["global_label"], test_df["species_label"]))
@@ -588,8 +601,10 @@ def get_test_samples(args):
 
 def evaluate_metrics_worker(ckpt_path, feats_np, labels_np, species_preds_np,known_classes, args, species_labels_np):
     """Worker function to compute metrics purely from numpy arrays on CPU"""
+    warnings.filterwarnings("ignore", message="y_pred contains classes not in y_true")
     model_name = os.path.basename(ckpt_path)
     
+
     # Reconstruct isolated CPU PyTorch tensors for the matrix math
     features = torch.from_numpy(feats_np)
     labels = torch.from_numpy(labels_np)
@@ -598,7 +613,7 @@ def evaluate_metrics_worker(ckpt_path, feats_np, labels_np, species_preds_np,kno
     r1, r5, r10, map_val, baks, baus = compute_reid_metrics(features, labels, known_classes, device='cpu', sim_thresh=0.4)
     #thesh, comp = compute_unsupervised_clustering(args,feats_np, species_preds_np)
     #ari, nmi, discovered_ids = compute_clustering_metrics(args, feats_np, labels_np, species_preds_np, sim_thresh = 0.8)
-    ari, nmi, discovered_ids = compute_clustering_metrics_leiden(args, feats_np, labels_np, species_preds_np, sim_thresh = 0.65)
+    ari, nmi, discovered_ids = compute_clustering_metrics_leiden(args, feats_np, labels_np, species_preds_np, sim_thresh = 0.5)
     #ari, nmi, discovered_ids =compute_best_clustering_metrics(args, feats_np, labels_np, species_preds_np)
     harmonic_score = np.sqrt(baks * baus)
 
@@ -691,6 +706,7 @@ def main(args):
             min_size=args.felz_min_size,
             num_bins=args.num_hog_bins
         )
+
         
         shared_loader = DataLoader(
             shared_dataset, batch_size=args.batch_size, 
