@@ -17,6 +17,7 @@ from torchvision import transforms
 from skimage.measure import regionprops
 import math
 from torch_geometric.utils import dropout_edge, dropout_node
+import os
 
 def image_to_superpixel_graph(img, scale, sigma, min_size, hog_bins, mask=None , hog_signed=False, hog_l2norm=True, features=['color', 'pos', 'hog'], n_hops=1, cae_weights_path=None, cae_latent_dim=64, return_segments=False):   
     if isinstance(img, Image.Image):
@@ -296,7 +297,7 @@ class GNNEncoder(nn.Module):
         x, spatial_edge_index, batch = data.x, data.edge_index, data.batch
         
         if self.training:
-            x = self.apply_modality_dropout(x, p=0.30)
+            x = self.apply_modality_dropout(x, p=0.2)
         
         if self.edge_strategy == "spatial":
             # Baseline: Use only the CPU-generated LMDB edges
@@ -327,7 +328,7 @@ class GNNEncoder(nn.Module):
             # Edge Dropout: Randomly drop 20% of individual edges
             final_edge_index, _ = dropout_edge(
                 final_edge_index, 
-                p=0.20, 
+                p=0.15, 
                 force_undirected=True
             )
         
