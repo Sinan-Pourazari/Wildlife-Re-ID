@@ -1,5 +1,6 @@
 import datetime
 import os
+#os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:64"
 import torch
 from torch import nn
 from torch.utils.data import Dataset as TorchDataset
@@ -16,13 +17,15 @@ from torch_geometric.loader import DataLoader
 from torch_geometric.data import Dataset as PyGDataset
 from gnn.gnn import image_to_superpixel_graph, GNNEncoder
 import torch.nn.functional as F
-from dataloader import InMemoryGraphDataset, UniversalGraphDataset
+from dataloader import InMemoryGraphDataset, UniversalGraphDataset, prepare_augmented_training_data
 import numpy as np
 from sklearn.preprocessing import LabelEncoder
 import argparse
 from  pytorch_metric_learning.losses import ArcFaceLoss 
 from gnn.cae import train_and_save_cae
-
+from adabelief_pytorch import AdaBelief
+from torch.optim.lr_scheduler import StepLR, ReduceLROnPlateau
+import bitsandbytes as bnb
 #device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu" 
 if torch.cuda.is_available():
     device = "cuda"
@@ -252,7 +255,7 @@ class ReIDModel(nn.Module):
         
         return model, checkpoint.get('label_encoder_classes')
 
-def train_one_epoch(loader, model, arcface_loss, optimizer, margin=1.0):
+def train_one_epoch(loader, model, arcface_loss, scaler, optimizer, margin=1.0):
     model.train()
     total = 0.0
     total_triplet = 0.0
@@ -263,28 +266,32 @@ def train_one_epoch(loader, model, arcface_loss, optimizer, margin=1.0):
 
     for data in loader:
         data = data.to(device)
+        optimizer.zero_grad(set_to_none = True)
 
         # reshape(-1, 2) ensures it splits the pairs correctly, then we separate them
         y_stacked = data.y.view(-1, 2).to(device) 
         labels = y_stacked[:, 0]          # Identity labels
         species_labels = y_stacked[:, 1]  # Species labels
-        # Unpack the two outputs
-        emb, species_logits, features = model(data)
+        with torch.amp.autocast():
+            # Unpack the two outputs
+            emb, species_logits, features = model(data)
 
-        # Calculate losses
-        #loss_triplet = batch_hard_triplet_loss(emb, labels, margin=margin)
-        loss_triplet = batch_topk_semi_hard_triplet_loss(features, labels, margin=margin, k_neg=8)
-        #TODO add args to change betwen arcface and cross entorpy
-        #loss_ce = 0.25 * criterion_ce(logits, labels)
-        loss_arc = 0.2 * arcface_loss(emb,labels)
-        #loss_compact = 3 * batch_compactness_loss(features, labels)
-        loss_ce_species = 1 * criterion_ce(species_logits, species_labels)
-        # Combined Loss
-        loss = loss_triplet + loss_arc + loss_ce_species # loss_compact
+            # Calculate losses
+            #loss_triplet = batch_hard_triplet_loss(emb, labels, margin=margin)
+            loss_triplet = batch_topk_semi_hard_triplet_loss(features, labels, margin=margin, k_neg=8)
+            #TODO add args to change betwen arcface and cross entorpy
+            #loss_ce = 0.25 * criterion_ce(logits, labels)
+            loss_arc = 0.2 * arcface_loss(emb,labels)
+            #loss_compact = 3 * batch_compactness_loss(features, labels)
+            loss_ce_species = 1 * criterion_ce(species_logits, species_labels)
+            # Combined Loss
+            loss = loss_triplet + loss_arc + loss_ce_species # loss_compact
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        #optimizer.zero_grad(set_to_none=True)
+        
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
         total += float(loss.item())
         total_triplet += loss_triplet.item()
@@ -295,10 +302,17 @@ def train_one_epoch(loader, model, arcface_loss, optimizer, margin=1.0):
     return total / len(loader), total_triplet / len(loader), total_ce / len(loader), total_compact / len(loader), total_species / len(loader)
 
 
-def train(loader, model, optimizer, num_epochs, arcface_loss, start_epoch=0, args=None, train_classes = None, species_classes = None):
+def train(loader, model, optimizer, num_epochs, arcface_loss, start_epoch=0, args=None, train_classes = None, species_classes = None, scheduler = None):
+    scaler = torch.amp.GradScaler()
+    
     for i in range(start_epoch, num_epochs):
-        total_batchloss, triplet, ce, compact, species = train_one_epoch(loader, model, arcface_loss, optimizer, margin=1)
+
+        total_batchloss, triplet, ce, compact, species = train_one_epoch(loader, model, arcface_loss, scaler, optimizer, margin=1)
         print(f"epoch {i} batchloss: {total_batchloss}, triplet loss: {triplet}, Arcface loss: {ce}, compactness loss: {compact}, ce species loss {species}")
+        if scheduler is not None:
+            scheduler.step(total_batchloss)
+        #if i % 2 == 0:
+            #torch.cuda.empty_cache()
         if i % 2 ==0:
             _ = model.save(args, epoch=i, optimizer=optimizer, train_classes=train_classes, species_classes=species_classes)
 
@@ -518,8 +532,7 @@ def main(args):
     train_le = LabelEncoder()
     species_le = LabelEncoder()
     df['species_label'] = species_le.fit_transform(df['species'])
-    train_df['contiguous_label'] = train_le.fit_transform(train_df['global_label'])
-    
+    train_df['contiguous_label'] = train_le.fit_transform(train_df['global_label'])  
     train_df['species_label'] = species_le.transform(train_df['species'])
     test_df['species_label'] = species_le.transform(test_df['species'])
 
@@ -529,9 +542,13 @@ def main(args):
     print(f"--> Active Training Classes: {num_train_classes}")
     print(f"--> Active Species Classes: {num_species}")
 
+    # create augumentations
+    aug_csv_path = prepare_augmented_training_data(train_df=train_df, root_dir=args.root_dir, lmdb_dir=args.cache_dir,args=args)
+    aug_train_df = pd.read_csv(aug_csv_path)
+
     # 4. Create Sample Lists (mapping path -> label)
     # Train uses the NEW contiguous labels
-    train_samples = list(zip(train_df["path"], train_df["contiguous_label"], train_df["species_label"]))
+    train_samples = list(zip(aug_train_df["path"], aug_train_df["contiguous_label"], aug_train_df["species_label"]))
     
     # Test uses the global_labels (Evaluation and Triplet loss don't care about gaps)
     test_samples = list(zip(test_df["path"], test_df["global_label"], test_df["species_label"]))
@@ -579,7 +596,7 @@ def main(args):
     dynamic_in_dim = first_graph.x.shape[1]
     print(f"--> Dynamically detected Node Feature Dimension (in_dim): {dynamic_in_dim}")
     print("\n[ Preparing Test/Holdout Data ]")
-
+    """
     test_dataset = UniversalGraphDataset(
         num_train_classes = num_train_classes,
         n_hops= args.n_hops,
@@ -597,10 +614,10 @@ def main(args):
         felz_scale= args.felz_scale,
         num_bins= args.num_hog_bins,
         min_size= args.felz_min_size
-        )
+        )"""
     # DataLoaders
-    batch_sampler = PKBatchSampler(train_df["global_label"].values, P=12, K=8)
-    train_loader = DataLoader(train_dataset, batch_sampler=batch_sampler, num_workers=args.workers, persistent_workers=True, prefetch_factor=2)
+    batch_sampler = PKBatchSampler(aug_train_df["global_label"].values, P=14, K=8)
+    train_loader = DataLoader(train_dataset, batch_sampler=batch_sampler, num_workers=args.workers, persistent_workers=False, prefetch_factor=None)
     #test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=args.workers)
 
     # Model & Optimizer
@@ -613,9 +630,21 @@ def main(args):
     model = ReIDModel(num_classes=num_train_classes, num_species= num_species,in_dim=dynamic_in_dim, hidden_dim=512, gnn_out_dim=256, emb_dim=512, 
                       use_hybrid_pooling = False, edge_strategy=args.edge_strategy,k_neighbors=args.k_neighbors, features=args.features, cae_latent_dim=args.cae_latent_dim, num_hog_bins= args.num_hog_bins).to(device)
     
-    arcface = ArcFaceLoss(num_classes=num_train_classes, embedding_size=512, margin=28.6, scale= 64).to(device)
-    optimizer = torch.optim.Adam(list(model.parameters()) + list(arcface.parameters()), lr=1e-3)
+    arcface = ArcFaceLoss(num_classes=num_train_classes, embedding_size=512, margin=12, scale= 64).to(device)
+    #optimizer = torch.optim.Adam(list(model.parameters()) + list(arcface.parameters()), lr=0.0001)
+    optimizer = bnb.optim.Adam8bit(list(model.parameters()) + list(arcface.parameters()), lr=0.0001)
+    #optimizer = AdaBelief(list(model.parameters()) + list(arcface.parameters()), lr=1e-3)
+    #TODO try reduce on Plateau
 
+    scheduler = ReduceLROnPlateau(
+        optimizer, 
+        mode='min',        # We want the loss to minimize
+        factor=0.5,        # Multiply current LR by 0.5 when stuck
+        patience=10,        # Wait 10 epochs of no improvement
+        threshold=0.005,    # The loss must improve by at least this much to reset the patience
+        cooldown= 5,
+        min_lr= 0.000001
+    )
     # --- RESUME LOGIC ---
     start_epoch = 0
     if args.resume:
@@ -641,7 +670,7 @@ def main(args):
     # Train & Evaluate
     # Pass the start_epoch and args into the train loop
     train(train_loader, model, optimizer,arcface_loss=arcface, num_epochs=args.epochs, start_epoch=start_epoch, args=args, train_classes=train_labels.tolist(), \
-           species_classes=species_le.classes_.tolist())
+           species_classes=species_le.classes_.tolist(), scheduler=scheduler)
     # --- Saving the Results ---
     print("\n[ Saving Model ]")
     save_dir = "checkpoints"
