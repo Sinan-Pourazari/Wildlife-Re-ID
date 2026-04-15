@@ -15,9 +15,6 @@ from PIL import ImageOps
 import numpy as np
 import gc
 import torchvision.transforms as T
-# Source - https://stackoverflow.com/a/287944
-# Posted by joeld, modified by community. See post 'Timeline' for change history
-# Retrieved 2026-04-14, License - CC BY-SA 4.0
 
 class bcolors:
     HEADER = '\033[95m'
@@ -72,115 +69,77 @@ def _worker_generate_graph(task, root_dir, args):
     torch.save(graph, buffer)
     return key, buffer.getvalue()
 
-def prepare_augmented_training_data(train_df, root_dir, lmdb_dir, args):
-    print("\n[ Pre-Flight ] Planning Parallel Augmentation Cache...")
-    
-    # --- Formulate LMDB Key Prefix ---
-    feature_str = "-".join(sorted(args.features)) 
-    if 'cae' in args.features:
-        feature_str += f"-CAE-v{args.cae_version}-dim{args.cae_latent_dim}"
-    if 'hog' in args.features:
-        feature_str += f"hogb-{args.num_hog_bins}"    
-        
-    base_str = f"res{args.img_size}_felzscale{args.felz_scale}_felzsigma{args.felz_sigma}_{args.felz_min_size}_hops{args.n_hops}_{feature_str}_"
-    base_key_prefix = base_str.encode('utf-8')
-    
-    # --- Setup Identity-Aware "Fill-to-K" Targets ---
-    target_K = 8
+def generate_augmented_metadata(train_df, target_K, save_dir):
+    """
+    PURE PLANNER: Calculates required augmentations to satisfy PKBatchSampler.
+    Does NOT generate graphs. Only builds the Fat CSV for the Dataloader.
+    """
+    print(f"\n[ Pre-Flight ] Planning Augmentation Targets (Fill-to-K={target_K})...")
     id_counts = train_df['contiguous_label'].value_counts().to_dict()
-    
-    tasks = []
     augmented_rows = []
-    
-    # --- SCAN PHASE: Build the To-Do List (Read-Only) ---
-    env = lmdb.open(lmdb_dir, max_readers=1, readonly=True, lock=False)
-    with env.begin(write=False) as txn:
-        for index, row in train_df.iterrows():
-            base_filename = row['path']
-            label = row['contiguous_label']
-            current_count = id_counts[label]
+
+    for index, row in train_df.iterrows():
+        base_filename = row['path']
+        label = row['contiguous_label']
+        current_count = id_counts[label]
+
+        # Calculate dynamic targets
+        if current_count >= target_K:
+            num_augs_to_make = 1
+        else:
+            num_augs_to_make = int(np.ceil((target_K - current_count) / current_count))
+
+        # Generate virtual filenames
+        for i in range(num_augs_to_make):
+            # We inject the tag "_aug_" so the Dataset worker knows to apply augmentations
+            aug_filename = base_filename.replace('.jpg', f'_aug_{i}.jpg')
             
-            base_key = base_key_prefix + base_filename.encode('utf-8')
-            
-            # 1. Check Base Graph
-            if txn.get(base_key) is None:
-                tasks.append({'type': 'base', 'key': base_key, 'base_filename': base_filename})
-            
-            # 2. Check/Calculate Augmentations
-            if current_count >= target_K:
-                num_augs_to_make = 1
-            else:
-                num_augs_to_make = int(np.ceil((target_K - current_count) / current_count))
-                
-            for i in range(num_augs_to_make):
-                aug_filename = base_filename.replace('.jpg', f'_aug_{i}.jpg')
-                aug_key = base_key_prefix + aug_filename.encode('utf-8')
-                
-                if txn.get(aug_key) is None:
-                    tasks.append({'type': 'aug', 'key': aug_key, 'base_filename': base_filename})
-                    
-                # Always track the valid augmented row for the Fat CSV
-                new_row = row.copy()
-                new_row['path'] = aug_filename
-                augmented_rows.append(new_row)
-    env.close() # Close read-only handle
-    
-    
-    # --- PARALLEL EXECUTION & WRITE PHASE ---
-    if tasks:
-        print(f"--> Found {len(tasks)} missing graphs. Launching CPU workers...")
-        
-        # return_as="generator" is the secret to memory efficiency here
-        results_gen = Parallel(
-            n_jobs= -2, 
-            return_as="generator",
-            batch_size=10, 
-            pre_dispatch="2*n_jobs"
-        )(delayed(_worker_generate_graph)(task, root_dir, args) for task in tasks)
-        
-        # Main thread opens LMDB for writing and consumes the generator
-        env = lmdb.open(lmdb_dir, max_readers=1, readonly=False, lock=True, map_size=1099511627776)
-        current_buffer = []
-        buffer_limit = 200
-        
-        for key, graph_bytes in tqdm(results_gen, total=len(tasks), desc="Processing & Saving"):
-            current_buffer.append((key, graph_bytes))
-            
-            if len(current_buffer) >= buffer_limit:
-                with env.begin(write=True) as txn:
-                    for k, r in current_buffer:
-                        txn.put(k, r)
-                current_buffer = []
-        
-        # Flush any remaining graphs
-        if current_buffer:
-            with env.begin(write=True) as txn:
-                for k, r in current_buffer:
-                    txn.put(k, r)
-        env.close()
-    else:
-        print("--> All base and augmented graphs already exist in LMDB. Skipping generation.")
-        
-    # --- ASSEMBLE FAT CSV ---
+            new_row = row.copy()
+            new_row['path'] = aug_filename
+            augmented_rows.append(new_row)
+
+    # Compile the Fat CSV
     fat_train_df = pd.concat([train_df, pd.DataFrame(augmented_rows)], ignore_index=True)
-    fat_csv_path = os.path.join(args.checkpoint_dir, "train_metadata_augmented.csv")
+    fat_csv_path = os.path.join(save_dir, "train_metadata_augmented.csv")
     fat_train_df.to_csv(fat_csv_path, index=False)
     
-    print(f"[ Pre-Flight ] Parallel Augmentation Complete. Fat CSV saved with {len(fat_train_df)} total training graphs.")
+    print(f"[ Pre-Flight ] Planned {len(augmented_rows)} new augmentations. Total graphs to verify: {len(fat_train_df)}.")
     return fat_csv_path
 
+import re
+import torchvision.transforms as T
+
 def process_for_lmdb(filename, root_dir, felz_scale, felz_sigma, min_size, num_bins, features, max_size, n_hops, cae_weights_path, cae_latent_dim):
-    img_path = os.path.join(root_dir, filename)
+    # 1. Smart Routing: Is this a base graph or an augmented graph?
+    is_aug = '_aug_' in filename
+    
+    if is_aug:
+        # Reconstruct the physical filename by stripping the virtual tag (e.g., tiger_aug_0.jpg -> tiger.jpg)
+        physical_filename = re.sub(r'_aug_\d+', '', filename)
+        img_path = os.path.join(root_dir, physical_filename)
+    else:
+        img_path = os.path.join(root_dir, filename)
+
+    # Load the physical image
     img = Image.open(img_path).convert("RGB")
 
-    # 1. Use the faster Thumbnail method (reduces total pixel area)
-    if max(img.size) > max_size:
-        img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
-        
-    # 2. Create the white mask to match the (now smaller) image
+    # 2. Apply Augmentations OR Standard Resize
+    if is_aug:
+        wildlife_augmenter = T.Compose([
+            T.RandomHorizontalFlip(p=0.5),
+            T.RandomResizedCrop(size=(max_size, max_size), scale=(0.8, 1.0), ratio=(0.9, 1.1)),
+            T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05),
+            T.RandomApply([T.GaussianBlur(kernel_size=(5, 9), sigma=(0.1, 2.0))], p=0.3),
+            T.RandomAutocontrast(p=0.2)
+        ])
+        img = wildlife_augmenter(img)
+    else:
+        if max(img.size) > max_size:
+            img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+            
+    # 3. Standard Graph Generation
     mask = Image.new('L', img.size, color=255)
 
-    # Pass the mask in to keep the graph safe from black edges
     graph = image_to_superpixel_graph(
         img, mask=np.array(mask), 
         scale=felz_scale,        
@@ -192,6 +151,7 @@ def process_for_lmdb(filename, root_dir, felz_scale, felz_sigma, min_size, num_b
         cae_weights_path=cae_weights_path,
         cae_latent_dim=cae_latent_dim
     )
+    
     buffer = io.BytesIO()
     torch.save(graph, buffer)
         
