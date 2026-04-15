@@ -168,7 +168,7 @@ def image_to_superpixel_graph(img, scale, sigma, min_size, hog_bins, mask=None ,
         x_list.append(x_ent)
 
     # --- Combine all selected features ---
-    x = torch.cat(x_list, dim=1)
+    x = torch.cat(x_list, dim=1).to(torch.bfloat16)
 
     # ==========================================
     # --- 5. GRAPH PRUNING (Using the Mask) ---
@@ -204,7 +204,7 @@ def image_to_superpixel_graph(img, scale, sigma, min_size, hog_bins, mask=None ,
                     edges.add((old_to_new_ids[a].item(), old_to_new_ids[c].item()))
                     edges.add((old_to_new_ids[c].item(), old_to_new_ids[a].item()))
 
-        edge_index = torch.tensor(list(edges), dtype=torch.long).t().contiguous()
+        edge_index = torch.tensor(list(edges), dtype=torch.int32).t().contiguous()
         data = Data(x=x_pruned, edge_index=edge_index)
         
     else:
