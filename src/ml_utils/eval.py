@@ -244,8 +244,8 @@ def extract_features(model, dataloader, device, species_confidence_thresh = 0.8)
                 labels = data.y.view(-1, 2)[:, 0] # Grab just the Identity Label
             else:
                 labels = data.y.view(-1)
-                
-            out = model(data)
+            with torch.amp.autocast(device_type="cuda"):
+                out = model(data)
             
             # If model returns a tuple, it has the species head!
             if isinstance(out, tuple):
@@ -613,7 +613,7 @@ def evaluate_metrics_worker(ckpt_path, feats_np, labels_np, species_preds_np,kno
     r1, r5, r10, map_val, baks, baus = compute_reid_metrics(features, labels, known_classes, device='cpu', sim_thresh=0.4)
     #thesh, comp = compute_unsupervised_clustering(args,feats_np, species_preds_np)
     #ari, nmi, discovered_ids = compute_clustering_metrics(args, feats_np, labels_np, species_preds_np, sim_thresh = 0.8)
-    ari, nmi, discovered_ids = compute_clustering_metrics_leiden(args, feats_np, labels_np, species_preds_np, sim_thresh = 0.5)
+    ari, nmi, discovered_ids = compute_clustering_metrics_leiden(args, feats_np, labels_np, species_preds_np, sim_thresh = 0.4)
     #ari, nmi, discovered_ids =compute_best_clustering_metrics(args, feats_np, labels_np, species_preds_np)
     harmonic_score = np.sqrt(baks * baus)
 
