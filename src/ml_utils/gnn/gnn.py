@@ -9,14 +9,14 @@ from skimage.morphology import disk
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.data import Data
-from torch_geometric.nn import GATv2Conv, global_mean_pool, global_max_pool, knn_graph
+from torch_geometric.nn import GATv2Conv, global_mean_pool, global_max_pool, knn_graph, SAGEConv
 from PIL import Image
 from helper import per_pixel_hog_bins # Make sure this import is still correct for your project!
 from gnn.cae import TextureEncoder
 from torchvision import transforms
 from skimage.measure import regionprops
 import math
-from torch_geometric.utils import dropout_edge, dropout_node
+from torch_geometric.utils import dropout_edge, dropout_node, subgraph
 import os
 
 def image_to_superpixel_graph(img, scale, sigma, min_size, hog_bins, mask=None , hog_signed=False, hog_l2norm=True, features=['color', 'pos', 'hog'], n_hops=1, cae_weights_path=None, cae_latent_dim=64, return_segments=False):   
@@ -32,7 +32,7 @@ def image_to_superpixel_graph(img, scale, sigma, min_size, hog_bins, mask=None ,
     
     x_list = []
 
-# --- CAE SETUP ---
+    # --- CAE SETUP ---
     if 'cae' in features:
         if cae_weights_path is None:
             raise ValueError("Requested 'cae' features but no cae_weights_path provided!")
@@ -40,10 +40,32 @@ def image_to_superpixel_graph(img, scale, sigma, min_size, hog_bins, mask=None ,
         
         cae_transform = transforms.Compose([
             transforms.ToPILImage(),
-            transforms.Resize((32, 32)), # <--- CHANGE THIS FROM 64 TO 32
+            transforms.Resize((64, 64)), # MUST BE 64 TO MATCH CAE!
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
+
+    # ==========================================
+    # --- GRAPH PRUNING (Mask Evaluation) ---
+    # ==========================================
+    # Calculate this FIRST so we know which nodes to skip in the heavy loop
+    if mask is not None:
+        mask_flat = torch.tensor(mask, dtype=torch.float).view(-1)
+        node_counts = torch.bincount(seg_flat, minlength=num_nodes).float()
+        
+        node_mask_scores = torch.zeros(num_nodes, dtype=torch.float)
+        node_mask_scores.scatter_add_(0, seg_flat, mask_flat)
+        node_mask_scores = node_mask_scores / (node_counts + 1e-6)
+
+        # Boolean array: True if it's the animal, False if it's background
+        is_valid_node = node_mask_scores > 127.0 
+    else:
+        is_valid_node = torch.ones(num_nodes, dtype=torch.bool)
+
+    # Safety net: If the augmentation cropped pure black and deleted everything
+    if is_valid_node.sum() == 0:
+        is_valid_node = torch.ones(num_nodes, dtype=torch.bool)
+
 
     # --- 2. Color, Position, HOG, and CAE Loop ---
     if any(f in features for f in ['color', 'pos', 'hog', 'cae', 'shape']):
@@ -55,9 +77,21 @@ def image_to_superpixel_graph(img, scale, sigma, min_size, hog_bins, mask=None ,
             props = regionprops(segments + 1)
             total_area = h * w
             max_perimeter = 2 * (h + w)
+            
         colors, positions, hogs, cae_features, shape_features = [], [], [], [], []
 
         for sp in range(num_nodes):
+            # SKIP THE HEAVY MATH IF IT IS BACKGROUND
+            if not is_valid_node[sp]:
+                # Just append dummy zeros to keep the list lengths intact
+                if 'color' in features: colors.append([0, 0, 0])
+                if 'pos' in features: positions.append([0, 0])
+                if 'hog' in features: hogs.append(np.zeros(hog_bins, dtype=np.float32))
+                if 'shape' in features: shape_features.append(np.zeros(14, dtype=np.float32))
+                if 'cae' in features: cae_features.append(np.zeros(cae_latent_dim, dtype=np.float32))
+                continue
+
+            # Standard Extraction
             mask_sp = (segments == sp)
             coords = np.column_stack(np.nonzero(mask_sp))
             vals = img_lab[mask_sp]
@@ -79,180 +113,144 @@ def image_to_superpixel_graph(img, scale, sigma, min_size, hog_bins, mask=None ,
                     hog_hist /= (np.linalg.norm(hog_hist, ord=2) + 1e-6)
                 hogs.append(hog_hist)
                 
-            # CAE Feature Extraction ---
             if 'cae' in features:
-                # 1. Find the Bounding Box of the superpixel
                 ymin, ymax = coords[:, 0].min(), coords[:, 0].max()
                 xmin, xmax = coords[:, 1].min(), coords[:, 1].max()
-                
-                # 2. Crop the original RGB image to that box
                 crop_img = img[ymin:ymax+1, xmin:xmax+1]
-                
-                # 3. Apply the transform and add batch dimension [1, C, H, W]
                 crop_tensor = cae_transform(crop_img).unsqueeze(0)
-                
-                # 4. Push through the encoder
                 with torch.no_grad():
                     latent_vector = cae_model.encoder(crop_tensor).squeeze(0)
-                    
                 cae_features.append(latent_vector.numpy())
                 
             if 'shape' in features:
                 prop = props[sp]
-                
                 area = prop.area / total_area
                 perimeter = prop.perimeter / max_perimeter
-                
                 min_y, min_x, max_y, max_x = prop.bbox
                 bb_h = max(max_y - min_y, 1)
                 bb_w = max(max_x - min_x, 1)
                 aspect_ratio = bb_w / bb_h
-                
                 circularity = (4 * math.pi * prop.area) / ((prop.perimeter ** 2) + 1e-6)
                 solidity = prop.solidity
                 extent = prop.extent
                 eccentricity = prop.eccentricity
-                
                 hu_moments = prop.moments_hu
                 log_hu = []
                 for hu in hu_moments:
                     val = -1 * math.copysign(1.0, hu) * math.log10(abs(hu) + 1e-6)
                     log_hu.append(val)
-                    
-                node_shape_vec = [
-                    area, perimeter, aspect_ratio, circularity, 
-                    solidity, extent, eccentricity
-                ] + log_hu
-                
+                node_shape_vec = [area, perimeter, aspect_ratio, circularity, solidity, extent, eccentricity] + log_hu
                 shape_features.append(node_shape_vec)
 
         # Append extracted loop features to main list
-        if 'color' in features:
-            x_list.append(torch.tensor(np.array(colors), dtype=torch.float))
-        if 'pos' in features:
-            x_list.append(torch.tensor(np.array(positions), dtype=torch.float))
-        if 'hog' in features:
-            x_list.append(torch.tensor(np.array(hogs), dtype=torch.float))
-        if 'cae' in features:
-            x_list.append(torch.tensor(np.array(cae_features), dtype=torch.float))
+        if 'color' in features: x_list.append(torch.tensor(np.array(colors), dtype=torch.float))
+        if 'pos' in features: x_list.append(torch.tensor(np.array(positions), dtype=torch.float))
+        if 'hog' in features: x_list.append(torch.tensor(np.array(hogs), dtype=torch.float))
+        if 'cae' in features: x_list.append(torch.tensor(np.array(cae_features), dtype=torch.float))
         if 'shape' in features:
             x_shape = torch.tensor(np.array(shape_features), dtype=torch.float)
-            # L2 Normalize the whole column to ensure stability alongside other features
             x_shape = F.normalize(x_shape, p=2, dim=0) 
             x_list.append(x_shape)
 
     # --- 3. Local Binary Patterns (LBP) Histogram ---
     if 'lbp' in features:
-        # Multiply by 255 and convert to 8-bit integer to safely calculate LBP
         gray = (rgb2gray(img) * 255).astype(np.uint8)
         lbp = local_binary_pattern(gray, P=8, R=1.0, method='uniform')
         lbp_flat = torch.tensor(lbp, dtype=torch.long).view(-1)
-        
         lbp_one_hot = F.one_hot(lbp_flat, num_classes=10).float()
         x_lbp = torch.zeros((num_nodes, 10), dtype=torch.float)
         x_lbp.scatter_add_(0, seg_flat.unsqueeze(1).expand(-1, 10), lbp_one_hot)
-        
         x_lbp = F.normalize(x_lbp, p=1, dim=1) 
         x_list.append(x_lbp)
 
-    # --- 4. Local Entropy (Chaos/Smoothness metric) ---
+    # --- 4. Local Entropy ---
     if 'texture' in features:
         gray_uint8 = (rgb2gray(img) * 255).astype(np.uint8)
         ent = entropy(gray_uint8, disk(3))
         ent_flat = torch.tensor(ent, dtype=torch.float).view(-1, 1)
-        
         node_counts = torch.bincount(seg_flat, minlength=num_nodes).view(-1, 1).float()
         x_ent = torch.zeros((num_nodes, 1), dtype=torch.float)
         x_ent.scatter_add_(0, seg_flat.unsqueeze(1), ent_flat)
         x_ent = x_ent / (node_counts + 1e-6)
         x_list.append(x_ent)
 
-    # --- Combine all selected features ---
+    # Combine all selected features
     x = torch.cat(x_list, dim=1).to(torch.bfloat16)
 
-    # ==========================================
-    # --- 5. GRAPH PRUNING (Using the Mask) ---
-    # ==========================================
-    if mask is not None:
-        mask_flat = torch.tensor(mask, dtype=torch.float).view(-1)
-        node_counts = torch.bincount(seg_flat, minlength=num_nodes).float()
-        
-        node_mask_scores = torch.zeros(num_nodes, dtype=torch.float)
-        node_mask_scores.scatter_add_(0, seg_flat, mask_flat)
-        node_mask_scores = node_mask_scores / (node_counts + 1e-6)
+    # APPLY PRUNING: Only keep the valid nodes!
+    x_pruned = x[is_valid_node]
+    old_to_new_ids = torch.full((num_nodes,), -1, dtype=torch.long)
+    old_to_new_ids[is_valid_node] = torch.arange(x_pruned.size(0))
 
-        is_valid_node = node_mask_scores > 127.0 
+    # --- Build Pruned Edges ---
+    edges = set()
+    for y in range(h - 1):
+        for x_ in range(w - 1):
+            a = segments[y, x_]
+            b = segments[y, x_ + 1]
+            c = segments[y + 1, x_]
 
-        x_pruned = x[is_valid_node]
+            if a != b and is_valid_node[a] and is_valid_node[b]:
+                edges.add((old_to_new_ids[a].item(), old_to_new_ids[b].item()))
+                edges.add((old_to_new_ids[b].item(), old_to_new_ids[a].item()))
+                
+            if a != c and is_valid_node[a] and is_valid_node[c]:
+                edges.add((old_to_new_ids[a].item(), old_to_new_ids[c].item()))
+                edges.add((old_to_new_ids[c].item(), old_to_new_ids[a].item()))
 
-        old_to_new_ids = torch.full((num_nodes,), -1, dtype=torch.long)
-        old_to_new_ids[is_valid_node] = torch.arange(x_pruned.size(0))
-
-        # --- Build Pruned Edges ---
-        edges = set()
-        for y in range(h - 1):
-            for x_ in range(w - 1):
-                a = segments[y, x_]
-                b = segments[y, x_ + 1]
-                c = segments[y + 1, x_]
-
-                if a != b and is_valid_node[a] and is_valid_node[b]:
-                    edges.add((old_to_new_ids[a].item(), old_to_new_ids[b].item()))
-                    edges.add((old_to_new_ids[b].item(), old_to_new_ids[a].item()))
-                    
-                if a != c and is_valid_node[a] and is_valid_node[c]:
-                    edges.add((old_to_new_ids[a].item(), old_to_new_ids[c].item()))
-                    edges.add((old_to_new_ids[c].item(), old_to_new_ids[a].item()))
-
-        edge_index = torch.tensor(list(edges), dtype=torch.int32).t().contiguous()
-        data = Data(x=x_pruned, edge_index=edge_index)
-        
-    else:
-        # --- Standard Edge Building (If no mask is provided) ---
-        edges = set()
-        for y in range(h - 1):
-            for x_ in range(w - 1):
-                a = segments[y, x_]
-                b = segments[y, x_ + 1]
-                c = segments[y + 1, x_]
-
-                if a != b:
-                    edges.add((a, b))
-                    edges.add((b, a))
-                if a != c:
-                    edges.add((a, c))
-                    edges.add((c, a))
-
-        edge_index = torch.tensor(list(edges), dtype=torch.long).t().contiguous()
-        data = Data(x=x, edge_index=edge_index)
+    edge_index = torch.tensor(list(edges), dtype=torch.int32).t().contiguous()
+    data = Data(x=x_pruned, edge_index=edge_index)
         
     if n_hops > 1:
         actual_nodes = data.x.size(0)
-        
-        # 1. Create a dense adjacency matrix
         adj = torch.zeros((actual_nodes, actual_nodes), dtype=torch.float)
         adj[data.edge_index[0], data.edge_index[1]] = 1.0
-        
-        # 2. Add self-loops (This ensures 1-hop edges aren't lost when finding 2-hop edges)
         adj.fill_diagonal_(1.0)
-        
-        # 3. Multiply matrix by itself 'n' times
         adj_n = torch.matrix_power(adj, n_hops)
-        
-        # 4. Remove self-loops (GNNs handle this internally usually, but best to be clean)
         adj_n.fill_diagonal_(0.0)
-        
-        # 5. Convert back to PyG edge_index format
         new_edge_index = (adj_n > 0).nonzero(as_tuple=False).t().contiguous()
         data.edge_index = new_edge_index
         
-    # Return the map if viz.py asks for it
     if return_segments:
         return data, segments
         
     return data
 
+class BackgroundPruner(nn.Module):
+    def __init__(self, in_dim, threshold = 0.1):
+        super().__init__()
+        self.threshold = threshold
+        # light layer to gain information over node neighbourhood
+        self.context_layer = SAGEConv(in_dim, in_dim//2)
+        self.prune_scorer = nn.Sequential(nn.BatchNorm1d(in_dim//2),
+                                          nn.ReLU(),
+                                          nn.Linear(in_dim//2, 1),
+                                          nn.Sigmoid())
+        
+    def forward(self, x, edge_index, batch = None):
+        # create "context"
+        x_context = self.context_layer(x,edge_index)
 
+        # judge /score each node
+        scores = self.prune_scorer(x_context).squeeze(-1)
+
+        # gradient flow needs this
+        x_weighted = x * scores.unsqueeze(-1)
+
+        keep_mask = scores > self.threshold
+
+        x_pruned = x_weighted[keep_mask]
+        batch_pruned = batch[keep_mask] if batch is not None else None
+        #sever deleted edges and relabel surviving nodes
+        edge_index_pruned, _ = subgraph(
+            subset=keep_mask, 
+            edge_index=edge_index, 
+            relabel_nodes=True, 
+            num_nodes=x.size(0)
+        )
+        
+        return x_pruned, edge_index_pruned, batch_pruned, scores
+    
 class GNNEncoder(nn.Module):
     def __init__(self, features, cae_latent_dim , num_hog_bins,in_dim=14, hidden_dim=512, out_dim=512, edge_strategy="spatial", k_neighbors=5):
         super().__init__()
@@ -262,6 +260,7 @@ class GNNEncoder(nn.Module):
         self.features = features
         self.cae_latent_dim = cae_latent_dim
         self.num_hog_bins = num_hog_bins
+        #self.pruner = BackgroundPruner(in_dim=in_dim)
         # Learned Attention Projection
         # Projects raw features into a specific "Edge Similarity" space.
         # This acts like the Query/Key transformations in standard Transformers.
@@ -295,7 +294,7 @@ class GNNEncoder(nn.Module):
 
     def forward(self, data):
         x, spatial_edge_index, batch = data.x, data.edge_index, data.batch
-        
+        #x, spatial_edge_index, batch, saliency_scores = self.pruner(x, spatial_edge_index, batch)
         if self.training:
             x = self.apply_modality_dropout(x, p=0.2)
         
@@ -307,7 +306,9 @@ class GNNEncoder(nn.Module):
             # Generate Attention Edges
             queries_keys = self.edge_proj(x)
             semantic_edge_index = knn_graph(x=queries_keys, k=self.k_neighbors, batch=batch, loop=False, cosine=True)
-            
+            #source_nodes = queries_keys[semantic_edge_index[0]]
+            #target_nodes = queries_keys[semantic_edge_index[1]]
+            #sim_scores = F.cosine_similarity(source_nodes, target_nodes, dim=1)
             if self.edge_strategy == "attention":
                 # Pure semantic approach (ignores physical layout)
                 final_edge_index = semantic_edge_index
@@ -357,7 +358,7 @@ class GNNEncoder(nn.Module):
         #pooled_mean = global_mean_pool(x, batch) 
         #pooled_max = global_max_pool(x, batch)   
         pooled = self.gem_pool(x_dynamic, batch)
-        return pooled
+        return pooled#, saliency_scores
         #return torch.cat([pooled_mean, pooled_max], dim=1)
 
     def apply_modality_dropout(self, x, p):
@@ -442,8 +443,8 @@ def get_cae_model(weights_path, latent_dim):
         # Pass the dynamic latent_dim to the architecture
         model = TextureEncoder(latent_dim=latent_dim) 
         
-        # Load weights
-        model.load_state_dict(torch.load(weights_path, map_location='cpu'))
+        # Load weights and set strict=False to ignore the missing classifier!
+        model.load_state_dict(torch.load(weights_path, map_location='cpu'), strict=False)
         model.eval()
         _WORKER_CAE_CACHE[weights_path] = model
         

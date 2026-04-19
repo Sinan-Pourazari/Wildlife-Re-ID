@@ -17,7 +17,7 @@ from torch_geometric.loader import DataLoader
 from torch_geometric.data import Dataset as PyGDataset
 from gnn.gnn import image_to_superpixel_graph, GNNEncoder
 import torch.nn.functional as F
-from dataloader import InMemoryGraphDataset, UniversalGraphDataset, prepare_augmented_training_data
+from dataloader import InMemoryGraphDataset, UniversalGraphDataset, generate_augmented_metadata
 import numpy as np
 from sklearn.preprocessing import LabelEncoder
 import argparse
@@ -34,7 +34,21 @@ elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
 else:
     device = "cpu"
 
-
+import subprocess
+#TODO pput this and duplicate from cae into helpers
+def get_gpu_power_watts():
+    """Queries nvidia-smi for current GPU power draw in Watts."""
+    if torch.cuda.is_available():
+        try:
+            result = subprocess.run(
+                ['nvidia-smi', '--query-gpu=power.draw', '--format=csv,noheader,nounits'], 
+                stdout=subprocess.PIPE, text=True
+            )
+            # If multiple GPUs, this takes the first one
+            return float(result.stdout.strip().split('\n')[0])
+        except Exception:
+            return 0.0
+    return 0.0
 print(f"Using {device} device")
 class SimpleDataset(TorchDataset):
     def __init__(self, features, labels):
@@ -88,25 +102,7 @@ class TripletDataset(TorchDataset):
 
         return anchor, positive, negative
     
-class GraphImageDataset(PyGDataset):
-    def __init__(self, samples, root_dir, n_segments=50):
-        super().__init__()
-        self.samples = samples
-        self.root_dir = root_dir
-        self.n_segments = n_segments
 
-    def len(self):
-        return len(self.samples)
-
-    def get(self, idx):
-        filename, label = self.samples[idx]
-        image_path = os.path.join(self.root_dir, filename)
-        img = Image.open(image_path).convert("RGB")
-        #img = img.resize((256, 256))  # or 
-
-        graph = image_to_superpixel_graph(img, n_segments=self.n_segments)
-        graph.y = torch.tensor([int(label)], dtype=torch.long)
-        return graph
     
 class ReIDModel(nn.Module):
     def __init__(self,features, cae_latent_dim, num_classes, num_species, in_dim, num_hog_bins \
@@ -181,8 +177,9 @@ class ReIDModel(nn.Module):
     # TODO save relevant args parts
     def save(self, args, epoch, optimizer, train_classes=None, species_classes = None):
         """Saves weights, metadata, and hyperparameters with attribute safety."""
-        if not os.path.exists(args.checkpoint_dir):
-            os.makedirs(args.checkpoint_dir)
+        # 1. Ensure the GNN subfolder exists
+        gnn_save_dir = os.path.join(args.checkpoint_dir, "gnn")
+        os.makedirs(gnn_save_dir, exist_ok=True)
 
         # --- DEFENSIVE CHECK ---
         if hasattr(self, 'save_params'):
@@ -197,11 +194,13 @@ class ReIDModel(nn.Module):
                 'use_hybrid_pooling': True
             }
 
-        # Generate unique filename
+        # Generate unique filename INCLUDING the epoch number
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         species = getattr(args, 'holdout_species', 'universal') or 'universal'
-        model_name = f"gnn_reid_{species}_{timestamp}.pth"
-        save_path = os.path.join(args.checkpoint_dir, model_name)
+        model_name = f"gnn_reid_ep{epoch}_{species}_{timestamp}.pth"
+        
+        # 2. Save directly into the GNN subfolder
+        save_path = os.path.join(gnn_save_dir, model_name)
 
         # Prepare payload
         payload = {
@@ -260,9 +259,10 @@ def train_one_epoch(loader, model, arcface_loss, scaler, optimizer, margin=1.0):
     total = 0.0
     total_triplet = 0.0
     total_ce = 0.0
-    total_compact = 0.0
+    total_scorer = 0.0
     total_species = 0.0
     criterion_ce = nn.CrossEntropyLoss(label_smoothing =0.001)
+    scorer_weight = 0.05 # TODO Adjust this if it deletes too much or too little
 
     for data in loader:
         data = data.to(device)
@@ -272,7 +272,7 @@ def train_one_epoch(loader, model, arcface_loss, scaler, optimizer, margin=1.0):
         y_stacked = data.y.view(-1, 2).to(device) 
         labels = y_stacked[:, 0]          # Identity labels
         species_labels = y_stacked[:, 1]  # Species labels
-        with torch.amp.autocast():
+        with torch.amp.autocast(device_type="cuda"):
             # Unpack the two outputs
             emb, species_logits, features = model(data)
 
@@ -280,14 +280,13 @@ def train_one_epoch(loader, model, arcface_loss, scaler, optimizer, margin=1.0):
             #loss_triplet = batch_hard_triplet_loss(emb, labels, margin=margin)
             loss_triplet = batch_topk_semi_hard_triplet_loss(features, labels, margin=margin, k_neg=8)
             #TODO add args to change betwen arcface and cross entorpy
-            #loss_ce = 0.25 * criterion_ce(logits, labels)
             loss_arc = 0.2 * arcface_loss(emb,labels)
-            #loss_compact = 3 * batch_compactness_loss(features, labels)
             loss_ce_species = 1 * criterion_ce(species_logits, species_labels)
+            
             # Combined Loss
-            loss = loss_triplet + loss_arc + loss_ce_species # loss_compact
+            loss = loss_triplet + loss_arc + loss_ce_species
+            
 
-        #optimizer.zero_grad(set_to_none=True)
         
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -296,26 +295,132 @@ def train_one_epoch(loader, model, arcface_loss, scaler, optimizer, margin=1.0):
         total += float(loss.item())
         total_triplet += loss_triplet.item()
         total_ce += loss_arc.item()
-        #total_compact += loss_compact
+        #total_scorer += loss_scorer.item()
         total_species += loss_ce_species.item()
 
-    return total / len(loader), total_triplet / len(loader), total_ce / len(loader), total_compact / len(loader), total_species / len(loader)
+    return total / len(loader), total_triplet / len(loader), total_ce / len(loader), total_scorer / len(loader), total_species / len(loader)
 
 
-def train(loader, model, optimizer, num_epochs, arcface_loss, start_epoch=0, args=None, train_classes = None, species_classes = None, scheduler = None):
+def train(loader, model, optimizer, num_epochs, arcface_loss, start_epoch=0, args=None, train_classes=None, species_classes=None, scheduler=None):
     scaler = torch.amp.GradScaler()
     
+    # 1. SETUP TRACKING
+    metrics_csv_path = os.path.join(args.checkpoint_dir, "training_metrics.csv")
+    headers = ["epoch", "total_batchloss", "triplet_loss", "arcface_loss", "compactness_loss", "species_ce_loss", "vram_mb", "gpu_util_percent", "power_watts", "learning_rate"]
+
+    # If starting fresh, or the file doesn't exist, write the CSV headers
+    if start_epoch == 0 or not os.path.exists(metrics_csv_path):
+        with open(metrics_csv_path, 'w') as f:
+            f.write(",".join(headers) + "\n")
+    else:
+        print(f"--> Resuming tracking, appending to existing CSV at {metrics_csv_path}")
+
     for i in range(start_epoch, num_epochs):
 
+        # Run the training epoch
         total_batchloss, triplet, ce, compact, species = train_one_epoch(loader, model, arcface_loss, scaler, optimizer, margin=1)
-        print(f"epoch {i} batchloss: {total_batchloss}, triplet loss: {triplet}, Arcface loss: {ce}, compactness loss: {compact}, ce species loss {species}")
+        
+        # 2. QUERY HARDWARE UTILIZATION
+        vram_mb = 0.0
+        gpu_util = 0.0
+        # 2. QUERY HARDWARE & ENERGY UTILIZATION
+        vram_mb, gpu_util, power_watts = 0.0, 0.0, 0.0
+        if torch.cuda.is_available():
+            vram_mb = torch.cuda.memory_allocated() / (1024 * 1024) 
+            try:
+                gpu_util = torch.cuda.utilization() 
+            except Exception:
+                pass 
+            power_watts = get_gpu_power_watts()
+
+        # --- 3. LR SCHEDULER LOGIC ---
+        if scheduler is not None:
+            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                scheduler.step(total_batchloss) # Steps based on plateauing loss
+            else:
+                scheduler.step() # Steps based purely on epoch count
+                
+        # Get the current Learning Rate from the optimizer
+        current_lr = optimizer.param_groups[0]['lr']
+
+        print(f"Epoch {i} | Total Loss: {total_batchloss:.4f} (Trip: {triplet:.4f}, Arc: {ce:.4f}, Comp: {compact:.4f}, Spec: {species:.4f}) | LR: {current_lr:.6f} | VRAM: {vram_mb:.0f}MB,  Power: {power_watts}W")
+        
+        # Flush to hard drive (Now includes current_lr)
+        row_data = [i, total_batchloss, triplet, ce, compact, species, vram_mb, gpu_util, power_watts, current_lr] 
+        with open(metrics_csv_path, 'a') as f:
+            f.write(",".join(map(str, row_data)) + "\n")
+
+        # Step Scheduler
         if scheduler is not None:
             scheduler.step(total_batchloss)
-        #if i % 2 == 0:
-            #torch.cuda.empty_cache()
-        if i % 2 ==0:
+
+        # Save Model Weights
+        if i % 2 == 0:
             _ = model.save(args, epoch=i, optimizer=optimizer, train_classes=train_classes, species_classes=species_classes)
 
+
+    # 4. GENERATE FINAL PLOT 
+    print("\n[ Generating Training Metrics Plot ]")
+    try:
+        import matplotlib.pyplot as plt
+        # Load the entire history from the hard drive only when we need to plot it
+        df_plot = pd.read_csv(metrics_csv_path)
+        
+        # --- PLOT 1: Losses ---
+        plt.figure(figsize=(10, 6))
+        plt.plot(df_plot['epoch'], df_plot['total_batchloss'], label='Total Loss', color='black', linewidth=2.5)
+        plt.plot(df_plot['epoch'], df_plot['triplet_loss'], label='Triplet', linestyle='--', alpha=0.8)
+        plt.plot(df_plot['epoch'], df_plot['arcface_loss'], label='ArcFace', linestyle='--', alpha=0.8)
+        plt.plot(df_plot['epoch'], df_plot['species_ce_loss'], label='Species CE', linestyle='--', alpha=0.8)
+        plt.title("GNN Training Losses over Epochs", fontsize=14, fontweight='bold')
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss Value")
+        plt.legend(loc="upper right")
+        plt.grid(True, linestyle=':', alpha=0.6)
+        plt.tight_layout()
+        
+        loss_plot_path = os.path.join(args.checkpoint_dir, "training_loss_plot.png")
+        plt.savefig(loss_plot_path, dpi=300)
+        plt.close()
+        
+        # --- PLOT 2: Hardware ---
+        fig, ax1 = plt.subplots(figsize=(10, 6))
+        
+        # Left Y-Axis: VRAM
+        ax1.plot(df_plot['epoch'], df_plot['vram_mb'], label='VRAM (MB)', color='purple', linewidth=2)
+        ax1.set_ylabel("VRAM (MB)", color='purple', fontweight='bold')
+        ax1.tick_params(axis='y', labelcolor='purple')
+        ax1.set_xlabel("Epoch")
+        ax1.grid(True, linestyle=':', alpha=0.6)
+        
+        # Right Y-Axis: GPU Util & Power
+        ax2 = ax1.twinx() 
+        ax2.plot(df_plot['epoch'], df_plot['gpu_util_percent'], label='GPU Util (%)', color='green', alpha=0.4, linewidth=2)
+        
+        # Safely plot power if it exists in the CSV
+        if 'power_watts' in df_plot.columns:
+            ax2.plot(df_plot['epoch'], df_plot['power_watts'], label='Power (W)', color='red', alpha=0.6, linewidth=2)
+            
+        ax2.set_ylabel("Utilization (%) / Power (W)", color='black', fontweight='bold')
+        ax2.tick_params(axis='y', labelcolor='black')
+        ax2.set_ylim(0, max(105, df_plot['power_watts'].max() * 1.1 if 'power_watts' in df_plot.columns else 105))
+        
+        # Combine legends
+        lines_1, labels_1 = ax1.get_legend_handles_labels()
+        lines_2, labels_2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines_1 + lines_2, labels_1 + labels_2, loc='upper left')
+        
+        plt.title("GNN Hardware Utilization & Power over Epochs", fontsize=14, fontweight='bold')
+        fig.tight_layout()
+        
+        hw_plot_path = os.path.join(args.checkpoint_dir, "training_hardware_plot.png")
+        plt.savefig(hw_plot_path, dpi=300)
+        plt.close()
+        
+        print(f"--> Saved high-res plots to {args.checkpoint_dir}")
+        
+    except Exception as e:
+        print(f"--> Failed to generate plots: {e}")
 
 def knn_accuracy(embeddings, labels, k=4):
     nbrs = NearestNeighbors(n_neighbors=k+1).fit(embeddings)
@@ -436,124 +541,37 @@ def accuracy_to_color(acc_percent: float) -> str:
 
 def main(args):
     # Setup Paths
-    csv_path = args.csv_path
+    
     img_root = args.root_dir
     cache_pool = args.cache_dir
     #for resume only
     print(f"\n[ Setting up Output Directory: {args.checkpoint_dir} ]")
     
-    if os.path.exists(args.checkpoint_dir):
-        if args.resume:
-            # logic constraint met: directory exists AND resume is set. Safe to continue.
-            print(f"--> Directory exists. Resuming training.")
-        else:
-            # logic constraint violated: directory exists but we aren't resuming.
-            # Abort to prevent accidental overwriting of a previous run's results.
-            print(f"\n[ERROR] The checkpoint directory '{args.checkpoint_dir}' already exists.")
-            print("To prevent accidental overwriting of previous results, this script is aborting.")
-            print("\nTo fix this:")
-            print("1. If you want to RESUME, add '--resume path/to/previous/checkpoint.pth'")
-            print("2. If you want a FRESH run, change '--checkpoint_dir' to a new name in your command.")
-            return # Exit the main function 
-    else:
-        # Directory doesn't exist, this is a normal fresh run. Create it.
-        print(f"--> Creating new directory.")
-        # Use makedirs just in case parent directories are needed, exist_ok handled by logic above
-        os.makedirs(args.checkpoint_dir, exist_ok=True) 
+    os.makedirs(f"{args.checkpoint_dir}/gnn", exist_ok=True)
     # ------------------------------------------------------------
-    # 1. Load the Universal Metadata
-    print("\n[ Loading Metadata ]")
-    df = pd.read_csv(csv_path)
-    df = pd.read_csv(csv_path)
+    print("\n[ Loading Pre-Split Metadata ]")
+    train_df = pd.read_csv(args.csv_path)
     
-    # --- FILTER BY SPECIFIC SPECIES ---
-    if args.species:
-        print(f"--> Filtering dataset to ONLY include: {args.species}")
-        df = df[df['species'].isin(args.species)].reset_index(drop=True)
-        
-        # Safety check to prevent crashing later if typos were made
-        if len(df) == 0:
-            raise ValueError(f"No images found for the specified species: {args.species}. Check your spelling.")
-
-    # Filter out entries with no cluster_id/identity if necessary
-    df['global_identity'] = df['dataset'] + "_" + df['identity'].astype(str)
-    
-    counts = df['global_identity'].value_counts()
-    keep_ids = counts[counts > 1].index
-    df = df[df['global_identity'].isin(keep_ids)].reset_index(drop=True)
-    # Filter out entries with no cluster_id/identity if necessary
-    df['global_identity'] = df['dataset'] + "_" + df['identity'].astype(str)
-    
-    counts = df['global_identity'].value_counts()
-    keep_ids = counts[counts > 1].index
-    df = df[df['global_identity'].isin(keep_ids)].reset_index(drop=True)
-
-    # --- NEW: SUBSET LOGIC ---
-    if args.subset_fraction < 1.0:
-        print(f"\n[ Applying {args.subset_fraction * 100:.0f}% Subset ]")
-        unique_ids = df['global_identity'].unique()
-        keep_n = max(2, int(len(unique_ids) * args.subset_fraction)) # Keep at least 2 IDs
-        
-        # Randomly select a subset of identities
-        np.random.seed(42) # Keep it reproducible so you test on the same subset
-        sampled_ids = np.random.choice(unique_ids, keep_n, replace=False)
-        
-        # Filter the dataframe to only include those identities
-        df = df[df['global_identity'].isin(sampled_ids)].reset_index(drop=True)
-        print(f"--> Shrunk dataset to {keep_n} unique identities ({len(df)} total images)")
-
-    le = LabelEncoder()
-    df['global_label'] = le.fit_transform(df['global_identity'])
-
-# 3. Apply Holdout Logic
-    if args.holdout_species:
-        print(f"--> HOLDING OUT SPECIES: {args.holdout_species}")
-        train_df = df[df['species'] != args.holdout_species].reset_index(drop=True)
-        test_df = df[df['species'] == args.holdout_species].reset_index(drop=True)
-        
-    elif args.holdout_dataset:
-        print(f"--> HOLDING OUT DATASET: {args.holdout_dataset}")
-        train_df = df[df['dataset'] != args.holdout_dataset].reset_index(drop=True)
-        test_df = df[df['dataset'] == args.holdout_dataset].reset_index(drop=True)
-        
-    else:
-        # Standard Open-Set Split on the whole universe
-        print("--> Standard Open-Set Split (No Holdout)")
-        unique_labels = df["global_label"].unique()
-        train_labels, test_labels = train_test_split(unique_labels, test_size=0.2, random_state=42)
-        train_df = df[df["global_label"].isin(train_labels)].reset_index(drop=True)
-        test_df = df[df["global_label"].isin(test_labels)].reset_index(drop=True)
-        test_df.to_csv(f"{args.checkpoint_dir}/current_test_split.csv", index=False)
-
-    
-    # No matter how the split was made, we must ensure training labels 
-    # are strictly 0 to (N-1) for the Cross Entropy classifier.
-    print("\n[ Processing Labels ]")
-    train_le = LabelEncoder()
-    species_le = LabelEncoder()
-    df['species_label'] = species_le.fit_transform(df['species'])
-    train_df['contiguous_label'] = train_le.fit_transform(train_df['global_label'])  
-    train_df['species_label'] = species_le.transform(train_df['species'])
-    test_df['species_label'] = species_le.transform(test_df['species'])
-
-    # Calculate the number of classes for the model init
-    num_train_classes = len(train_le.classes_)
-    num_species = len(species_le.classes_)
+    num_train_classes = train_df['contiguous_label'].nunique()
+    num_species = train_df['species_label'].nunique()
     print(f"--> Active Training Classes: {num_train_classes}")
     print(f"--> Active Species Classes: {num_species}")
 
-    # create augumentations
-    aug_csv_path = prepare_augmented_training_data(train_df=train_df, root_dir=args.root_dir, lmdb_dir=args.cache_dir,args=args)
+    # Extract the original class IDs to save into the checkpoint payload later
+    train_classes_list = sorted(train_df['global_label'].unique().tolist())
+    species_classes_list = sorted(train_df['species_label'].unique().tolist())
+
+    # Generate augmentations
+    aug_csv_path = generate_augmented_metadata(
+        train_df=train_df, 
+        target_K=8, 
+        save_dir=args.checkpoint_dir
+    )  
     aug_train_df = pd.read_csv(aug_csv_path)
 
-    # 4. Create Sample Lists (mapping path -> label)
-    # Train uses the NEW contiguous labels
+    # 2. Create Sample Lists
     train_samples = list(zip(aug_train_df["path"], aug_train_df["contiguous_label"], aug_train_df["species_label"]))
-    
-    # Test uses the global_labels (Evaluation and Triplet loss don't care about gaps)
-    test_samples = list(zip(test_df["path"], test_df["global_label"], test_df["species_label"]))
-
-    print(f"Train size: {len(train_samples)} images | Test size: {len(test_samples)} images")
+    print(f"Train size: {len(train_samples)} images")
 
     if 'latent' in args.features:
         # Create a highly specific filename based on the current run's parameters
@@ -616,7 +634,7 @@ def main(args):
         min_size= args.felz_min_size
         )"""
     # DataLoaders
-    batch_sampler = PKBatchSampler(aug_train_df["global_label"].values, P=14, K=8)
+    batch_sampler = PKBatchSampler(aug_train_df["global_label"].values, P=45, K=8)
     train_loader = DataLoader(train_dataset, batch_sampler=batch_sampler, num_workers=args.workers, persistent_workers=False, prefetch_factor=None)
     #test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=args.workers)
 
@@ -632,20 +650,19 @@ def main(args):
     
     arcface = ArcFaceLoss(num_classes=num_train_classes, embedding_size=512, margin=12, scale= 64).to(device)
     #optimizer = torch.optim.Adam(list(model.parameters()) + list(arcface.parameters()), lr=0.0001)
-    optimizer = bnb.optim.Adam8bit(list(model.parameters()) + list(arcface.parameters()), lr=0.0001)
+    optimizer = bnb.optim.Adam8bit(list(model.parameters()) + list(arcface.parameters()), lr=0.01)
     #optimizer = AdaBelief(list(model.parameters()) + list(arcface.parameters()), lr=1e-3)
     #TODO try reduce on Plateau
-
+    
     scheduler = ReduceLROnPlateau(
         optimizer, 
         mode='min',        # We want the loss to minimize
-        factor=0.5,        # Multiply current LR by 0.5 when stuck
-        patience=10,        # Wait 10 epochs of no improvement
-        threshold=0.005,    # The loss must improve by at least this much to reset the patience
+        factor=0.1,        # Multiply current LR by 0.5 when stuck
+        patience=25,        # Wait 10 epochs of no improvement
+        threshold=0.0001,    # The loss must improve by at least this much to reset the patience
         cooldown= 5,
-        min_lr= 0.000001
+        min_lr= 0.00001
     )
-    # --- RESUME LOGIC ---
     start_epoch = 0
     if args.resume:
         if os.path.isfile(args.resume):
@@ -669,8 +686,8 @@ def main(args):
 
     # Train & Evaluate
     # Pass the start_epoch and args into the train loop
-    train(train_loader, model, optimizer,arcface_loss=arcface, num_epochs=args.epochs, start_epoch=start_epoch, args=args, train_classes=train_labels.tolist(), \
-           species_classes=species_le.classes_.tolist(), scheduler=scheduler)
+    train(train_loader, model, optimizer, arcface_loss=arcface, num_epochs=args.epochs, start_epoch=start_epoch, args=args, 
+          train_classes=train_classes_list, species_classes=species_classes_list, scheduler= scheduler)
     # --- Saving the Results ---
     print("\n[ Saving Model ]")
     save_dir = "checkpoints"

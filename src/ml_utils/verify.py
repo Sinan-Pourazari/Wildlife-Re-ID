@@ -5,6 +5,7 @@ import os
 import collections
 from tqdm import tqdm
 from torch_geometric.data import Data
+import re
 
 def peek_at_unknowns(cache_dir, num_samples=15):
     print(f"Peeking at 'unknown' keys in LMDB: {cache_dir}...\n")
@@ -47,33 +48,32 @@ def verify_lmdb_cache(cache_dir):
         empty = 0
         sample_checked = 0
         
-        # Dictionary to track how many graphs belong to each configuration
+        # Track configurations and node dimensions
         config_counts = collections.defaultdict(int)
+        dim_counts = collections.defaultdict(int)
 
         # Iterate through every single entry
         for key, value in tqdm(cursor, total=total_entries, desc="Auditing Graphs"):
             key_str = key.decode('utf-8')
             
             # --- EXTRACT CONFIGURATION ---
-            # Keys NOW look like: res512_felzscale70.0_felzsigma0.65_hops1_cae-color-hog-pos-CAE-v7-dim16_filename.jpg
-            parts = key_str.split('_')
-            
-            # We assume the first 5 chunks define the configuration now
-            if len(parts) >= 6 and parts[0].startswith('res'):
-                config_name = f"{parts[0]}_{parts[1]}_{parts[2]}_{parts[3]}_{parts[4]}"
+            # Extract the core parameters from the new key structure
+            # Example: res512_felzscale70.0_felzsigma0.65_300_hops1_...
+            match = re.match(r'^(res\d+_felzscale[\d\.]+_felzsigma[\d\.]+_\d+_hops\d+)', key_str)
+            if match:
+                config_name = match.group(1)
             else:
-                config_name = "unknown_config"
+                config_name = "unknown_legacy_config"
                 
             config_counts[config_name] += 1
             # -----------------------------
 
             # 1. Check for empty entries
             if value is None or len(value) == 0:
-                print(f"[!] Empty entry found for key: {key_str}")
                 empty += 1
                 continue
 
-            # 2. Structural Integrity Check (Every 500th entry to save time)
+            # 2. Structural Integrity & Dimension Check (Every 500th entry to save time)
             if sample_checked % 500 == 0:
                 try:
                     buffer = io.BytesIO(value)
@@ -81,10 +81,13 @@ def verify_lmdb_cache(cache_dir):
                     
                     # Verify it has the core GNN attributes
                     if not isinstance(graph, Data) or not hasattr(graph, 'x') or not hasattr(graph, 'edge_index'):
-                        print(f"[!] Invalid Graph structure for key: {key_str}")
                         corrupted += 1
+                    else:
+                        # TRACK THE DIMENSION OF THE FEATURES!
+                        in_dim = graph.x.shape[1]
+                        dim_counts[in_dim] += 1
+                        
                 except Exception as e:
-                    print(f"[!] Deserialization error for key {key_str}: {e}")
                     corrupted += 1
             
             sample_checked += 1
@@ -92,22 +95,33 @@ def verify_lmdb_cache(cache_dir):
     env.close()
 
     # --- PRINT THE SUMMARY ---
-    print("\n" + "="*40)
-    print("           VERIFICATION COMPLETE")
-    print("="*40)
+    print("\n" + "="*60)
+    print("                    VERIFICATION COMPLETE")
+    print("="*60)
     print(f"--> Total Audited:       {total_entries}")
     print(f"--> Empty Entries:       {empty}")
     print(f"--> Corrupted/Invalid:   {corrupted}")
-    print("\n[ CONFIGURATION BREAKDOWN ]")
+    print("-" * 60)
     
-    # Sort the dictionary so the output is neat and readable
+    print("\n[ GRAPH NODE DIMENSIONS (Sampled) ]")
+    for dim, count in sorted(dim_counts.items()):
+        estimated_total = count * 500
+        print(f"  • {dim} Dimensions : ~{estimated_total} graphs")
+        
+        # Friendly diagnosis of the dimension sizes
+        if dim == 38:
+            print("    [!] WARNING: These are stale graphs! They are missing the 32-dim CAE features.")
+        elif dim == 70:
+            print("    [+] SUCCESS: These are fully updated 70-dim graphs with CAE injected.")
+
+    print("\n[ CONFIGURATION BREAKDOWN ]")
     for config, count in sorted(config_counts.items()):
-        print(f"  • {config:<60} : {count} graphs")
+        print(f"  • {config} : {count} graphs")
         
     print("-" * 60)
     
     if empty == 0 and corrupted == 0:
-        print("--> [STATUS] Database is HEALTHY.")
+        print("--> [STATUS] Database integrity is HEALTHY.")
     else:
         print("--> [STATUS] Issues detected. Recommend running with --rebuild.")
     print("="*60)
@@ -115,4 +129,3 @@ def verify_lmdb_cache(cache_dir):
 # Run it
 if __name__ == "__main__":
     verify_lmdb_cache("src/images/reid-10k/graph_cache_pool")
-    # peek_at_unknowns("src/images/reid-10k/graph_cache_pool") # Uncomment to see old keys

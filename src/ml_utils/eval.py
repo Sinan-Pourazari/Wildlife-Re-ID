@@ -548,19 +548,8 @@ def plot_detailed_tsne(features_nd, labels, title, save_path):
     plt.close()
 
 def get_test_samples(args):
-    # low_memory=False to stop the DtypeWarning in pandas
-    df = pd.read_csv(args.csv_path, low_memory=False).dropna(subset=['identity'])
-    df['global_identity'] = df['dataset'] + "_" + df['identity'].astype(str)
-    
-    counts = df['global_identity'].value_counts()
-    df = df[df['global_identity'].isin(counts[counts > 1].index)].reset_index(drop=True)
-    
-    if args.holdout_species:
-        test_df = df[df['species'] == args.holdout_species].reset_index(drop=True)
-    elif args.holdout_dataset:
-        test_df = df[df['dataset'] == args.holdout_dataset].reset_index(drop=True)
-    else:
-        test_df = pd.read_csv(f"{args.checkpoints_dir}/current_test_split.csv")
+    # The batch script directly provides the test_split.csv, so we just load it!
+    test_df = pd.read_csv(args.csv_path, low_memory=False)
 
     if args.eval_filter_species:
         test_df = test_df[test_df['species'] == args.eval_filter_species].reset_index(drop=True)
@@ -574,25 +563,7 @@ def get_test_samples(args):
         ).reset_index(drop=True)
         print(f"Downsampled test set to a maximum of {args.max_images_per_id} images per identity.")
 
-    # Guarantee these columns exist right before returning!
-    from sklearn.preprocessing import LabelEncoder
-    if 'global_identity' not in test_df.columns:
-        test_df['global_identity'] = test_df['dataset'] + "_" + test_df['identity'].astype(str)
-    
-    # FIX: Guarantee these columns exist right before returning!
-    if 'global_identity' not in test_df.columns:
-        test_df['global_identity'] = test_df['dataset'] + "_" + test_df['identity'].astype(str)
-    
-    # Check if the dataframe ALREADY has the correct global_labels from the training split
-    if 'global_label' not in test_df.columns:
-        # If it doesn't, this must be a completely unseen holdout dataset.
-        # We encode it, and offset it by a huge number so it strictly registers as "Unknown" 
-        print("Assigning novel labels for a completely unseen dataset...")
-        test_df['global_label'] = LabelEncoder().fit_transform(test_df['global_identity']) + 999999
-    
-    # We can safely re-encode species because it is evaluated separately
-    test_df['species_label'] = LabelEncoder().fit_transform(test_df['species'].astype(str))
-
+    # We extract the paths and the pre-computed labels directly
     return list(zip(test_df["path"], test_df["global_label"], test_df["species_label"]))
 
 # ==========================================
@@ -613,7 +584,7 @@ def evaluate_metrics_worker(ckpt_path, feats_np, labels_np, species_preds_np,kno
     r1, r5, r10, map_val, baks, baus = compute_reid_metrics(features, labels, known_classes, device='cpu', sim_thresh=0.4)
     #thesh, comp = compute_unsupervised_clustering(args,feats_np, species_preds_np)
     #ari, nmi, discovered_ids = compute_clustering_metrics(args, feats_np, labels_np, species_preds_np, sim_thresh = 0.8)
-    ari, nmi, discovered_ids = compute_clustering_metrics_leiden(args, feats_np, labels_np, species_preds_np, sim_thresh = 0.4)
+    ari, nmi, discovered_ids = compute_clustering_metrics_leiden(args, feats_np, labels_np, species_preds_np, sim_thresh = 0.5)
     #ari, nmi, discovered_ids =compute_best_clustering_metrics(args, feats_np, labels_np, species_preds_np)
     harmonic_score = np.sqrt(baks * baus)
 
@@ -661,19 +632,22 @@ def main(args):
     main_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"[{main_device.type.upper()}] Starting Asynchronous Pipeline...")
     
+    # 1. Output evaluation results to the main checkpoint_dir
     eval_out_dir = os.path.join(args.checkpoints_dir, "evaluation_results")
     csv_path = os.path.join(eval_out_dir, 'benchmark_stats.csv')
     os.makedirs(eval_out_dir, exist_ok=True)
     
     test_samples = get_test_samples(args)
-    #TODO _ is indiv id and species id!
     true_unique_ids = len(set(label for _, label, _ in test_samples))
     print(f"Evaluated Test Set Size: {len(test_samples)} images")
     print(f"--> TRUE Unique Identities in Test Set: {true_unique_ids}")
     
-    pth_files = glob.glob(os.path.join(args.checkpoints_dir, "*.pth"))
+    # 2. Point glob to the specific GNN subdirectory!
+    gnn_dir = os.path.join(args.checkpoints_dir, "gnn")
+    pth_files = glob.glob(os.path.join(gnn_dir, "*.pth"))
+    
     if not pth_files:
-        print(f"No .pth files found in {args.checkpoints_dir}")
+        print(f"No .pth files found in {gnn_dir}")
         return
 
     # Dictionary to hold pure raw NumPy arrays in RAM (Safe for Multiprocessing)

@@ -14,7 +14,8 @@
 *.jpg
 *.csv
 /checkpoints*/
-
+/old checkpoints*/
+/models/
 # Local test videos and outputs
 /test_vid/
 /output.mp4
@@ -26,3 +27,4 @@
 /tree.txt
 /tree.tx
 __temp_pipreqsnb_folder/
+/runs/*

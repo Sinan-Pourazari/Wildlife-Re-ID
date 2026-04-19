@@ -15,6 +15,11 @@ from PIL import ImageOps
 import numpy as np
 import gc
 import torchvision.transforms as T
+from rembg import remove, new_session
+import re
+import torchvision.transforms.functional as TF
+from PIL import Image
+
 
 class bcolors:
     HEADER = '\033[95m'
@@ -26,6 +31,17 @@ class bcolors:
     ENDC = '\033[0m'
     BOLD = '\033[1m'
     UNDERLINE = '\033[4m'
+from rembg import remove, new_session
+
+_WORKER_REMBG_SESSION = None
+
+
+def get_rembg_session():
+    """Loads the U2-Net session once per CPU worker to prevent RAM explosion."""
+    global _WORKER_REMBG_SESSION
+    if _WORKER_REMBG_SESSION is None:
+        _WORKER_REMBG_SESSION = new_session("u2net")
+    return _WORKER_REMBG_SESSION
 
 def _worker_generate_graph(task, root_dir, args):
     """Executes the heavy SLIC extraction on a single CPU core."""
@@ -106,42 +122,38 @@ def generate_augmented_metadata(train_df, target_K, save_dir):
     print(f"[ Pre-Flight ] Planned {len(augmented_rows)} new augmentations. Total graphs to verify: {len(fat_train_df)}.")
     return fat_csv_path
 
-import re
-import torchvision.transforms as T
 
 def process_for_lmdb(filename, root_dir, felz_scale, felz_sigma, min_size, num_bins, features, max_size, n_hops, cae_weights_path, cae_latent_dim):
-    # 1. Smart Routing: Is this a base graph or an augmented graph?
     is_aug = '_aug_' in filename
+    physical_filename = re.sub(r'_aug_\d+', '', filename) if is_aug else filename
     
-    if is_aug:
-        # Reconstruct the physical filename by stripping the virtual tag (e.g., tiger_aug_0.jpg -> tiger.jpg)
-        physical_filename = re.sub(r'_aug_\d+', '', filename)
-        img_path = os.path.join(root_dir, physical_filename)
-    else:
-        img_path = os.path.join(root_dir, filename)
-
-    # Load the physical image
+    # root_dir now safely points to RAW images
+    img_path = os.path.join(root_dir, physical_filename)
     img = Image.open(img_path).convert("RGB")
 
-    # 2. Apply Augmentations OR Standard Resize
+    # Pure image augmentations (no mask syncing needed anymore)
     if is_aug:
-        wildlife_augmenter = T.Compose([
-            T.RandomHorizontalFlip(p=0.5),
-            T.RandomResizedCrop(size=(max_size, max_size), scale=(0.8, 1.0), ratio=(0.9, 1.1)),
+        import random
+        if random.random() > 0.5:
+            img = TF.hflip(img)
+            
+        i, j, h, w = T.RandomResizedCrop.get_params(img, scale=(0.8, 1.0), ratio=(0.9, 1.1))
+        img = TF.resized_crop(img, i, j, h, w, size=[max_size, max_size], interpolation=Image.Resampling.LANCZOS)
+
+        color_augmenter = T.Compose([
             T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05),
             T.RandomApply([T.GaussianBlur(kernel_size=(5, 9), sigma=(0.1, 2.0))], p=0.3),
             T.RandomAutocontrast(p=0.2)
         ])
-        img = wildlife_augmenter(img)
+        img = color_augmenter(img)
     else:
         if max(img.size) > max_size:
             img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
             
-    # 3. Standard Graph Generation
-    mask = Image.new('L', img.size, color=255)
-
+    # Pass mask=None to the graph generator
     graph = image_to_superpixel_graph(
-        img, mask=np.array(mask), 
+        img, 
+        mask=None, 
         scale=felz_scale,        
         sigma=felz_sigma,        
         min_size=min_size,       

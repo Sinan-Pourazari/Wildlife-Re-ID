@@ -74,7 +74,7 @@ def pairwise_dist(x):
     dist = xx + xx.t() - 2.0 * (x @ x.t())
     return dist.clamp_min(0.0)
 
-def batch_topk_triplet_loss(embeddings, labels, margin=1.0, k_pos=1, k_neg=10):
+def batch_topk_triplet_loss(embeddings, labels, margin=1.0, k_pos=10, k_neg=10):
     """
     Functional implementation of Top-K Hard Triplet Loss.
     """
