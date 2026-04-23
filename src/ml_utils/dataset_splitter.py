@@ -13,7 +13,9 @@ def main(args):
 
     # 2. FILTER OUT COMPETITION TEST DATA
     # We only want images that actually have labels
+    comp_test_df = pd.DataFrame()
     if 'split' in df.columns:
+        comp_test_df = df[df['split'] == 'test'].copy()
         df = df[df['split'] == 'train'].reset_index(drop=True)
         print(f"--> Filtered strictly to 'train' split. Remaining: {len(df)}")
 
@@ -80,9 +82,19 @@ def main(args):
     test_df.to_csv(test_path, index=False)
     pd.concat([train_df, test_df], ignore_index=True).to_csv(pipeline_path, index=False)
 
+    # 7. Format and save the actual competition test set
+    if not comp_test_df.empty:
+        comp_test_df['global_label'] = -1
+        comp_test_df['contiguous_label'] = -1
+        comp_test_df['species_label'] = -1
+        comp_test_path = os.path.join(args.save_dir, "competition_test.csv")
+        comp_test_df.to_csv(comp_test_path, index=False)
+        print(f"Competition Test size: {len(comp_test_df)} images ready for submission.")
+
     print(f"\n[ Split Complete ]")
     print(f"Train size: {len(train_df)} images ({len(train_ids)} identities)")
     print(f"Test size:  {len(test_df)} images ({len(test_ids)} STRICTLY UNSEEN identities)")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
