@@ -6,24 +6,20 @@ from torch import nn
 from torch.utils.data import Dataset as TorchDataset
 import random
 import pandas as pd
-import tqdm
 from sklearn.neighbors import NearestNeighbors
 from sklearn.model_selection import train_test_split
 import embedding_clusterings as ec
 from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 from loss_mining_tools import batch_hard_triplet_loss, PKBatchSampler, batch_semi_hard_triplet_loss, batch_compactness_loss, batch_topk_triplet_loss, batch_topk_semi_hard_triplet_loss
-from PIL import Image
 from torch_geometric.loader import DataLoader
 from torch_geometric.data import Dataset as PyGDataset
-from gnn.gnn import image_to_superpixel_graph, GNNEncoder
+from gnn.gnn import  GNNEncoder
 import torch.nn.functional as F
-from dataloader import InMemoryGraphDataset, UniversalGraphDataset, generate_augmented_metadata
+from dataloader import UniversalGraphDataset, generate_augmented_metadata
 import numpy as np
-from sklearn.preprocessing import LabelEncoder
 import argparse
 from  pytorch_metric_learning.losses import ArcFaceLoss 
 from gnn.cae import train_and_save_cae
-from adabelief_pytorch import AdaBelief
 from torch.optim.lr_scheduler import StepLR, ReduceLROnPlateau
 import bitsandbytes as bnb
 #device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu" 
@@ -175,7 +171,7 @@ class ReIDModel(nn.Module):
     
     # --- Accept train_classes instead of label_encoder ---
     # TODO save relevant args parts
-    def save(self, args, epoch, optimizer, train_classes=None, species_classes = None):
+    def save(self, args, epoch, optimizer, arcface, train_classes=None, species_classes = None):
         """Saves weights, metadata, and hyperparameters with attribute safety."""
         # 1. Ensure the GNN subfolder exists
         gnn_save_dir = os.path.join(args.checkpoint_dir, "gnn")
@@ -205,6 +201,7 @@ class ReIDModel(nn.Module):
         # Prepare payload
         payload = {
             'model_state_dict': self.state_dict(),
+            'arcface_state_dict': arcface.state_dict(), 
             'hyperparameters': hyperparams,
             'optimizer_state_dict': optimizer.state_dict(), 
             'epoch': epoch,                                 
@@ -356,7 +353,7 @@ def train(loader, model, optimizer, num_epochs, arcface_loss, start_epoch=0, arg
 
         # Save Model Weights
         if i % 2 == 0:
-            _ = model.save(args, epoch=i, optimizer=optimizer, train_classes=train_classes, species_classes=species_classes)
+            _ = model.save(args, epoch=i, optimizer=optimizer, arcface=arcface_loss, train_classes=train_classes, species_classes=species_classes)
 
 
     # 4. GENERATE FINAL PLOT 
@@ -650,7 +647,7 @@ def main(args):
     
     arcface = ArcFaceLoss(num_classes=num_train_classes, embedding_size=512, margin=12, scale= 64).to(device)
     #optimizer = torch.optim.Adam(list(model.parameters()) + list(arcface.parameters()), lr=0.0001)
-    optimizer = bnb.optim.Adam8bit(list(model.parameters()) + list(arcface.parameters()), lr=0.01)
+    optimizer = bnb.optim.Adam8bit(list(model.parameters()) + list(arcface.parameters()), lr=0.001)
     #optimizer = AdaBelief(list(model.parameters()) + list(arcface.parameters()), lr=1e-3)
     #TODO try reduce on Plateau
     
@@ -669,14 +666,18 @@ def main(args):
             print(f"\n[ Resuming Training from: {args.resume} ]")
             checkpoint = torch.load(args.resume, map_location=device)
             
-            # 1. Load the full model weights (including classifier)
+            # 1. Load the full model weights
             model.load_state_dict(checkpoint['model_state_dict'])
             
-            # 2. Load the optimizer's momentum buffers
+            # 2. Load ArcFace weights (The missing piece!)
+            if 'arcface_state_dict' in checkpoint:
+                arcface.load_state_dict(checkpoint['arcface_state_dict'])
+            
+            # 3. Load the optimizer's momentum buffers
             if 'optimizer_state_dict' in checkpoint:
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                 
-            # 3. Set the starting epoch
+            # 4. Set the starting epoch
             if 'epoch' in checkpoint:
                 start_epoch = checkpoint['epoch'] + 1 # Start on the *next* epoch
                 

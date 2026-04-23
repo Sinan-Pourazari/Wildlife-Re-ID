@@ -30,24 +30,22 @@ def get_gpu_power_watts():
             return 0.0
     return 0.0
 
-# --- 1. SIMCLR DUAL-VIEW AUGMENTATION ---
-class ContrastiveTransform:
-    """Applies two different random augmentations to the same patch."""
+# --- RECONSTRUCTION AUGMENTATION ---
+class ReconstructionTransform:
+    """Standardizes patches for MSE reconstruction."""
     def __init__(self):
         self.transform = T.Compose([
             T.RandomHorizontalFlip(p=0.5),
-            T.RandomApply([T.ColorJitter(0.4, 0.4, 0.4, 0.1)], p=0.8),
-            T.RandomGrayscale(p=0.2),
-            T.RandomApply([T.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0))], p=0.5),
             T.ToTensor(),
+            # Normalization matches the cae_transform exactly in gnn.py
             T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
 
     def __call__(self, x):
-        return self.transform(x), self.transform(x)
+        return self.transform(x)
 
 def extract_patches_from_image(row_tuple, root_dir, img_size, args, patches_per_image):
-    """Worker function: Extracts raw crops. NO LABELS NEEDED!"""
+    """Worker function: Extracts raw crops. unsupervised version"""
     _, row = row_tuple 
     local_patches = []
     patch_size = 64 
@@ -83,7 +81,6 @@ def extract_patches_from_image(row_tuple, root_dir, img_size, args, patches_per_
                 continue
                 
             patch = img.crop((left, top, right, bottom))
-            # Return raw numpy array to survive joblib serialization easily
             local_patches.append(np.array(patch))
             patches_found += 1
             
@@ -98,10 +95,11 @@ def extract_patches_from_image(row_tuple, root_dir, img_size, args, patches_per_
     except Exception as e:
         return []
 
-# --- 2. CONTRASTIVE TEXTURE ENCODER ---
+# 2. CONVOLUTIONAL AUTOENCODER (CAE)
 class TextureEncoder(nn.Module):
     def __init__(self, latent_dim=32): 
         super().__init__()
+        # ================= ENCODER =================
         # 64x64 -> 32x32
         self.enc_conv1 = nn.Conv2d(3, 32, kernel_size=3, padding=1, stride=2)
         self.enc_bn1 = nn.BatchNorm2d(32)
@@ -118,15 +116,23 @@ class TextureEncoder(nn.Module):
         # Base Encoder (This is what the GNN uses)
         self.fc_enc = nn.Linear(256 * 4 * 4, latent_dim)
         
-        # Projection Head (Used ONLY for Contrastive Training)
-        self.projector = nn.Sequential(
-            nn.Linear(latent_dim, latent_dim),
-            nn.ReLU(),
-            nn.Linear(latent_dim, latent_dim)
-        )
+        # ================= DECODER =================
+        self.fc_dec = nn.Linear(latent_dim, 256 * 4 * 4)
+        
+        # 4x4 -> 8x8
+        self.dec_conv1 = nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1)
+        self.dec_bn1 = nn.BatchNorm2d(128)
+        # 8x8 -> 16x16
+        self.dec_conv2 = nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1)
+        self.dec_bn2 = nn.BatchNorm2d(64)
+        # 16x16 -> 32x32
+        self.dec_conv3 = nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1)
+        self.dec_bn3 = nn.BatchNorm2d(32)
+        # 32x32 -> 64x64
+        self.dec_conv4 = nn.ConvTranspose2d(32, 3, kernel_size=4, stride=2, padding=1)
 
     def encoder(self, x):
-        """The pure representation layer."""
+        """ representation layer called by gnn.py."""
         x = F.gelu(self.enc_bn1(self.enc_conv1(x)))
         x = F.gelu(self.enc_bn2(self.enc_conv2(x)))
         x = F.gelu(self.enc_bn3(self.enc_conv3(x)))
@@ -136,36 +142,26 @@ class TextureEncoder(nn.Module):
         return F.normalize(z, p=2, dim=1)
 
     def forward(self, x):
-        """Training pass goes through encoder AND projector."""
-        h = self.encoder(x)
-        z = self.projector(h)
-        return F.normalize(z, p=2, dim=1)
+        """Training pass goes through encoder and decoder."""
+        # Encode
+        z = self.encoder(x)
+        
+        # Decode
+        h = self.fc_dec(z)
+        h = h.view(h.size(0), 256, 4, 4)
+        h = F.gelu(self.dec_bn1(self.dec_conv1(h)))
+        h = F.gelu(self.dec_bn2(self.dec_conv2(h)))
+        h = F.gelu(self.dec_bn3(self.dec_conv3(h)))
+        
+        reconstruction = self.dec_conv4(h) 
+        
+        return reconstruction, z
 
-# --- 3. NT-Xent LOSS (Normalized Temperature-scaled Cross Entropy) ---
-def nt_xent_loss(z1, z2, temperature=0.1):
-    """Calculates contrastive loss between two augmented views of patches."""
-    batch_size = z1.size(0)
-    # Concatenate all views: [z1_1, ..., z1_B, z2_1, ..., z2_B]
-    z = torch.cat([z1, z2], dim=0) 
-    
-    # Cosine similarity matrix
-    sim_matrix = torch.exp(torch.mm(z, z.t()) / temperature)
-    
-    # Remove self-similarity from the diagonal
-    mask = ~torch.eye(2 * batch_size, dtype=torch.bool, device=z.device)
-    sim_matrix = sim_matrix.masked_select(mask).view(2 * batch_size, -1)
-    
-    # Calculate positives (the similarity between z1 and its corresponding z2)
-    positives = torch.exp(torch.sum(z1 * z2, dim=-1) / temperature)
-    positives = torch.cat([positives, positives], dim=0)
-    
-    loss = -torch.log(positives / sim_matrix.sum(dim=-1))
-    return loss.mean()
 
 class SuperpixelPatchDataset(TorchDataset):
     def __init__(self, args, df, root_dir, patches_per_image, n_jobs=-1):
         self.patches = []
-        self.transform = ContrastiveTransform()
+        self.transform = ReconstructionTransform()
         
         print("\n[CAE Phase] Extracting Texture Patches (Unsupervised/No Labels)...")
         sample_df = df.sample(min(12000, len(df)), random_state=42)
@@ -180,16 +176,15 @@ class SuperpixelPatchDataset(TorchDataset):
             if worker_patches:  
                 self.patches.extend(worker_patches)
                 
-        print(f"--> Extracted {len(self.patches)} raw patches for contrastive learning.")
+        print(f"--> Extracted {len(self.patches)} raw patches for autoencoder training.")
 
     def __len__(self):
         return len(self.patches)
 
     def __getitem__(self, idx):
-        # Convert numpy back to PIL and apply dual-transform
+        # Convert numpy back to PIL and apply single transform
         pil_img = Image.fromarray(self.patches[idx])
-        view_1, view_2 = self.transform(pil_img)
-        return view_1, view_2
+        return self.transform(pil_img)
 
 def train_and_save_cae(df, args, save_path, device):
     dataset = SuperpixelPatchDataset(
@@ -198,31 +193,30 @@ def train_and_save_cae(df, args, save_path, device):
     )
     
     import multiprocessing
-    # Use up to 8 CPU cores, but leave 2 free for the OS and GPU driver
     optimal_workers = max(1, min(14, multiprocessing.cpu_count() - 2))
-    print(f"\n--> Spawning {optimal_workers} background CPU workers for on-the-fly augmentation...")
+    print(f"\n--> Spawning {optimal_workers} background CPU workers for data loading...")
     
-    # Standard random batching with working-ahead capabilities
     loader = DataLoader(
         dataset, 
         batch_size=args.batch_size if hasattr(args, 'batch_size') else 256, 
         shuffle=True, 
         num_workers=optimal_workers, 
-        pin_memory=True,          # Pre-allocates page-locked memory for instant GPU transfer
-        persistent_workers=True,  # Keeps the CPU workers alive between epochs so they don't restart
+        pin_memory=True,          
+        persistent_workers=True,  
         drop_last=True
     )
     
     model = TextureEncoder(latent_dim=args.cae_latent_dim).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    criterion = nn.MSELoss() # Replacing NT-Xent with simple MSE
     
     metrics_csv_path = os.path.join(args.checkpoint_dir, "cae_training_metrics.csv")
-    headers = ["epoch", "contrastive_loss", "vram_mb", "gpu_util_percent", "power_watts"]
+    headers = ["epoch", "reconstruction_loss", "vram_mb", "gpu_util_percent", "power_watts"]
     with open(metrics_csv_path, 'w') as f:
         f.write(",".join(headers) + "\n")
 
     epochs = args.cae_epochs
-    print(f"\n[CAE Phase] Training Contrastive Texture Extractor for {epochs} epochs...")
+    print(f"\n[CAE Phase] Training Convolutional Autoencoder for {epochs} epochs...")
     
     best_loss = float('inf')
     patience = 10
@@ -232,14 +226,14 @@ def train_and_save_cae(df, args, save_path, device):
     for epoch in range(epochs):
         total_loss = 0
         
-        for view_1, view_2 in loader:
-            view_1, view_2 = view_1.to(device), view_2.to(device)
+        for view in loader:
+            view = view.to(device)
             
-            # Pass both views through encoder + projector
-            z1 = model(view_1)
-            z2 = model(view_2)
+            # Pass patch through network
+            reconstruction, _ = model(view)
             
-            loss = nt_xent_loss(z1, z2, temperature=0.1)
+            # Calculate MSE against the original view
+            loss = criterion(reconstruction, view)
             
             optimizer.zero_grad()
             loss.backward()
@@ -258,13 +252,14 @@ def train_and_save_cae(df, args, save_path, device):
                 pass
             power_watts = get_gpu_power_watts()
             
-        print(f"  Epoch {epoch+1}/{epochs} - Contrastive Loss: {epoch_loss:.4f} | VRAM: {vram_mb:.0f}MB | GPU: {gpu_util}%")
+        print(f"  Epoch {epoch+1}/{epochs} - Reconstruction Loss (MSE): {epoch_loss:.4f} | VRAM: {vram_mb:.0f}MB | GPU: {gpu_util}%")
         
         row_data = [epoch+1, epoch_loss, vram_mb, gpu_util, power_watts]
         with open(metrics_csv_path, 'a') as f:
             f.write(",".join(map(str, row_data)) + "\n")
         
-        if epoch_loss < best_loss - 0.005:
+        # Track loss and handle early stopping
+        if epoch_loss < best_loss - 0.0005:
             best_loss = epoch_loss
             patience_counter = 0
             best_model_state = {k: v.cpu() for k, v in model.state_dict().items()}
@@ -277,8 +272,6 @@ def train_and_save_cae(df, args, save_path, device):
     print(f"\n--> Saving best unsupervised weights to disk...")
     model.load_state_dict(best_model_state)
     
-    # Strip the projector before saving so it maps strictly to the base encoder
-    del model.projector 
     torch.save(model.state_dict(), save_path)
     
     try:
@@ -287,8 +280,8 @@ def train_and_save_cae(df, args, save_path, device):
         df_plot = pd.read_csv(metrics_csv_path)
         
         plt.figure(figsize=(10, 6))
-        plt.plot(df_plot['epoch'], df_plot['contrastive_loss'], label='NT-Xent Loss', color='blue', linewidth=2)
-        plt.title("CAE Contrastive Training", fontweight='bold')
+        plt.plot(df_plot['epoch'], df_plot['reconstruction_loss'], label='MSE Loss', color='blue', linewidth=2)
+        plt.title("CAE Reconstruction Training", fontweight='bold')
         plt.xlabel("Epoch")
         plt.ylabel("Loss")
         plt.legend()
@@ -321,15 +314,14 @@ if __name__ == "__main__":
     import pandas as pd
     import sys
 
-    parser = argparse.ArgumentParser(description="Train Contrastive Texture Encoder")
+    parser = argparse.ArgumentParser(description="Train Reconstruction Texture Encoder")
     
     parser.add_argument("--epochs", dest="cae_epochs", type=int, default=15)
     parser.add_argument("--latent_dim", dest="cae_latent_dim", type=int, default=32)
-    parser.add_argument("--margin", dest="cae_margin", type=float, default=0.5) 
     parser.add_argument("--batch_size", type=int, default=256) 
     parser.add_argument("--save_dir", type=str, default="models/cae")
     parser.add_argument("--checkpoint_dir", type=str, default=".", help="Where to save telemetry")
-    parser.add_argument("--model_name", type=str, default="texture_contrastive")
+    parser.add_argument("--model_name", type=str, default="texture_reconstruction")
     parser.add_argument("--root_dir", type=str, default="src/images/reid-10k")
     parser.add_argument("--csv_path", type=str, default="src/images/reid-10k/metadata.csv")
     parser.add_argument("--img_size", type=int, default=256)
@@ -341,7 +333,7 @@ if __name__ == "__main__":
     save_path = os.path.join(args.save_dir, f"{args.model_name}.pth")
 
     print(f"=========================================")
-    print(f" STARTING CONTRASTIVE CAE TRAINING")
+    print(f" STARTING RECONSTRUCTION CAE TRAINING")
     print(f" Target: {save_path}")
     print(f"=========================================")
 

@@ -15,7 +15,7 @@ from PIL import ImageOps
 import numpy as np
 import gc
 import torchvision.transforms as T
-from rembg import remove, new_session
+from rembg import new_session
 import re
 import torchvision.transforms.functional as TF
 from PIL import Image
@@ -43,47 +43,6 @@ def get_rembg_session():
         _WORKER_REMBG_SESSION = new_session("u2net")
     return _WORKER_REMBG_SESSION
 
-def _worker_generate_graph(task, root_dir, args):
-    """Executes the heavy SLIC extraction on a single CPU core."""
-    import torch
-    torch.set_num_threads(1) # CRITICAL: Prevents CPU thrashing in workers
-    
-    key = task['key']
-    img_path = os.path.join(root_dir, task['base_filename'])
-    img = Image.open(img_path).convert("RGB")
-    
-    if task['type'] == 'base':
-        if max(img.size) > args.img_size:
-            img.thumbnail((args.img_size, args.img_size), Image.Resampling.LANCZOS)
-        mask = Image.new('L', img.size, color=255)
-    else: # 'aug'
-        # Define the heavy pipeline inside the worker
-        wildlife_augmenter = T.Compose([
-            T.RandomHorizontalFlip(p=0.5),
-            T.RandomResizedCrop(size=(args.img_size, args.img_size), scale=(0.8, 1.0), ratio=(0.9, 1.1)),
-            T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05),
-            T.RandomApply([T.GaussianBlur(kernel_size=(5, 9), sigma=(0.1, 2.0))], p=0.3),
-            T.RandomAutocontrast(p=0.2)
-        ])
-        img = wildlife_augmenter(img)
-        mask = Image.new('L', img.size, color=255)
-        
-    graph = image_to_superpixel_graph(
-        img, 
-        scale=args.felz_scale, 
-        sigma=args.felz_sigma, 
-        min_size=args.felz_min_size, 
-        hog_bins=args.num_hog_bins, 
-        n_hops=args.n_hops,
-        mask=np.array(mask), 
-        features=args.features, 
-        cae_weights_path=args.cae_weights_path,
-        cae_latent_dim=args.cae_latent_dim
-    )
-    
-    buffer = io.BytesIO()
-    torch.save(graph, buffer)
-    return key, buffer.getvalue()
 
 def generate_augmented_metadata(train_df, target_K, save_dir):
     """
@@ -150,7 +109,7 @@ def process_for_lmdb(filename, root_dir, felz_scale, felz_sigma, min_size, num_b
         if max(img.size) > max_size:
             img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
             
-    # Pass mask=None to the graph generator
+    # Pass mask=None to the graph generator TODO remove deprecatd mask behaviour entirely
     graph = image_to_superpixel_graph(
         img, 
         mask=None, 
@@ -171,14 +130,13 @@ def process_for_lmdb(filename, root_dir, felz_scale, felz_sigma, min_size, num_b
     
 def process_single_image(filename, root_dir, cache_dir, n_segments, rebuild, max_size=1024):
     # --- 1. Identify Dataset Folder ---
-    # Assuming path is "images/DatasetName/..."
     parts = filename.split('/')
     dataset_name = parts[1] if len(parts) > 1 else "unknown"
     
     # Create the subfolder path
     cache_subdir = os.path.join(cache_dir, dataset_name)
     
-    # Create filename: seg300_imagename.pt
+    # Create filename
     safe_filename = os.path.basename(filename).rsplit('.', 1)[0] + ".pt"
     cache_path = os.path.join(cache_subdir, f"seg{n_segments}_{safe_filename}")
 
@@ -193,7 +151,7 @@ def process_single_image(filename, root_dir, cache_dir, n_segments, rebuild, max
         img = Image.open(img_path).convert("RGB")
 
         # Resize Mechanic
-        # Force every single image to be exactly 512x512
+        # Force every single image to be exactly as defined in args
         # 1. Resize while keeping aspect ratio, and pad the rest with black
         img = ImageOps.pad(img, (max_size, max_size), color=(0, 0, 0), method=Image.Resampling.LANCZOS)
 
@@ -204,126 +162,6 @@ def process_single_image(filename, root_dir, cache_dir, n_segments, rebuild, max
         return True
     except Exception as e:
         return f"Error {filename}: {str(e)}"
-    
-class TripletDataset(Dataset):
-    def __init__(self, base_dataset):
-        self.base_dataset = base_dataset
-        self.labels = [label for _, label in base_dataset.samples]
-
-        # build label → indices mapping
-        self.label_to_indices = {}
-        for idx, label in enumerate(self.labels):
-            self.label_to_indices.setdefault(label, []).append(idx)
-
-    def __getitem__(self, index):
-        # anchor
-        anchor_img, anchor_label = self.base_dataset[index]
-
-        # positive (same class, not same index)
-        pos_index = index
-        while pos_index == index:
-            pos_index = random.choice(self.label_to_indices[anchor_label])
-        positive_img, _ = self.base_dataset[pos_index]
-
-        # negative (different class)
-        neg_label = random.choice([l for l in self.label_to_indices if l != anchor_label])
-        neg_index = random.choice(self.label_to_indices[neg_label])
-        negative_img, _ = self.base_dataset[neg_index]
-
-        return anchor_img, positive_img, negative_img
-
-    def __len__(self):
-        return len(self.base_dataset)
-
-
-
-class TripletTrainDataset(Dataset):
-    def __init__(self, csv_path, img_dir, transform=None):
-        """
-        csv_path: path to training CSV with columns [animal_id, filename]
-        img_dir: folder where training images are stored
-        transform: torchvision transforms to apply to each image
-        """
-        self.df = pd.read_csv(csv_path)
-        self.img_dir = img_dir
-        self.transform = transform
-
-        # group file indices by animal_id
-        self.label_to_indices = {}
-        for idx, row in self.df.iterrows():
-            label = row["animal_id"]
-            self.label_to_indices.setdefault(label, []).append(idx)
-
-    def __getitem__(self, index):
-        # anchor
-        anchor_row = self.df.iloc[index]
-        anchor_path = os.path.join(self.img_dir, anchor_row["filename"])
-        anchor_img = cv.imread(anchor_path)
-        #anchor_img = Image.open(anchor_path).convert("RGB")
-        anchor_label = anchor_row["animal_id"]
-
-        if self.transform:
-            anchor_img = self.transform(anchor_img)
-            print(type(anchor_img))
-            print(anchor_img.shape)
-            print(anchor_img)
-
-        # positive (same label, different index)
-        pos_index = index
-        while pos_index == index:
-            pos_index = random.choice(self.label_to_indices[anchor_label])
-        pos_row = self.df.iloc[pos_index]
-        pos_path = os.path.join(self.img_dir, pos_row["filename"])
-
-        positive_img = cv.imread(pos_path)
-        #positive_img = Image.open(pos_path).convert("RGB")
-        if self.transform:
-            positive_img = self.transform(positive_img)
-
-        # negative (different label)
-        neg_label = random.choice([l for l in self.label_to_indices if l != anchor_label])
-        neg_index = random.choice(self.label_to_indices[neg_label])
-        neg_row = self.df.iloc[neg_index]
-        neg_path = os.path.join(self.img_dir, neg_row["filename"])
-        negative_img = cv.imread(neg_path)
-        #negative_img = Image.open(neg_path).convert("RGB")
-        if self.transform:
-            negative_img = self.transform(negative_img)
-        #print(type(anchor_img))
-        return anchor_img, positive_img, negative_img
-
-    def __len__(self):
-        return len(self.df)
-
-
-class TestDataset(Dataset):
-    def __init__(self, csv_path, img_dir, transform=None):
-        """
-        csv_path: path to test CSV with single column [filename]
-        img_dir: folder where test images are stored
-        transform: torchvision transforms to apply to each image
-        """
-        self.df = pd.read_csv(csv_path)
-        self.img_dir = img_dir
-        self.transform = transform
-
-    def __getitem__(self, index):
-        row = self.df.iloc[index]
-        animal_id = row["animal_id"]
-        img_path = os.path.join(self.img_dir, row["filename"])
-        img = Image.open(img_path).convert("RGB")
-        if self.transform:
-            img = self.transform(img)
-
-        # animal_id = row number + 1 (1-based indexing)
-
-        label = animal_id
-        return img, label
-
-    def __len__(self):
-        return len(self.df)
-    
-
 
 class InMemoryGraphDataset(PyGDataset):
     def __init__(self, samples, root_dir, cache_dir, n_segments=64):

@@ -24,7 +24,7 @@ set SHARED_CAE_DIR=models\cae
 
 set IMG_SIZE=256
 set CAE_LATENT_DIM=24
-set CAE_EPOCHS=600
+set CAE_EPOCHS=75
 set FELZ_SCALE=70.0
 set FELZ_SIGMA=0.65
 set FELZ_MIN_SIZE=300
@@ -32,24 +32,23 @@ set NUM_HOG_BINS=9
 set N_HOPS=1
 set EDGE_STRATEGY=hybrid
 set DATASETS=
-set TRAIN_EPOCHS=1000
+set TRAIN_EPOCHS=600
 
 :: ========================================================
 :: NEW DYNAMIC CHECKPOINT NAMING SYSTEM
 :: ========================================================
-:: 1. Get a reliable, locale-independent timestamp (YYYYMMDD_HHMMSS)
-for /f "tokens=2 delims==" %%I in ('wmic os get localdatetime /value') do set datetime=%%I
-set RUN_TIMESTAMP=!datetime:~0,8!_!datetime:~8,6!
+:: Manually update this ID for each new experiment
+set RUN_ID=run_008
 
 set EXPERIMENT_TAG=animal_clef_2026_baseline
-set CHECKPOINT_DIR=runs\!RUN_TIMESTAMP!_!EXPERIMENT_TAG!
+set CHECKPOINT_DIR=runs\!RUN_ID!_!EXPERIMENT_TAG!
 
 :: Safe formatting for CAE names
 set SAFE_SCALE=%FELZ_SCALE:.=p%
 set SAFE_SIGMA=%FELZ_SIGMA:.=p%
 set CAE_NAME=cae_dim%CAE_LATENT_DIM%_size%IMG_SIZE%_scale%SAFE_SCALE%_sigma%SAFE_SIGMA%_clef
 
-:: [NEW] Point the weights path to the persistent shared directory
+:: Point the weights path to the persistent shared directory
 set CAE_WEIGHTS_PATH=%SHARED_CAE_DIR%\%CAE_NAME%.pth
 
 :: Define CSV paths inside the new directory
@@ -126,6 +125,25 @@ echo.
 :: ========================================================
 echo %FOX_ORANGE%STEP 3: Building LMDB Cache and Training GNN%RESET%
 :: ========================================================
+
+:: ---  RESUME LOGIC ---
+set "RESUME_ARG="
+set "LATEST_CHECKPOINT="
+if exist "!CHECKPOINT_DIR!\gnn\*.pth" (
+    :: Sorts files by date (/o-d) and grabs the first one it sees (the newest)
+    for /f "delims=" %%I in ('dir "!CHECKPOINT_DIR!\gnn\*.pth" /b /o-d 2^>nul') do (
+        set "LATEST_CHECKPOINT=%%I"
+        goto :found_ckpt
+    )
+)
+:found_ckpt
+if defined LATEST_CHECKPOINT (
+    echo %SUCCESS_LIME%[INFO] Found existing checkpoint: !LATEST_CHECKPOINT!. Resuming training...%RESET%
+    set "RESUME_ARG=--resume "!CHECKPOINT_DIR!\gnn\!LATEST_CHECKPOINT!""
+) else (
+    echo %FOX_WHITE%[INFO] No existing checkpoints found. Starting GNN training from scratch...%RESET%
+)
+
 echo %FOX_ORANGE%[TRAIN] Initiating GNN Training sequence...%RESET%
 python .\src\ml_utils\train_test_prototype.py ^
     --root_dir %RAW_DIR% ^
@@ -144,7 +162,8 @@ python .\src\ml_utils\train_test_prototype.py ^
     --cae_weights_path "%CAE_WEIGHTS_PATH%" ^
     --cae_version %CAE_NAME% ^
     --cae_latent_dim %CAE_LATENT_DIM% ^
-    --edge_strategy %EDGE_STRATEGY% 
+    --edge_strategy %EDGE_STRATEGY% ^
+    !RESUME_ARG!
 
 if !errorlevel! neq 0 (
     echo %DANGER_RED%[ERROR] GNN Training failed. Aborting pipeline.%RESET%

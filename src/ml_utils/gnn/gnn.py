@@ -11,13 +11,12 @@ import torch.nn.functional as F
 from torch_geometric.data import Data
 from torch_geometric.nn import GATv2Conv, global_mean_pool, global_max_pool, knn_graph, SAGEConv
 from PIL import Image
-from helper import per_pixel_hog_bins # Make sure this import is still correct for your project!
+from helper import per_pixel_hog_bins
 from gnn.cae import TextureEncoder
 from torchvision import transforms
 from skimage.measure import regionprops
 import math
 from torch_geometric.utils import dropout_edge, dropout_node, subgraph
-import os
 
 def image_to_superpixel_graph(img, scale, sigma, min_size, hog_bins, mask=None , hog_signed=False, hog_l2norm=True, features=['color', 'pos', 'hog'], n_hops=1, cae_weights_path=None, cae_latent_dim=64, return_segments=False):   
     if isinstance(img, Image.Image):
@@ -25,14 +24,14 @@ def image_to_superpixel_graph(img, scale, sigma, min_size, hog_bins, mask=None ,
     
     h, w, _ = img.shape
 
-    # --- 1. Standard felzenszwalb ---
+    #  felzenszwalb 
     segments = felzenszwalb(img, scale=scale, sigma=sigma, min_size=min_size)
     num_nodes = segments.max() + 1
     seg_flat = torch.tensor(segments, dtype=torch.long).view(-1)
     
     x_list = []
 
-    # --- CAE SETUP ---
+    # CAE SETUP 
     if 'cae' in features:
         if cae_weights_path is None:
             raise ValueError("Requested 'cae' features but no cae_weights_path provided!")
@@ -46,9 +45,8 @@ def image_to_superpixel_graph(img, scale, sigma, min_size, hog_bins, mask=None ,
         ])
 
     # ==========================================
-    # --- GRAPH PRUNING (Mask Evaluation) ---
+    # --- GRAPH PRUNING (Mask Evaluation DEPRECATED DO NOT USE) ---
     # ==========================================
-    # Calculate this FIRST so we know which nodes to skip in the heavy loop
     if mask is not None:
         mask_flat = torch.tensor(mask, dtype=torch.float).view(-1)
         node_counts = torch.bincount(seg_flat, minlength=num_nodes).float()
@@ -81,7 +79,7 @@ def image_to_superpixel_graph(img, scale, sigma, min_size, hog_bins, mask=None ,
         colors, positions, hogs, cae_features, shape_features = [], [], [], [], []
 
         for sp in range(num_nodes):
-            # SKIP THE HEAVY MATH IF IT IS BACKGROUND
+            # SKIP THE MATH IF IT IS BACKGROUND
             if not is_valid_node[sp]:
                 # Just append dummy zeros to keep the list lengths intact
                 if 'color' in features: colors.append([0, 0, 0])
@@ -152,7 +150,7 @@ def image_to_superpixel_graph(img, scale, sigma, min_size, hog_bins, mask=None ,
             x_shape = F.normalize(x_shape, p=2, dim=0) 
             x_list.append(x_shape)
 
-    # --- 3. Local Binary Patterns (LBP) Histogram ---
+    # Local Binary Patterns (LBP) Histogram 
     if 'lbp' in features:
         gray = (rgb2gray(img) * 255).astype(np.uint8)
         lbp = local_binary_pattern(gray, P=8, R=1.0, method='uniform')
@@ -163,7 +161,7 @@ def image_to_superpixel_graph(img, scale, sigma, min_size, hog_bins, mask=None ,
         x_lbp = F.normalize(x_lbp, p=1, dim=1) 
         x_list.append(x_lbp)
 
-    # --- 4. Local Entropy ---
+    # Local Entropy 
     if 'texture' in features:
         gray_uint8 = (rgb2gray(img) * 255).astype(np.uint8)
         ent = entropy(gray_uint8, disk(3))
@@ -182,7 +180,7 @@ def image_to_superpixel_graph(img, scale, sigma, min_size, hog_bins, mask=None ,
     old_to_new_ids = torch.full((num_nodes,), -1, dtype=torch.long)
     old_to_new_ids[is_valid_node] = torch.arange(x_pruned.size(0))
 
-    # --- Build Pruned Edges ---
+    #  Build Pruned Edges 
     edges = set()
     for y in range(h - 1):
         for x_ in range(w - 1):
@@ -306,15 +304,13 @@ class GNNEncoder(nn.Module):
             # Generate Attention Edges
             queries_keys = self.edge_proj(x)
             semantic_edge_index = knn_graph(x=queries_keys, k=self.k_neighbors, batch=batch, loop=False, cosine=True)
-            #source_nodes = queries_keys[semantic_edge_index[0]]
-            #target_nodes = queries_keys[semantic_edge_index[1]]
-            #sim_scores = F.cosine_similarity(source_nodes, target_nodes, dim=1)
+
             if self.edge_strategy == "attention":
                 # Pure semantic approach (ignores physical layout)
                 final_edge_index = semantic_edge_index
 
             elif self.edge_strategy == "hybrid":
-                # Best of both worlds: Anatomy + Texture Matching
+                # Anatomy + Texture Matching
                 final_edge_index = torch.cat([spatial_edge_index, semantic_edge_index], dim=1)
 
        # Graph argumentations
@@ -344,7 +340,7 @@ class GNNEncoder(nn.Module):
         x3 = self.norm3(F.elu(self.conv3(x2, final_edge_index)))
         x3 = F.softplus(x3)
 
-        # --- 4. dynamic jumping knowledge (like attention) ---
+        # dynamic jumping knowledge (like attention) 
         #reshape to [Num_Nodes, 3, 512]
         x_stacked = torch.stack([x1, x2, x3], dim=1)
         scores = self.layer_scorer(x_stacked)
@@ -354,12 +350,10 @@ class GNNEncoder(nn.Module):
 
         # Multiply and sum to get the final custom blend per node
         x_dynamic = (x_stacked * score_weights).sum(dim=1)
+
         # Pooling
-        #pooled_mean = global_mean_pool(x, batch) 
-        #pooled_max = global_max_pool(x, batch)   
         pooled = self.gem_pool(x_dynamic, batch)
-        return pooled#, saliency_scores
-        #return torch.cat([pooled_mean, pooled_max], dim=1)
+        return pooled
 
     def apply_modality_dropout(self, x, p):
         """
@@ -370,7 +364,7 @@ class GNNEncoder(nn.Module):
             return x
 
         x_dropped = x.clone()
-        num_nodes = x.size(0) # Fixed typo 'sizze'
+        num_nodes = x.size(0) 
 
         # 1. Define the sizes of each block
         feature_block_sizes = {
@@ -385,7 +379,7 @@ class GNNEncoder(nn.Module):
         # Dynamically pull the CAE size  if it exists, otherwise default to 16
         feature_block_sizes['cae'] = self.cae_latent_dim
 
-        # 2. STRICT order they are appended in image_to_superpixel_graph
+        # 2. strict order they are appended in image_to_superpixel_graph
         extraction_order = ['color', 'pos', 'hog', 'cae', 'shape', 'lbp', 'texture']
         
         feature_blocks = {}

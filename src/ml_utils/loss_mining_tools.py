@@ -53,7 +53,7 @@ class PKBatchSampler(Sampler):
             batch = []
             for y in chosen:
                 idxs = self.label_to_indices[y]
-                # sample K examples per identity (with replacement if needed)
+                # sample K examples per identity (with replacement if needed if k is unsatisfiable naturally)
                 if len(idxs) >= self.K:
                     batch.extend(random.sample(idxs, self.K))
                 else:
@@ -62,7 +62,7 @@ class PKBatchSampler(Sampler):
             yield batch
             
     def __len__(self):
-        # rough epoch length; you can tune this
+        # rough epoch length; 
         n = len(self.labels)
         b = self.P * self.K
         return n // b if self.drop_last else (n + b - 1) // b
