@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from dataloader import UniversalGraphDataset, generate_augmented_metadata
 import numpy as np
 import argparse
-from  pytorch_metric_learning.losses import ArcFaceLoss 
+from  pytorch_metric_learning.losses import ArcFaceLoss, SupConLoss
 from gnn.cae import train_and_save_cae
 from torch.optim.lr_scheduler import StepLR, ReduceLROnPlateau
 import bitsandbytes as bnb
@@ -138,35 +138,30 @@ class ReIDModel(nn.Module):
         self.bottleneck = nn.BatchNorm1d(emb_dim)
         self.bottleneck.bias.requires_grad_(False) # No bias shift
 
-        # ID Classification head (Used ONLY during training for CE loss)
-        #self.classifier = nn.Linear(emb_dim, num_classes)
-
-        # Species Classification head
-        self.species_classifier = nn.Linear(emb_dim, num_species)
+        self.macro_proj = nn.Sequential(
+            nn.Linear(emb_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 128)
+        )
 
     def forward(self, data):
         # 1. Extract graph-level features
         z = self.encoder(data) 
         
-        # 2. Project to Re-ID embedding space
+        # 2. Project to Re-ID embedding space (Primary Embeddings)
         features = self.head(z)
         bn_features = self.bottleneck(features)
-        # 3. L2 Normalize for Cosine Similarity / Metric Learning
         embeddings = F.normalize(bn_features, p=2, dim=1)
 
         if self.training:
-            # Return both for the dual-loss training loop
-            #logits = self.classifier(features) # Use un-normalized features for CE
-            if self.species_classifier is not None:
-                species_logits = self.species_classifier(features)
-                return embeddings,  species_logits ,features
+            # 3. Project to Macro space (Only during training for SupCon!)
+            macro_features = self.macro_proj(bn_features)
+            macro_embeddings = F.normalize(macro_features, p=2, dim=1)
             
-            return embeddings
-        
-        elif self.species_classifier is not None:
-            species_logits = self.species_classifier(features)
-            return embeddings, species_logits
-
+            # Return primary embeddings, the projected macro embeddings, and raw features
+            return embeddings, macro_embeddings, features
+            
         return embeddings
     
     # --- Accept train_classes instead of label_encoder ---
@@ -251,40 +246,32 @@ class ReIDModel(nn.Module):
         
         return model, checkpoint.get('label_encoder_classes')
 
-def train_one_epoch(loader, model, arcface_loss, scaler, optimizer, margin=1.0):
+def train_one_epoch(loader, model, arcface_loss, supcon_loss, scaler, optimizer, margin=1.0):
     model.train()
     total = 0.0
-    total_triplet = 0.0
-    total_ce = 0.0
-    total_scorer = 0.0
-    total_species = 0.0
-    criterion_ce = nn.CrossEntropyLoss(label_smoothing =0.001)
-    scorer_weight = 0.05 # TODO Adjust this if it deletes too much or too little
+    total_triplet, total_ce, total_scorer, total_species = 0.0, 0.0, 0.0, 0.0
 
     for data in loader:
         data = data.to(device)
-        optimizer.zero_grad(set_to_none = True)
+        optimizer.zero_grad(set_to_none=True)
 
-        # reshape(-1, 2) ensures it splits the pairs correctly, then we separate them
         y_stacked = data.y.view(-1, 2).to(device) 
         labels = y_stacked[:, 0]          # Identity labels
-        species_labels = y_stacked[:, 1]  # Species labels
-        with torch.amp.autocast(device_type="cuda"):
-            # Unpack the two outputs
-            emb, species_logits, features = model(data)
-
-            # Calculate losses
-            #loss_triplet = batch_hard_triplet_loss(emb, labels, margin=margin)
-            loss_triplet = batch_topk_semi_hard_triplet_loss(features, labels, margin=margin, k_neg=8)
-            #TODO add args to change betwen arcface and cross entorpy
-            loss_arc = 0.2 * arcface_loss(emb,labels)
-            loss_ce_species = 1 * criterion_ce(species_logits, species_labels)
-            
-            # Combined Loss
-            loss = loss_triplet + loss_arc + loss_ce_species
-            
-
+        species_labels = y_stacked[:, 1]  # Species/Orientation labels
         
+        with torch.amp.autocast(device_type="cuda"):
+            # Unpack the NEW outputs
+            emb, macro_emb, features = model(data)
+
+            # 1. Micro Identity Loss
+            loss_triplet = batch_topk_semi_hard_triplet_loss(features, labels, margin=margin, k_neg=8)
+            loss_arc = 0.2 * arcface_loss(emb, labels)
+            
+            # 2. Macro Scaffolding Loss (SupCon) using the projected embeddings!
+            loss_supcon = 1.0 * supcon_loss(macro_emb, species_labels)
+            
+            loss = loss_triplet + loss_arc + loss_supcon
+            
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
@@ -292,10 +279,9 @@ def train_one_epoch(loader, model, arcface_loss, scaler, optimizer, margin=1.0):
         total += float(loss.item())
         total_triplet += loss_triplet.item()
         total_ce += loss_arc.item()
-        #total_scorer += loss_scorer.item()
-        total_species += loss_ce_species.item()
+        total_species += loss_supcon.item()
 
-    return total / len(loader), total_triplet / len(loader), total_ce / len(loader), total_scorer / len(loader), total_species / len(loader)
+    return total / len(loader), total_triplet / len(loader), total_ce / len(loader), 0.0, total_species / len(loader)
 
 
 def train(loader, model, optimizer, num_epochs, arcface_loss, start_epoch=0, args=None, train_classes=None, species_classes=None, scheduler=None):
@@ -304,6 +290,9 @@ def train(loader, model, optimizer, num_epochs, arcface_loss, start_epoch=0, arg
     # 1. SETUP TRACKING
     metrics_csv_path = os.path.join(args.checkpoint_dir, "training_metrics.csv")
     headers = ["epoch", "total_batchloss", "triplet_loss", "arcface_loss", "compactness_loss", "species_ce_loss", "vram_mb", "gpu_util_percent", "power_watts", "learning_rate"]
+    
+    # Temperature controls how tightly it packs the macro-clusters (0.1 is standard)
+    supcon_loss = SupConLoss(temperature=0.1).to(device)
 
     # If starting fresh, or the file doesn't exist, write the CSV headers
     if start_epoch == 0 or not os.path.exists(metrics_csv_path):
@@ -315,7 +304,7 @@ def train(loader, model, optimizer, num_epochs, arcface_loss, start_epoch=0, arg
     for i in range(start_epoch, num_epochs):
 
         # Run the training epoch
-        total_batchloss, triplet, ce, compact, species = train_one_epoch(loader, model, arcface_loss, scaler, optimizer, margin=1)
+        total_batchloss, triplet, ce, compact, species = train_one_epoch(loader, model, arcface_loss, supcon_loss, scaler, optimizer, margin=1,)
         
         # 2. QUERY HARDWARE UTILIZATION
         vram_mb = 0.0
@@ -645,7 +634,7 @@ def main(args):
     model = ReIDModel(num_classes=num_train_classes, num_species= num_species,in_dim=dynamic_in_dim, hidden_dim=512, gnn_out_dim=256, emb_dim=512, 
                       use_hybrid_pooling = False, edge_strategy=args.edge_strategy,k_neighbors=args.k_neighbors, features=args.features, cae_latent_dim=args.cae_latent_dim, num_hog_bins= args.num_hog_bins).to(device)
     
-    arcface = ArcFaceLoss(num_classes=num_train_classes, embedding_size=512, margin=12, scale= 64).to(device)
+    arcface = ArcFaceLoss(num_classes=num_train_classes, embedding_size=512, margin=args.margin_arc, scale= 64).to(device)
     #optimizer = torch.optim.Adam(list(model.parameters()) + list(arcface.parameters()), lr=0.0001)
     optimizer = bnb.optim.Adam8bit(list(model.parameters()) + list(arcface.parameters()), lr=0.001)
     #optimizer = AdaBelief(list(model.parameters()) + list(arcface.parameters()), lr=1e-3)
@@ -749,7 +738,7 @@ if __name__ == "__main__":
     parser.add_argument("--root_dir", type=str, default="src/images/reid-10k", help="Base directory for images")
     parser.add_argument("--csv_path", type=str, default="src/images/reid-10k/metadata.csv", help="Path to metadata CSV")
     parser.add_argument("--cache_dir", type=str, default="src/images/reid-10k/graph_cache_pool", help="Cache directory for graphs")
-
+    parser.add_argument("--margin_arc", type=float, default =12.0)
     args = parser.parse_args()
 
     main(args)

@@ -35,18 +35,69 @@ from torch_geometric.loader import DataLoader
 # =====================================================================
 def get_test_samples(args):
     test_df = pd.read_csv(args.csv_path, low_memory=False)
+    print(f"--> Initial CSV loaded. Total rows: {len(test_df)}")
 
-    if args.eval_filter_species:
-        test_df = test_df[test_df['species'] == args.eval_filter_species].reset_index(drop=True)
-        if len(test_df) == 0:
-            raise ValueError(f"No images found for species '{args.eval_filter_species}'!")
+    # 1. Filter by Dataset Name
+    if args.holdout_dataset:
+        if 'dataset' in test_df.columns:
+            # Strip whitespace and make lowercase for safe comparison
+            safe_target = args.holdout_dataset.strip().lower()
+            test_df['dataset_safe'] = test_df['dataset'].astype(str).str.strip().str.lower()
             
+            test_df = test_df[test_df['dataset_safe'] == safe_target].reset_index(drop=True)
+            print(f"--> After --holdout_dataset '{args.holdout_dataset}': {len(test_df)} rows remain.")
+            
+            if len(test_df) == 0:
+                # Print the actual datasets available to help debug!
+                unique_ds = pd.read_csv(args.csv_path, low_memory=False)['dataset'].dropna().unique()
+                raise ValueError(f"No images found for dataset '{args.holdout_dataset}'. Available datasets in CSV: {unique_ds}")
+        else:
+            print(f"--> WARNING: 'dataset' column not found.")
+
+    # 2. Filter by Species
+    if args.holdout_species:
+        if 'species' in test_df.columns:
+            safe_target = args.holdout_species.strip().lower()
+            test_df['species_safe'] = test_df['species'].astype(str).str.strip().str.lower()
+            test_df = test_df[test_df['species_safe'] == safe_target].reset_index(drop=True)
+            print(f"--> After --holdout_species '{args.holdout_species}': {len(test_df)} rows remain.")
+        else:
+            print(f"--> WARNING: 'species' column not found.")
+
+    # 3. Standardize Identity Column & Clean Data
+    if 'identity' not in test_df.columns and 'animal_id' in test_df.columns:
+        test_df['identity'] = test_df['animal_id'].astype(str)
+        
+    test_df = test_df[test_df['identity'] != 'unknown'].dropna(subset=['identity']).reset_index(drop=True)
+    print(f"--> After dropping 'unknown' or missing identities: {len(test_df)} rows remain.")
+
+    if len(test_df) == 0:
+        raise ValueError("All images were dropped because their identity was 'unknown' or missing.")
+
+    # 4. Filter out singletons (Re-ID metrics require at least 2 images per ID)
+    counts = test_df['identity'].value_counts()
+    keep_ids = counts[counts > 1].index
+    test_df = test_df[test_df['identity'].isin(keep_ids)].reset_index(drop=True)
+    print(f"--> After dropping singleton identities (IDs with only 1 image): {len(test_df)} rows remain.")
+
+    if len(test_df) == 0:
+        raise ValueError("All images were dropped because every identity only had 1 image (singletons). Re-ID evaluation requires >= 2 images per identity!")
+
+    # 5. Generate integer labels required by PyG DataLoader
+    from sklearn.preprocessing import LabelEncoder
+    test_df['global_label'] = LabelEncoder().fit_transform(test_df['identity'])
+        
+    if 'species' in test_df.columns:
+        test_df['species_label'] = LabelEncoder().fit_transform(test_df['species'].astype(str))
+    else:
+        test_df['species_label'] = 0
+
+    # 6. Optional: Cap Max Images
     if hasattr(args, 'max_images_per_id') and args.max_images_per_id is not None:
-        group_col = 'global_label' if 'global_label' in test_df.columns else 'identity'
-        test_df = test_df.groupby(group_col, group_keys=False).apply(
+        test_df = test_df.groupby('global_label', group_keys=False).apply(
             lambda x: x.sample(min(len(x), args.max_images_per_id), random_state=42)
         ).reset_index(drop=True)
-        print(f"Downsampled test set to max {args.max_images_per_id} images per identity.")
+        print(f"--> Downsampled test set to max {args.max_images_per_id} images per identity. Final size: {len(test_df)}")
 
     return test_df
 
@@ -176,9 +227,9 @@ def predict_clusters_leiden(embeddings, species_preds, sim_thresh=0.50, k1=10, l
     
     sim_matrix = k_reciprocal_rerank(sim_matrix, k1=k1, lambda_value=lambda_val)
     
-    species_preds_t = torch.tensor(species_preds)
-    cross_species_mask = species_preds_t.unsqueeze(1) != species_preds_t.unsqueeze(0)
-    sim_matrix[cross_species_mask] = -1.0 
+    #species_preds_t = torch.tensor(species_preds)
+    #cross_species_mask = species_preds_t.unsqueeze(1) != species_preds_t.unsqueeze(0)
+    #sim_matrix[cross_species_mask] = -1.0 
     
     sim_matrix_np = sim_matrix.numpy()
     sources, targets = np.where(sim_matrix_np > sim_thresh)
@@ -441,8 +492,10 @@ def generate_submission_csv(image_ids, predicted_ids, species_preds, species_idx
 def main(args):
     main_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"[{main_device.type.upper()}] Starting Asynchronous Pipeline...")
-    
-    eval_out_dir = os.path.join(args.checkpoints_dir, "evaluation_results")
+    if args.holdout_dataset != None:
+        eval_out_dir = os.path.join(args.checkpoints_dir, "evaluation_results_dataset_holdout")
+    else:
+        eval_out_dir = os.path.join(args.checkpoints_dir, "evaluation_results")
     csv_path = os.path.join(eval_out_dir, 'benchmark_stats.csv')
     os.makedirs(eval_out_dir, exist_ok=True)
     
