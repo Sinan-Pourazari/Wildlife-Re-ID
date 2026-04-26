@@ -621,7 +621,7 @@ def main(args):
         )"""
     # DataLoaders
     batch_sampler = PKBatchSampler(aug_train_df["global_label"].values, P=45, K=8)
-    train_loader = DataLoader(train_dataset, batch_sampler=batch_sampler, num_workers=args.workers, persistent_workers=False, prefetch_factor=None, pin_memory= True)
+    train_loader = DataLoader(train_dataset, batch_sampler=batch_sampler, num_workers=args.workers, persistent_workers=True, prefetch_factor=8, pin_memory= True)
     #test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=args.workers)
 
     # Model & Optimizer
@@ -664,7 +664,13 @@ def main(args):
             
             # 1. Load the full model weights
             model.load_state_dict(checkpoint['model_state_dict'])
+
+            # 4. Set the starting epoch
             
+            if 'epoch' in checkpoint:
+                start_epoch = checkpoint['epoch'] + 1 # Start on the *next* epoch
+                if start_epoch >= args.epochs:
+                    return
             # 2. Load ArcFace weights (The missing piece!)
             if 'arcface_state_dict' in checkpoint:
                 arcface.load_state_dict(checkpoint['arcface_state_dict'])
@@ -673,9 +679,7 @@ def main(args):
             if 'optimizer_state_dict' in checkpoint:
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                 
-            # 4. Set the starting epoch
-            if 'epoch' in checkpoint:
-                start_epoch = checkpoint['epoch'] + 1 # Start on the *next* epoch
+            
                 
             print(f"--> Successfully loaded. Resuming at Epoch {start_epoch}...")
         else:

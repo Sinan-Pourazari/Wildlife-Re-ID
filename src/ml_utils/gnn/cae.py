@@ -164,7 +164,7 @@ class SuperpixelPatchDataset(TorchDataset):
         self.transform = ReconstructionTransform()
         
         print("\n[CAE Phase] Extracting Texture Patches (Unsupervised/No Labels)...")
-        sample_df = df.sample(min(12000, len(df)), random_state=42)
+        sample_df = df.sample(min(8000, len(df)), random_state=42)
 
         results_gen = Parallel(n_jobs=n_jobs, return_as="generator")(
             delayed(extract_patches_from_image)(
@@ -189,7 +189,7 @@ class SuperpixelPatchDataset(TorchDataset):
 def train_and_save_cae(df, args, save_path, device):
     dataset = SuperpixelPatchDataset(
         args, df, root_dir=args.root_dir, 
-        patches_per_image=25, n_jobs=-1
+        patches_per_image=10, n_jobs=-1
     )
     
     import multiprocessing

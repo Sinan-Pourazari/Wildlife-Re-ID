@@ -40,7 +40,7 @@ set CSV_PATH=C:\Users\sinan\Projects\Wildlife-Re-ID\src\images\reid-10k\metadata
 set SHARED_CAE_DIR=models\cae
 
 set IMG_SIZE=256
-set CAE_LATENT_DIM=64
+set CAE_LATENT_DIM=32
 set CAE_EPOCHS=150
 set FELZ_SCALE=70.0
 set FELZ_SIGMA=0.65
@@ -57,7 +57,7 @@ set DATASETS=LynxID2025 SalamanderID2025 SeaTurtleID2022 AmvrakikosTurtles ATRW 
 :: NEW DYNAMIC CHECKPOINT NAMING SYSTEM
 :: ========================================================
 :: Manually update this ID for each new experiment
-set RUN_ID=run_020
+set RUN_ID=run_021
 
 set EXPERIMENT_TAG=animal_clef_2026_baseline
 set CHECKPOINT_DIR=runs\!RUN_ID!_!EXPERIMENT_TAG!
@@ -188,7 +188,7 @@ echo %FOX_ORANGE%[TRAIN] Initiating GNN Training sequence...%RESET%
 python .\src\ml_utils\train_test_prototype.py ^
     --root_dir %RAW_DIR% ^
     --csv_path %TRAIN_CSV% ^
-    --workers 0 ^
+    --workers 8 ^
     --img_size %IMG_SIZE% ^
     --felz_scale %FELZ_SCALE% ^
     --felz_sigma %FELZ_SIGMA% ^

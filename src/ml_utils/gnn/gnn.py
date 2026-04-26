@@ -114,7 +114,18 @@ def image_to_superpixel_graph(img, scale, sigma, min_size, hog_bins, mask=None ,
             if 'cae' in features:
                 ymin, ymax = coords[:, 0].min(), coords[:, 0].max()
                 xmin, xmax = coords[:, 1].min(), coords[:, 1].max()
-                crop_img = img[ymin:ymax+1, xmin:xmax+1]
+                
+                # 1. Get the raw rectangular crop
+                crop_img = img[ymin:ymax+1, xmin:xmax+1].copy() 
+                
+                # 2. Get the boolean mask for just this patch
+                local_mask = mask_sp[ymin:ymax+1, xmin:xmax+1]
+                
+                # 3. Apply the ZERO-MASK (Black out everything outside the superpixel)
+                # Expand dims so we can broadcast across RGB channels
+                crop_img[~local_mask] = 0 
+                
+                # 4. Pass to CAE
                 crop_tensor = cae_transform(crop_img).unsqueeze(0)
                 with torch.no_grad():
                     latent_vector = cae_model.encoder(crop_tensor).squeeze(0)
@@ -173,8 +184,10 @@ def image_to_superpixel_graph(img, scale, sigma, min_size, hog_bins, mask=None ,
         x_list.append(x_ent)
 
     # Combine all selected features
-    x = torch.cat(x_list, dim=1).to(torch.bfloat16)
-
+    x = torch.cat(x_list, dim=1).to(torch.float32)
+    # Standardize the whole vector so no modality overpowers the others
+    x = F.layer_norm(x, x.shape[1:]) 
+    x = x.to(torch.bfloat16)
     # APPLY PRUNING: Only keep the valid nodes!
     x_pruned = x[is_valid_node]
     old_to_new_ids = torch.full((num_nodes,), -1, dtype=torch.long)
@@ -258,40 +271,6 @@ def image_to_superpixel_graph(img, scale, sigma, min_size, hog_bins, mask=None ,
         
     return data
 
-class BackgroundPruner(nn.Module):
-    def __init__(self, in_dim, threshold = 0.1):
-        super().__init__()
-        self.threshold = threshold
-        # light layer to gain information over node neighbourhood
-        self.context_layer = SAGEConv(in_dim, in_dim//2)
-        self.prune_scorer = nn.Sequential(nn.BatchNorm1d(in_dim//2),
-                                          nn.ReLU(),
-                                          nn.Linear(in_dim//2, 1),
-                                          nn.Sigmoid())
-        
-    def forward(self, x, edge_index, batch = None):
-        # create "context"
-        x_context = self.context_layer(x,edge_index)
-
-        # judge /score each node
-        scores = self.prune_scorer(x_context).squeeze(-1)
-
-        # gradient flow needs this
-        x_weighted = x * scores.unsqueeze(-1)
-
-        keep_mask = scores > self.threshold
-
-        x_pruned = x_weighted[keep_mask]
-        batch_pruned = batch[keep_mask] if batch is not None else None
-        #sever deleted edges and relabel surviving nodes
-        edge_index_pruned, _ = subgraph(
-            subset=keep_mask, 
-            edge_index=edge_index, 
-            relabel_nodes=True, 
-            num_nodes=x.size(0)
-        )
-        
-        return x_pruned, edge_index_pruned, batch_pruned, scores
     
 class GNNEncoder(nn.Module):
     def __init__(self, features, cae_latent_dim , num_hog_bins,in_dim=14, hidden_dim=512, out_dim=512, edge_strategy="spatial", k_neighbors=5):

@@ -150,12 +150,12 @@ if __name__ == "__main__":
     TEST_IMAGE = r"src\ml_utils\gnn\000011.jpg"
     
     # Point this directly to your newly trained CAE weights
-    CAE_WEIGHTS = r"C:\Users\sinan\Projects\Wildlife-Re-ID\models\cae\cae_dim24_size256_scale70p0_sigma0p65_clef_debugg.pth"
+    CAE_WEIGHTS = r"C:\Users\sinan\Projects\Wildlife-Re-ID\models\cae\cae_dim32_size256_scale70p0_sigma0p65_clef_big_v2.pth"
     
     debug_cae_reconstruction(
         img_path=TEST_IMAGE, 
         weights_path=CAE_WEIGHTS,
-        latent_dim=24,  # Make sure this matches what you pre-trained with
+        latent_dim=32,  # Make sure this matches what you pre-trained with
         img_size=256,   
         patch_size=64   
     )
