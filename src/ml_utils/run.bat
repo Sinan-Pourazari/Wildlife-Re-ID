@@ -40,7 +40,7 @@ set CSV_PATH=C:\Users\sinan\Projects\Wildlife-Re-ID\src\images\reid-10k\metadata
 set SHARED_CAE_DIR=models\cae
 
 set IMG_SIZE=256
-set CAE_LATENT_DIM=24
+set CAE_LATENT_DIM=64
 set CAE_EPOCHS=150
 set FELZ_SCALE=70.0
 set FELZ_SIGMA=0.65
@@ -48,7 +48,7 @@ set FELZ_MIN_SIZE=300
 set NUM_HOG_BINS=9
 set N_HOPS=1
 set EDGE_STRATEGY=hybrid
-set TRAIN_EPOCHS=1
+set TRAIN_EPOCHS=200
 :: Define your target species here! (Leave blank to use the whole dataset)
 :: E.g., set DATASETS=tiger turtle leopard
 set DATASETS=LynxID2025 SalamanderID2025 SeaTurtleID2022 AmvrakikosTurtles ATRW LeopardID2022 SeaStarReID2023
@@ -57,7 +57,7 @@ set DATASETS=LynxID2025 SalamanderID2025 SeaTurtleID2022 AmvrakikosTurtles ATRW 
 :: NEW DYNAMIC CHECKPOINT NAMING SYSTEM
 :: ========================================================
 :: Manually update this ID for each new experiment
-set RUN_ID=run_017
+set RUN_ID=run_020
 
 set EXPERIMENT_TAG=animal_clef_2026_baseline
 set CHECKPOINT_DIR=runs\!RUN_ID!_!EXPERIMENT_TAG!

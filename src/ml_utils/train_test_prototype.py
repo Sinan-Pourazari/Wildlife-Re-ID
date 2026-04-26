@@ -10,7 +10,7 @@ from sklearn.neighbors import NearestNeighbors
 from sklearn.model_selection import train_test_split
 import embedding_clusterings as ec
 from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
-from loss_mining_tools import batch_hard_triplet_loss, PKBatchSampler, batch_semi_hard_triplet_loss, batch_compactness_loss, batch_topk_triplet_loss, batch_topk_semi_hard_triplet_loss
+from loss_mining_tools import orthogonality_loss, batch_hard_triplet_loss, PKBatchSampler, batch_semi_hard_triplet_loss, batch_compactness_loss, batch_topk_triplet_loss, batch_topk_semi_hard_triplet_loss
 from torch_geometric.loader import DataLoader
 from torch_geometric.data import Dataset as PyGDataset
 from gnn.gnn import  GNNEncoder
@@ -119,54 +119,49 @@ class ReIDModel(nn.Module):
             'num_hog_bins': num_hog_bins
         }
         # Initialize the GNN Encoder with provided params
-        self.encoder = GNNEncoder(num_hog_bins = num_hog_bins,features=features,cae_latent_dim=cae_latent_dim, in_dim=in_dim, hidden_dim=hidden_dim, out_dim=gnn_out_dim, edge_strategy=edge_strategy, k_neighbors=k_neighbors)
-        # Calculate the actual size coming out of the GNN
-        # If pooling Mean + Max, the dimension is doubled
-        #TODO check this see gnn
-        #self.gnn_feature_size = gnn_out_dim * 2 if use_hybrid_pooling else gnn_out_dim
+        self.encoder = GNNEncoder(num_hog_bins=num_hog_bins, features=features, cae_latent_dim=cae_latent_dim, in_dim=in_dim, hidden_dim=hidden_dim, out_dim=gnn_out_dim, edge_strategy=edge_strategy, k_neighbors=k_neighbors)
         self.gnn_feature_size = hidden_dim * 2 if use_hybrid_pooling else hidden_dim
 
+        # BRANCH 1: The Identity Head (Re-ID)
         self.head = nn.Sequential(
             nn.Linear(self.gnn_feature_size, hidden_dim),
-            nn.BatchNorm1d(hidden_dim), # Added for training stability at 140k scale
+            nn.BatchNorm1d(hidden_dim),
             nn.GELU(),
             nn.Dropout(p=0.1),
             nn.Linear(hidden_dim, emb_dim),
         )
-
-        # --- BNNeck ---
         self.bottleneck = nn.BatchNorm1d(emb_dim)
-        self.bottleneck.bias.requires_grad_(False) # No bias shift
+        self.bottleneck.bias.requires_grad_(False)
 
-        # ID Classification head (Used ONLY during training for CE loss)
-        #self.classifier = nn.Linear(emb_dim, num_classes)
-
-        # Species Classification head
+        # BRANCH 2: The Species Head (Disentanglement Target)
+        # We make it output the exact same dimension (emb_dim) so we can easily compare them
+        self.species_proj = nn.Sequential(
+            nn.Linear(self.gnn_feature_size, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, emb_dim) 
+        )
+        # We need a classic classifier to force this branch to learn species
         self.species_classifier = nn.Linear(emb_dim, num_species)
 
     def forward(self, data):
-        # 1. Extract graph-level features
+        # 1. Shared Graph Extraction
         z = self.encoder(data) 
         
-        # 2. Project to Re-ID embedding space
+        # 2. Branch A: Identity Space
         features = self.head(z)
         bn_features = self.bottleneck(features)
-        # 3. L2 Normalize for Cosine Similarity / Metric Learning
         embeddings = F.normalize(bn_features, p=2, dim=1)
 
         if self.training:
-            # Return both for the dual-loss training loop
-            #logits = self.classifier(features) # Use un-normalized features for CE
-            if self.species_classifier is not None:
-                species_logits = self.species_classifier(features)
-                return embeddings,  species_logits ,features
+            # 3. Branch B: Species Space
+            species_features = self.species_proj(z)
+            species_embeddings = F.normalize(species_features, p=2, dim=1)
+            species_logits = self.species_classifier(species_embeddings)
             
-            return embeddings
-        
-        elif self.species_classifier is not None:
-            species_logits = self.species_classifier(features)
-            return embeddings, species_logits
-
+            # Return identity embeddings, species embeddings, and the species predictions
+            return embeddings, features, species_embeddings, species_logits
+            
         return embeddings
     
     # --- Accept train_classes instead of label_encoder ---
@@ -254,37 +249,39 @@ class ReIDModel(nn.Module):
 def train_one_epoch(loader, model, arcface_loss, scaler, optimizer, margin=1.0):
     model.train()
     total = 0.0
-    total_triplet = 0.0
-    total_ce = 0.0
-    total_scorer = 0.0
-    total_species = 0.0
-    criterion_ce = nn.CrossEntropyLoss(label_smoothing =0.001)
-    #scorer_weight = 0.05 # TODO Adjust this if it deletes too much or too little
+    total_triplet, total_ce, total_species, total_ortho = 0.0, 0.0, 0.0, 0.0
+
+    # Weight factor for how hard to push the disentanglement. 
+    # 1.0 is standard, but you can tune this up or down.
+    gamma_ortho = 1.0 
 
     for data in loader:
         data = data.to(device)
-        optimizer.zero_grad(set_to_none = True)
+        optimizer.zero_grad(set_to_none=True)
 
-        # reshape(-1, 2) ensures it splits the pairs correctly, then we separate them
         y_stacked = data.y.view(-1, 2).to(device) 
         labels = y_stacked[:, 0]          # Identity labels
         species_labels = y_stacked[:, 1]  # Species labels
-        with torch.amp.autocast(device_type="cuda"):
-            # Unpack the two outputs
-            emb, species_logits, features = model(data)
-
-            # Calculate losses
-            #loss_triplet = batch_hard_triplet_loss(emb, labels, margin=margin)
-            loss_triplet = batch_topk_semi_hard_triplet_loss(features, labels, margin=margin, k_neg=8)
-            #TODO add args to change betwen arcface and cross entorpy
-            loss_arc = 0.2 * arcface_loss(emb,labels)
-            loss_ce_species = 1 * criterion_ce(species_logits, species_labels)
-            
-            # Combined Loss
-            loss = loss_triplet + loss_arc + loss_ce_species
-            
-
         
+        with torch.amp.autocast(device_type="cuda"):
+            # Unpack the 4 outputs from our branched network
+            id_emb, id_features, species_emb, species_logits = model(data)
+
+            # --- TARGET 1: Identity Branch (Learn Who it is) ---
+            loss_triplet = batch_topk_semi_hard_triplet_loss(id_features, labels, margin=margin, k_neg=8)
+            loss_arc = 0.2 * arcface_loss(id_emb, labels)
+            
+            # --- TARGET 2: Species Branch (Learn What it is) ---
+            # Standard Cross Entropy forces `species_emb` to contain the species data
+            loss_species = 1.0 * F.cross_entropy(species_logits, species_labels)
+            
+            # --- TARGET 3: Disentanglement (Separate the knowledge) ---
+            # Forces the Identity branch to throw away the species data!
+            loss_ortho = gamma_ortho * orthogonality_loss(id_emb, species_emb)
+            
+            # Total Loss
+            loss = loss_triplet + loss_arc + loss_species + loss_ortho
+            
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
@@ -292,18 +289,19 @@ def train_one_epoch(loader, model, arcface_loss, scaler, optimizer, margin=1.0):
         total += float(loss.item())
         total_triplet += loss_triplet.item()
         total_ce += loss_arc.item()
-        #total_scorer += loss_scorer.item()
-        total_species += loss_ce_species.item()
+        total_species += loss_species.item()
+        total_ortho += loss_ortho.item()
 
-    return total / len(loader), total_triplet / len(loader), total_ce / len(loader), total_scorer / len(loader), total_species / len(loader)
-
+    # You might want to update your CSV logging to track `total_ortho`!
+    return total / len(loader), total_triplet / len(loader), total_ce / len(loader), total_ortho / len(loader), total_species / len(loader)
 
 def train(loader, model, optimizer, num_epochs, arcface_loss, start_epoch=0, args=None, train_classes=None, species_classes=None, scheduler=None):
     scaler = torch.amp.GradScaler()
     
     # 1. SETUP TRACKING
     metrics_csv_path = os.path.join(args.checkpoint_dir, "training_metrics.csv")
-    headers = ["epoch", "total_batchloss", "triplet_loss", "arcface_loss", "compactness_loss", "species_ce_loss", "vram_mb", "gpu_util_percent", "power_watts", "learning_rate"]
+    # Updated 'compactness_loss' to 'ortho_loss' to reflect disentanglement
+    headers = ["epoch", "total_batchloss", "triplet_loss", "arcface_loss", "ortho_loss", "species_ce_loss", "vram_mb", "gpu_util_percent", "power_watts", "learning_rate"]
 
     # If starting fresh, or the file doesn't exist, write the CSV headers
     if start_epoch == 0 or not os.path.exists(metrics_csv_path):
@@ -314,12 +312,9 @@ def train(loader, model, optimizer, num_epochs, arcface_loss, start_epoch=0, arg
 
     for i in range(start_epoch, num_epochs):
 
-        # Run the training epoch
-        total_batchloss, triplet, ce, compact, species = train_one_epoch(loader, model, arcface_loss, scaler, optimizer, margin=1)
+        # Run the training epoch - signatures now match the disentanglement branch
+        total_batchloss, triplet, ce, ortho, species = train_one_epoch(loader, model, arcface_loss, scaler, optimizer, margin=1)
         
-        # 2. QUERY HARDWARE UTILIZATION
-        vram_mb = 0.0
-        gpu_util = 0.0
         # 2. QUERY HARDWARE & ENERGY UTILIZATION
         vram_mb, gpu_util, power_watts = 0.0, 0.0, 0.0
         if torch.cuda.is_available():
@@ -333,43 +328,41 @@ def train(loader, model, optimizer, num_epochs, arcface_loss, start_epoch=0, arg
         # --- 3. LR SCHEDULER LOGIC ---
         if scheduler is not None:
             if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                scheduler.step(total_batchloss) # Steps based on plateauing loss
+                scheduler.step(total_batchloss) # Steps based on plateauing loss 
             else:
-                scheduler.step() # Steps based purely on epoch count
+                scheduler.step() # Steps based purely on epoch count 
                 
         # Get the current Learning Rate from the optimizer
         current_lr = optimizer.param_groups[0]['lr']
 
-        print(f"Epoch {i} | Total Loss: {total_batchloss:.4f} (Trip: {triplet:.4f}, Arc: {ce:.4f}, Comp: {compact:.4f}, Spec: {species:.4f}) | LR: {current_lr:.6f} | VRAM: {vram_mb:.0f}MB,  Power: {power_watts}W")
+        print(f"Epoch {i} | Total Loss: {total_batchloss:.4f} (Trip: {triplet:.4f}, Arc: {ce:.4f}, Ortho: {ortho:.4f}, Spec: {species:.4f}) | LR: {current_lr:.6f} | VRAM: {vram_mb:.0f}MB, Power: {power_watts}W")
         
-        # Flush to hard drive (Now includes current_lr)
-        row_data = [i, total_batchloss, triplet, ce, compact, species, vram_mb, gpu_util, power_watts, current_lr] 
+        # Flush to hard drive (Mapping 'ortho' to 'ortho_loss')
+        row_data = [i, total_batchloss, triplet, ce, ortho, species, vram_mb, gpu_util, power_watts, current_lr] 
         with open(metrics_csv_path, 'a') as f:
             f.write(",".join(map(str, row_data)) + "\n")
 
-        # Step Scheduler
-        if scheduler is not None:
-            scheduler.step(total_batchloss)
-
-        # Save Model Weights
+        # Save Model Weights every 2nd epoch
         if i % 2 == 0:
             _ = model.save(args, epoch=i, optimizer=optimizer, arcface=arcface_loss, train_classes=train_classes, species_classes=species_classes)
 
 
-    # 4. GENERATE FINAL PLOT 
+    # 4. GENERATE FINAL PLOTS
     print("\n[ Generating Training Metrics Plot ]")
     try:
         import matplotlib.pyplot as plt
-        # Load the entire history from the hard drive only when we need to plot it
         df_plot = pd.read_csv(metrics_csv_path)
         
         # --- PLOT 1: Losses ---
         plt.figure(figsize=(10, 6))
         plt.plot(df_plot['epoch'], df_plot['total_batchloss'], label='Total Loss', color='black', linewidth=2.5)
-        plt.plot(df_plot['epoch'], df_plot['triplet_loss'], label='Triplet', linestyle='--', alpha=0.8)
-        plt.plot(df_plot['epoch'], df_plot['arcface_loss'], label='ArcFace', linestyle='--', alpha=0.8)
+        plt.plot(df_plot['epoch'], df_plot['triplet_loss'], label='Triplet (ID)', linestyle='--', alpha=0.8)
+        plt.plot(df_plot['epoch'], df_plot['arcface_loss'], label='ArcFace (ID)', linestyle='--', alpha=0.8)
         plt.plot(df_plot['epoch'], df_plot['species_ce_loss'], label='Species CE', linestyle='--', alpha=0.8)
-        plt.title("GNN Training Losses over Epochs", fontsize=14, fontweight='bold')
+        # Fixed: Corrected label for Orthogonality Loss
+        plt.plot(df_plot['epoch'], df_plot['ortho_loss'], label='Ortho Disentanglement', color='red', linestyle='-', alpha=0.6)
+        
+        plt.title("GNN Training Losses (Feature Disentanglement Mode)", fontsize=14, fontweight='bold')
         plt.xlabel("Epoch")
         plt.ylabel("Loss Value")
         plt.legend(loc="upper right")
@@ -383,18 +376,15 @@ def train(loader, model, optimizer, num_epochs, arcface_loss, start_epoch=0, arg
         # --- PLOT 2: Hardware ---
         fig, ax1 = plt.subplots(figsize=(10, 6))
         
-        # Left Y-Axis: VRAM
         ax1.plot(df_plot['epoch'], df_plot['vram_mb'], label='VRAM (MB)', color='purple', linewidth=2)
         ax1.set_ylabel("VRAM (MB)", color='purple', fontweight='bold')
         ax1.tick_params(axis='y', labelcolor='purple')
         ax1.set_xlabel("Epoch")
         ax1.grid(True, linestyle=':', alpha=0.6)
         
-        # Right Y-Axis: GPU Util & Power
         ax2 = ax1.twinx() 
         ax2.plot(df_plot['epoch'], df_plot['gpu_util_percent'], label='GPU Util (%)', color='green', alpha=0.4, linewidth=2)
         
-        # Safely plot power if it exists in the CSV
         if 'power_watts' in df_plot.columns:
             ax2.plot(df_plot['epoch'], df_plot['power_watts'], label='Power (W)', color='red', alpha=0.6, linewidth=2)
             
@@ -402,7 +392,6 @@ def train(loader, model, optimizer, num_epochs, arcface_loss, start_epoch=0, arg
         ax2.tick_params(axis='y', labelcolor='black')
         ax2.set_ylim(0, max(105, df_plot['power_watts'].max() * 1.1 if 'power_watts' in df_plot.columns else 105))
         
-        # Combine legends
         lines_1, labels_1 = ax1.get_legend_handles_labels()
         lines_2, labels_2 = ax2.get_legend_handles_labels()
         ax1.legend(lines_1 + lines_2, labels_1 + labels_2, loc='upper left')
@@ -632,7 +621,7 @@ def main(args):
         )"""
     # DataLoaders
     batch_sampler = PKBatchSampler(aug_train_df["global_label"].values, P=45, K=8)
-    train_loader = DataLoader(train_dataset, batch_sampler=batch_sampler, num_workers=args.workers, persistent_workers=False, prefetch_factor=None)
+    train_loader = DataLoader(train_dataset, batch_sampler=batch_sampler, num_workers=args.workers, persistent_workers=False, prefetch_factor=None, pin_memory= True)
     #test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=args.workers)
 
     # Model & Optimizer
@@ -662,8 +651,8 @@ def main(args):
         optimizer, 
         mode='min',        # We want the loss to minimize
         factor=0.1,        # Multiply current LR by 0.5 when stuck
-        patience=25,        # Wait 10 epochs of no improvement
-        threshold=0.0001,    # The loss must improve by at least this much to reset the patience
+        patience=10,        # Wait 10 epochs of no improvement
+        threshold=0.005,    # The loss must improve by at least this much to reset the patience
         cooldown= 5,
         min_lr= 0.00001
     )

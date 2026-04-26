@@ -189,7 +189,7 @@ class SuperpixelPatchDataset(TorchDataset):
 def train_and_save_cae(df, args, save_path, device):
     dataset = SuperpixelPatchDataset(
         args, df, root_dir=args.root_dir, 
-        patches_per_image=5, n_jobs=-1
+        patches_per_image=25, n_jobs=-1
     )
     
     import multiprocessing
@@ -207,7 +207,7 @@ def train_and_save_cae(df, args, save_path, device):
     )
     
     model = TextureEncoder(latent_dim=args.cae_latent_dim).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    optimizer = torch.optim.Adam(model.parameters(), lr=5e-4)
     criterion = nn.MSELoss() # Replacing NT-Xent with simple MSE
     
     metrics_csv_path = os.path.join(args.checkpoint_dir, "cae_training_metrics.csv")
@@ -317,7 +317,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Reconstruction Texture Encoder")
     
     parser.add_argument("--epochs", dest="cae_epochs", type=int, default=15)
-    parser.add_argument("--latent_dim", dest="cae_latent_dim", type=int, default=32)
+    parser.add_argument("--latent_dim", dest="cae_latent_dim", type=int, default=128)
     parser.add_argument("--batch_size", type=int, default=256) 
     parser.add_argument("--save_dir", type=str, default="models/cae")
     parser.add_argument("--checkpoint_dir", type=str, default=".", help="Where to save telemetry")

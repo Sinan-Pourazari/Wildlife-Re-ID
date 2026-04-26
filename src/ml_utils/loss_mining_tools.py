@@ -302,3 +302,15 @@ class SpeciesSupConLoss(nn.Module):
         loss = - (soft_targets * log_prob).sum(dim=1)
         
         return loss.mean()
+    
+def orthogonality_loss(emb1, emb2):
+        """
+        Forces two L2-normalized vectors to be orthogonal (perpendicular).
+        If they share no information, their dot product will be 0.
+        """
+        # Calculate cosine similarity (dot product of L2 normalized vectors)
+        cos_sim = (emb1 * emb2).sum(dim=1)
+        
+        # Square it so both positive (same direction) and negative (opposite direction) 
+        # similarities are penalized. We want the value to hit exactly 0.0.
+        return (cos_sim ** 2).mean()
