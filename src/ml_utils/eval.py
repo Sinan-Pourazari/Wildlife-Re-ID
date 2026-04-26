@@ -64,24 +64,34 @@ def get_test_samples(args):
         else:
             print(f"--> WARNING: 'species' column not found.")
 
-    # 3. Standardize Identity Column & Clean Data
-    if 'identity' not in test_df.columns and 'animal_id' in test_df.columns:
-        test_df['identity'] = test_df['animal_id'].astype(str)
-        
-    test_df = test_df[test_df['identity'] != 'unknown'].dropna(subset=['identity']).reset_index(drop=True)
-    print(f"--> After dropping 'unknown' or missing identities: {len(test_df)} rows remain.")
+    # =================================================================
+    # 3 & 4. IDENTITY FILTERING (Bypass for Submission!)
+    # =================================================================
+    if getattr(args, 'generate_submission', False):
+        # SUBMISSION MODE: Keep all images, mock the identities
+        if 'identity' not in test_df.columns:
+            test_df['identity'] = "unknown"
+        test_df['identity'] = test_df['identity'].fillna("unknown")
+        print(f"--> Submission Mode: Kept all {len(test_df)} rows (bypassing identity checks).")
+    else:
+        # VALIDATION MODE: Require strict ground truth identities
+        if 'identity' not in test_df.columns and 'animal_id' in test_df.columns:
+            test_df['identity'] = test_df['animal_id'].astype(str)
+            
+        #test_df = test_df[test_df['identity'] != 'unknown'].dropna(subset=['identity']).reset_index(drop=True)
+        #print(f"--> After dropping 'unknown' or missing identities: {len(test_df)} rows remain.")
 
-    if len(test_df) == 0:
-        raise ValueError("All images were dropped because their identity was 'unknown' or missing.")
+        if len(test_df) == 0:
+            raise ValueError("All images were dropped because their identity was 'unknown' or missing.")
 
-    # 4. Filter out singletons (Re-ID metrics require at least 2 images per ID)
-    counts = test_df['identity'].value_counts()
-    keep_ids = counts[counts > 1].index
-    test_df = test_df[test_df['identity'].isin(keep_ids)].reset_index(drop=True)
-    print(f"--> After dropping singleton identities (IDs with only 1 image): {len(test_df)} rows remain.")
+        # 4. Filter out singletons (Re-ID metrics require at least 2 images per ID)
+        #counts = test_df['identity'].value_counts()
+        #keep_ids = counts[counts > 1].index
+        #test_df = test_df[test_df['identity'].isin(keep_ids)].reset_index(drop=True)
+        print(f"--> After dropping singleton identities (IDs with only 1 image): {len(test_df)} rows remain.")
 
-    if len(test_df) == 0:
-        raise ValueError("All images were dropped because every identity only had 1 image (singletons). Re-ID evaluation requires >= 2 images per identity!")
+        if len(test_df) == 0:
+            raise ValueError("All images were dropped because every identity only had 1 image (singletons). Re-ID evaluation requires >= 2 images per identity!")
 
     # 5. Generate integer labels required by PyG DataLoader
     from sklearn.preprocessing import LabelEncoder
@@ -281,7 +291,7 @@ def tune_leiden_hyperparameters(embeddings, labels, species_preds, disable_pbar=
     for k1 in k1_values:
         for lamb in lambda_values:
             reranked_sim = k_reciprocal_rerank(base_sim_matrix.clone(), k1=k1, lambda_value=lamb)
-            reranked_sim[cross_species_mask] = -1.0 
+            #reranked_sim[cross_species_mask] = -1.0 
             reranked_sim_np = reranked_sim.numpy()
 
             for thresh in thresholds:

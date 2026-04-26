@@ -255,3 +255,50 @@ def batch_compactness_loss(embeddings, labels):
     
     # Fallback if no classes had >1 image (shouldn't happen with your PK sampler)
     return torch.tensor(0.0, device=embeddings.device, requires_grad=True)
+
+import torch
+import torch.nn.functional as F
+import torch.nn as nn
+
+class SpeciesSupConLoss(nn.Module):
+    def __init__(self, temperature=0.1):
+        super().__init__()
+        self.temperature = temperature
+
+    def forward(self, features, taxonomy_sim_matrix):
+        """
+        features: [B, D] L2-normalized embeddings (your macro_emb)
+        taxonomy_sim_matrix: [B, B] Precomputed similarities based on taxonomy (0.0 to 1.0)
+        """
+        device = features.device
+        batch_size = features.shape[0]
+
+        # 1. Compute cosine similarities and scale by temperature
+        sim_matrix = torch.div(torch.matmul(features, features.T), self.temperature)
+        
+        # Numerical stability trick (prevents overflow in exp)
+        max_sim, _ = torch.max(sim_matrix, dim=1, keepdim=True)
+        sim_matrix = sim_matrix - max_sim.detach()
+        
+        # 2. Mask out self-comparisons (diagonal)
+        mask = torch.eye(batch_size, dtype=torch.bool, device=device)
+        
+        # 3. Compute log probabilities
+        exp_sim = torch.exp(sim_matrix) * (~mask)
+        log_prob = sim_matrix - torch.log(exp_sim.sum(dim=1, keepdim=True) + 1e-8)
+        
+        # 4. Prepare soft targets from the taxonomy matrix
+        soft_targets = taxonomy_sim_matrix.clone().to(device) * (~mask)
+        
+        # Normalize the soft targets so they sum to 1 per row (Cross-Entropy requirement)
+        target_sums = soft_targets.sum(dim=1, keepdim=True)
+        
+        # Prevent division by zero if a batch has absolutely zero taxonomic overlap
+        valid_rows = (target_sums > 0).squeeze()
+        if valid_rows.any():
+            soft_targets[valid_rows] = soft_targets[valid_rows] / target_sums[valid_rows]
+        
+        # 5. Compute the final soft contrastive loss: -sum(Target * Log_Prob)
+        loss = - (soft_targets * log_prob).sum(dim=1)
+        
+        return loss.mean()

@@ -196,8 +196,52 @@ def image_to_superpixel_graph(img, scale, sigma, min_size, hog_bins, mask=None ,
                 edges.add((old_to_new_ids[a].item(), old_to_new_ids[c].item()))
                 edges.add((old_to_new_ids[c].item(), old_to_new_ids[a].item()))
 
-    edge_index = torch.tensor(list(edges), dtype=torch.int32).t().contiguous()
-    data = Data(x=x_pruned, edge_index=edge_index)
+    # ---------------------------------------------------------
+    # Build PyG Edge Index Safely (Handle 0-edge graphs)
+    # ---------------------------------------------------------
+    if len(edges) > 0:
+        edge_index = torch.tensor(list(edges), dtype=torch.long).t().contiguous()
+    else:
+        edge_index = torch.empty((2, 0), dtype=torch.long)
+    
+    # ---------------------------------------------------------
+    # Calculate Local Edge Attributes (Distance and Angle)
+    # ---------------------------------------------------------
+    edge_attr = None
+    if 'pos' in features:
+        if edge_index.numel() > 0:
+            # Dynamically find where the 'pos' features are stored in x_pruned
+            feature_block_sizes = {'color': 3, 'pos': 2, 'hog': hog_bins, 'shape': 14, 'lbp': 10, 'texture': 1, 'cae': cae_latent_dim}
+            extraction_order = ['color', 'pos', 'hog', 'cae', 'shape', 'lbp', 'texture']
+            
+            pos_start = 0
+            for feat in extraction_order:
+                if feat == 'pos':
+                    break
+                if feat in features:
+                    pos_start += feature_block_sizes[feat]
+                    
+            # Extract positions and cast to float32 for math functions
+            pos_tensor = x_pruned[:, pos_start : pos_start+2].to(torch.float32)
+            row, col = edge_index
+            
+            # Calculate Relative Vector
+            rel_pos = pos_tensor[row] - pos_tensor[col]
+            
+            # 1. Distance
+            dist = torch.norm(rel_pos, dim=-1, keepdim=True)
+            # 2. Angle (Sine and Cosine)
+            angle = torch.atan2(rel_pos[:, 1], rel_pos[:, 0])
+            sin_angle = torch.sin(angle).unsqueeze(-1)
+            cos_angle = torch.cos(angle).unsqueeze(-1)
+            
+            # Concatenate and cast back to bfloat16 to match your network
+            edge_attr = torch.cat([dist, sin_angle, cos_angle], dim=-1).to(torch.bfloat16)
+        else:
+            # FIX: If there are no edges, supply an empty [0, 3] tensor instead of None!
+            edge_attr = torch.empty((0, 3), dtype=torch.bfloat16)
+
+    data = Data(x=x_pruned, edge_index=edge_index, edge_attr=edge_attr)
         
     if n_hops > 1:
         actual_nodes = data.x.size(0)
@@ -269,14 +313,16 @@ class GNNEncoder(nn.Module):
                 nn.ReLU(),
                 nn.Linear(hidden_dim // 2, hidden_dim // 2)
             )
-        self.conv1 = GATv2Conv(in_dim, hidden_dim//8, heads=8)
+        self.edge_dim = 3 if 'pos' in features else None
+        
+        # Pass edge_dim into the GATv2Conv layers
+        self.conv1 = GATv2Conv(in_dim, hidden_dim//8, heads=8, edge_dim=self.edge_dim)
         self.norm1 = nn.LayerNorm(hidden_dim)
 
-        self.conv2 = GATv2Conv(hidden_dim, hidden_dim // 8, heads=8)
+        self.conv2 = GATv2Conv(hidden_dim, hidden_dim // 8, heads=8, edge_dim=self.edge_dim)
         self.norm2 = nn.LayerNorm(hidden_dim)
 
-        # todo look at out dim again / hidden dim
-        self.conv3 = GATv2Conv(hidden_dim, hidden_dim // 8, heads=8)
+        self.conv3 = GATv2Conv(hidden_dim, hidden_dim // 8, heads=8, edge_dim=self.edge_dim)
         self.norm3 = nn.LayerNorm(hidden_dim)
         
         
@@ -292,66 +338,74 @@ class GNNEncoder(nn.Module):
 
     def forward(self, data):
         x, spatial_edge_index, batch = data.x, data.edge_index, data.batch
-        #x, spatial_edge_index, batch, saliency_scores = self.pruner(x, spatial_edge_index, batch)
+        
+        # Safely extract edge_attr if it exists
+        edge_attr = getattr(data, 'edge_attr', None) 
+
         if self.training:
             x = self.apply_modality_dropout(x, p=0.2)
         
         if self.edge_strategy == "spatial":
-            # Baseline: Use only the CPU-generated LMDB edges
             final_edge_index = spatial_edge_index
+            final_edge_attr = edge_attr # Keep spatial edge attributes
             
         else:
-            # Generate Attention Edges
             queries_keys = self.edge_proj(x)
             semantic_edge_index = knn_graph(x=queries_keys, k=self.k_neighbors, batch=batch, loop=False, cosine=True)
 
             if self.edge_strategy == "attention":
-                # Pure semantic approach (ignores physical layout)
                 final_edge_index = semantic_edge_index
+                final_edge_attr = None # Attention edges don't have spatial attributes
 
             elif self.edge_strategy == "hybrid":
-                # Anatomy + Texture Matching
                 final_edge_index = torch.cat([spatial_edge_index, semantic_edge_index], dim=1)
+                final_edge_attr = None # Cannot mix spatial and non-spatial attributes
 
-       # Graph argumentations
+       # Graph augmentations
         if self.training:
-            # Node Dropout: Randomly isolate 10% of nodes (removes all their edges)
             final_edge_index, _, _ = dropout_node(
                 final_edge_index, 
                 p=0.10, 
                 num_nodes=x.size(0)
             )
             
-            # Edge Dropout: Randomly drop 20% of individual edges
-            final_edge_index, _ = dropout_edge(
+            # Extract the edge_mask so we can drop the corresponding edge attributes!
+            final_edge_index, edge_mask = dropout_edge(
                 final_edge_index, 
                 p=0.15, 
                 force_undirected=True
             )
+            # Sync edge attributes with the dropped edges
+            if final_edge_attr is not None:
+                final_edge_attr = final_edge_attr[edge_mask]
         
-        # Layer 1
-        x1 = self.norm1(F.elu(self.conv1(x, final_edge_index)))
+        # Layer 1 (Pass final_edge_attr)
+        x1 = self.norm1(F.elu(self.conv1(x, final_edge_index, edge_attr=final_edge_attr)))
         
-        # Layer 2 (with Residual)
-        x2 = self.norm2(F.elu(self.conv2(x1, final_edge_index)))
+        # Layer 2 (with Residual Skip Connection)
+        x2 = self.norm2(F.elu(self.conv2(x1, final_edge_index, edge_attr=final_edge_attr)))
         x2 = x2 + x1
 
         # Layer 3
-        x3 = self.norm3(F.elu(self.conv3(x2, final_edge_index)))
+        x3 = self.norm3(F.elu(self.conv3(x2, final_edge_index, edge_attr=final_edge_attr)))
         x3 = F.softplus(x3)
 
-        # dynamic jumping knowledge (like attention) 
-        #reshape to [Num_Nodes, 3, 512]
+        # ==============================================================
+        # RESTORED: Dynamic Jumping Knowledge (Layer Attention)
+        # ==============================================================
+        # reshape to [Num_Nodes, 3, 512]
         x_stacked = torch.stack([x1, x2, x3], dim=1)
         scores = self.layer_scorer(x_stacked)
 
-        #convert to percentage
-        score_weights = F.softmin(scores, dim = 1)
+        # convert to percentage
+        score_weights = F.softmin(scores, dim=1)
 
         # Multiply and sum to get the final custom blend per node
         x_dynamic = (x_stacked * score_weights).sum(dim=1)
 
-        # Pooling
+        # ==============================================================
+        # RESTORED: Pooling and Return
+        # ==============================================================
         pooled = self.gem_pool(x_dynamic, batch)
         return pooled
 
