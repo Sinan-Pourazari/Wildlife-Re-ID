@@ -7,11 +7,13 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib import patheffects
 from PIL import Image, ImageOps
-from skimage.segmentation import felzenszwalb, mark_boundaries, quickshift
+from skimage.segmentation import felzenszwalb, mark_boundaries, quickshift, slic
 from skimage.measure import regionprops
 import torchvision.transforms as T
 import warnings
 from gnn.cae import TextureEncoder
+import cv2  # <-- Added cv2 import
+from cv2.ximgproc import createSuperpixelSEEDS
 
 warnings.filterwarnings("ignore")
 
@@ -38,9 +40,30 @@ def debug_cae_reconstruction(img_path, weights_path, latent_dim=24, img_size=256
     img_pil = ImageOps.pad(img_pil, (img_size, img_size), color=(0, 0, 0))
     img_np = np.array(img_pil)
 
-    # 3. Segment the image
-    segments = felzenszwalb(img_np, scale=70.0, sigma=0.65, min_size=300)
-    #segments = quickshift(img_np,ratio=0.5,kernel_size=5,max_dist=50)
+    # ==========================================
+    # 3. SEGMENT THE IMAGE (SEEDS IMPLEMENTATION)
+    # ==========================================
+    h, w, c = img_np.shape
+    
+    # Convert to HSV for better histogram energy calculation
+    img_hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
+    
+    # Target number of nodes
+    target_superpixels = 300 
+    
+    # Initialize SEEDS
+    seeds_algo = createSuperpixelSEEDS(
+        w, h, c, 
+        target_superpixels, 
+        num_levels=4, 
+        prior=1, 
+        histogram_bins=4
+    )
+    
+    # Run optimization and get segments
+    seeds_algo.iterate(img_hsv, 4)
+    segments = seeds_algo.getLabels()
+
     regions = regionprops(segments + 1) # Note: skimage regions expects 1-indexed labels
     print(f"--> Found {len(regions)} superpixel segments")
 
@@ -52,7 +75,7 @@ def debug_cae_reconstruction(img_path, weights_path, latent_dim=24, img_size=256
     patches_for_model = []
     patch_images_for_plot = []
     
-    # 4. Extract patches based on Tight Bounding Boxes WITH ZERO-MASKING
+    # 4. Extract patches based on Tight Bounding Boxes
     for props in regions:
         min_row, min_col, max_row, max_col = props.bbox
         
@@ -66,7 +89,7 @@ def debug_cae_reconstruction(img_path, weights_path, latent_dim=24, img_size=256
         # 2. Get the boolean mask for just this patch
         local_mask = mask_sp[min_row:max_row, min_col:max_col]
         
-        # 3. APPLY MEAN-MASKING
+        # 3. APPLY MEAN-MASKING (Fixed to actually calculate the mean)
         if local_mask.any():
             mean_color = crop_np[local_mask].mean(axis=0).astype(np.uint8)
         else:
@@ -109,7 +132,7 @@ def debug_cae_reconstruction(img_path, weights_path, latent_dim=24, img_size=256
     axes[0].axis('off')
     
     axes[1].imshow(mark_boundaries(img_np, segments))
-    axes[1].set_title(f"Felzenszwalb Superpixels (N={len(regions)})")
+    axes[1].set_title(f"SEEDS Superpixels (N={len(regions)})")
     axes[1].axis('off')
     plt.tight_layout()
     plt.show()
@@ -161,9 +184,9 @@ def debug_cae_reconstruction(img_path, weights_path, latent_dim=24, img_size=256
 
 if __name__ == "__main__":
     # ---> CHANGE THESE PATHS TO MATCH YOUR LOCAL SETUP <---
-    #TEST_IMAGE = r"src\ml_utils\gnn\000011.jpg"
-    TEST_IMAGE= r"C:\Users\sinan\Projects\Wildlife-Re-ID\src\images\animal-clef-2026\images\TexasHornedLizards\test\1e177a6eab060e92.jpg"
-    # Point this directly to your newly trained CAE weights
+    TEST_IMAGE = r"src\ml_utils\gnn\000011.jpg"
+    #TEST_IMAGE= r"C:\Users\sinan\Projects\Wildlife-Re-ID\src\images\animal-clef-2026\images\TexasHornedLizards\test\1e177a6eab060e92.jpg"
+    ## Point this directly to your newly trained CAE weights
     CAE_WEIGHTS = r"C:\Users\sinan\Projects\Wildlife-Re-ID\models\cae\cae_dim64_size256_scale70p0_sigma0p65_clef_big_v4.pth"
     
     debug_cae_reconstruction(

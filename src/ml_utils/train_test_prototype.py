@@ -624,7 +624,7 @@ def main(args):
         min_size= args.felz_min_size
         )"""
     # DataLoaders
-    batch_sampler = PKBatchSampler(aug_train_df["global_label"].values, P=45, K=8)
+    batch_sampler = PKBatchSampler(aug_train_df["global_label"].values, P=30, K=8)
     train_loader = DataLoader(train_dataset, batch_sampler=batch_sampler, num_workers=args.workers, persistent_workers=True, prefetch_factor=16, pin_memory= True)
     #test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=args.workers)
 
@@ -656,7 +656,7 @@ def main(args):
         mode='min',        # We want the loss to minimize
         factor=0.1,        # Multiply current LR by 0.5 when stuck
         patience=10,        # Wait 10 epochs of no improvement
-        threshold=0.005,    # The loss must improve by at least this much to reset the patience
+        threshold=0.1,    # The loss must improve by at least this much to reset the patience
         cooldown= 5,
         min_lr= 0.00001
     )

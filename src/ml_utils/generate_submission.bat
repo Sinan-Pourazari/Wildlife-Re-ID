@@ -8,7 +8,7 @@ echo ========================================================
 :: ========================================================
 :: 1. PASTE THE EXACT PATH TO YOUR MODEL HERE:
 :: ========================================================
-set "TARGET_PTH=runs\run_020_animal_clef_2026_baseline\gnn\gnn_reid_ep174_universal_20260426_164703.pth"
+set "TARGET_PTH=runs\run_027_animal_clef_2026_baseline\gnn\gnn_reid_ep158_universal_20260427_175241.pth"
 if not exist "%TARGET_PTH%" (
     echo [ERROR] Could not find checkpoint: %TARGET_PTH%
     pause
@@ -24,20 +24,20 @@ set "CHECKPOINT_DIR=!CHECKPOINT_DIR:~0,-1!"
 :: Recreate standard pipeline vars
 set RAW_DIR=src/images
 set TEST_CSV=!CHECKPOINT_DIR!\competition_test.csv
-set IMG_SIZE=256
+set IMG_SIZE=512
 set FELZ_SCALE=70.0
-set FELZ_SIGMA=0.65
-set FELZ_MIN_SIZE=300
+set FELZ_SIGMA=0.35
+set FELZ_MIN_SIZE=400
 set NUM_HOG_BINS=9
-set CAE_LATENT_DIM=24
-set CAE_WEIGHTS_PATH=models\cae\cae_dim24_size256_scale70p0_sigma0p65_clef_big_v2.pth
-set CAE_NAME=cae_dim24_size256_scale70p0_sigma0p65_clef_big_v2
+set CAE_LATENT_DIM=64
+set CAE_WEIGHTS_PATH=models\cae\cae_dim64_size512_scale70p0_sigma0p35_clef_big_v6.pth
+set CAE_NAME=cae_dim64_size512_scale70p0_sigma0p35_clef_big_v6
 
 :: ========================================================
 :: 2. LEIDEN CLUSTERING PARAMS
 :: ========================================================
-set LEIDEN_THRESH=0.6
-set LEIDEN_K1=20
+set LEIDEN_THRESH=0.42
+set LEIDEN_K1=10
 set LEIDEN_LAMBDA=0.4
 echo.
 echo [INFO] Generating submission.csv using %TARGET_PTH%...

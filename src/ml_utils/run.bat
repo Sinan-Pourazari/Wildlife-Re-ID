@@ -43,8 +43,8 @@ set IMG_SIZE=512
 set CAE_LATENT_DIM=64
 set CAE_EPOCHS=75
 set FELZ_SCALE=70.0
-set FELZ_SIGMA=0.65
-set FELZ_MIN_SIZE=300
+set FELZ_SIGMA=0.35
+set FELZ_MIN_SIZE=400
 set NUM_HOG_BINS=9
 set N_HOPS=1
 set EDGE_STRATEGY=hybrid
@@ -57,7 +57,7 @@ set DATASETS=LynxID2025 SalamanderID2025 SeaTurtleID2022 AmvrakikosTurtles ATRW 
 :: NEW DYNAMIC CHECKPOINT NAMING SYSTEM
 :: ========================================================
 :: Manually update this ID for each new experiment
-set RUN_ID=run_026
+set RUN_ID=run_027
 
 set EXPERIMENT_TAG=animal_clef_2026_baseline
 set CHECKPOINT_DIR=runs\!RUN_ID!_!EXPERIMENT_TAG!
