@@ -29,7 +29,7 @@ import leidenalg as la
 from train_test_prototype import ReIDModel, reduce_to_nd
 from dataloader import UniversalGraphDataset
 from torch_geometric.loader import DataLoader
-
+import re
 # =====================================================================
 # 1. FEATURE EXTRACTION & DATA UTILS
 # =====================================================================
@@ -437,11 +437,16 @@ def evaluate_metrics_worker(ckpt_path, feats_np, labels_np, species_preds_np, kn
     model_name = os.path.basename(ckpt_path)
     features, labels = torch.from_numpy(feats_np), torch.from_numpy(labels_np)
     
+    # --- NEW: Extract Epoch or Timestamp for chronological sorting ---
+    match = re.search(r'ep(\d+)', model_name)
+    sort_val = int(match.group(1)) if match else os.path.getmtime(ckpt_path)
+    
     r1, r5, r10, map_val, baks, baus = compute_reid_metrics(features, labels, known_classes, device='cpu', sim_thresh=0.4)
     ari, nmi, discovered_ids = compute_clustering_metrics_leiden(args, feats_np, labels_np, species_preds_np, sim_thresh=0.50, k1=15, lambda_val=0.3)
 
     return {
         'Model Name': model_name.replace('.pth', ''),
+        'Epoch': sort_val, # <--- Added this key
         'Rank-1 (%)': r1, 'Rank-5 (%)': r5, 'Rank-10 (%)': r10, 'mAP (%)': map_val,
         'BaKS': baks, 'BAUS': baus, 'H-Score': np.sqrt(baks * baus), 
         'Baseline ARI': ari, 'Baseline NMI': nmi, 'Baseline IDs': discovered_ids,
@@ -592,9 +597,10 @@ def main(args):
             futures = {executor.submit(evaluate_metrics_worker, c, f, l, sp, k, args, sl): c for c, (f, l, sp, sl, k) in extracted_data.items()}
             results = [future.result() for future in tqdm(as_completed(futures), total=len(futures), desc="Computing Baseline Metrics")]
                     
-        df = pd.DataFrame(results).sort_values(by='Model Name', ascending=True).reset_index(drop=True)
+        df = pd.DataFrame(results).sort_values(by='Epoch', ascending=True).reset_index(drop=True)
+        
         print("\n================ BENCHMARK SUMMARY ================")
-        print(df.drop(columns=['ckpt_path']).to_string(index=False))
+        print(df.drop(columns=['ckpt_path', 'Epoch']).to_string(index=False)) # Hide the epoch col for cleaner terminal output
         plot_benchmark_results(df, eval_out_dir)
         df.to_csv(csv_path, index=False)
         

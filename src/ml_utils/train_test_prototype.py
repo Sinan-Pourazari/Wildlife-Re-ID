@@ -10,7 +10,7 @@ from sklearn.neighbors import NearestNeighbors
 from sklearn.model_selection import train_test_split
 import embedding_clusterings as ec
 from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
-from loss_mining_tools import orthogonality_loss, batch_hard_triplet_loss, PKBatchSampler, batch_semi_hard_triplet_loss, batch_compactness_loss, batch_topk_triplet_loss, batch_topk_semi_hard_triplet_loss
+from loss_mining_tools import orthogonality_loss, strict_orthogonality_loss, PKBatchSampler, batch_semi_hard_triplet_loss, batch_compactness_loss, batch_topk_triplet_loss, batch_topk_semi_hard_triplet_loss
 from torch_geometric.loader import DataLoader
 from torch_geometric.data import Dataset as PyGDataset
 from gnn.gnn import  GNNEncoder
@@ -153,16 +153,17 @@ class ReIDModel(nn.Module):
         bn_features = self.bottleneck(features)
         embeddings = F.normalize(bn_features, p=2, dim=1)
 
+        # 3. Branch B: Species Space (Calculated unconditionally)
+        species_features = self.species_proj(z)
+        species_embeddings = F.normalize(species_features, p=2, dim=1)
+        species_logits = self.species_classifier(species_embeddings) # <--- MUST BE HERE
+
         if self.training:
-            # 3. Branch B: Species Space
-            species_features = self.species_proj(z)
-            species_embeddings = F.normalize(species_features, p=2, dim=1)
-            species_logits = self.species_classifier(species_embeddings)
-            
-            # Return identity embeddings, species embeddings, and the species predictions
+            # Return all 4 items for your custom training loop loss calculations
             return embeddings, features, species_embeddings, species_logits
             
-        return embeddings
+        # Return the 2 items that eval.py expects!
+        return embeddings, species_logits
     
     # --- Accept train_classes instead of label_encoder ---
     # TODO save relevant args parts
@@ -277,7 +278,10 @@ def train_one_epoch(loader, model, arcface_loss, scaler, optimizer, margin=1.0):
             
             # --- TARGET 3: Disentanglement (Separate the knowledge) ---
             # Forces the Identity branch to throw away the species data!
-            loss_ortho = gamma_ortho * orthogonality_loss(id_emb, species_emb)
+            
+            loss_ortho = gamma_ortho * strict_orthogonality_loss(id_emb, species_emb)
+
+            #loss_ortho = gamma_ortho * orthogonality_loss(id_emb, species_emb)
             
             # Total Loss
             loss = loss_triplet + loss_arc + loss_species + loss_ortho
@@ -621,7 +625,7 @@ def main(args):
         )"""
     # DataLoaders
     batch_sampler = PKBatchSampler(aug_train_df["global_label"].values, P=45, K=8)
-    train_loader = DataLoader(train_dataset, batch_sampler=batch_sampler, num_workers=args.workers, persistent_workers=True, prefetch_factor=8, pin_memory= True)
+    train_loader = DataLoader(train_dataset, batch_sampler=batch_sampler, num_workers=args.workers, persistent_workers=True, prefetch_factor=16, pin_memory= True)
     #test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=args.workers)
 
     # Model & Optimizer

@@ -314,3 +314,32 @@ def orthogonality_loss(emb1, emb2):
         # Square it so both positive (same direction) and negative (opposite direction) 
         # similarities are penalized. We want the value to hit exactly 0.0.
         return (cos_sim ** 2).mean()
+
+def strict_orthogonality_loss(id_emb, species_emb):
+    """
+    Computes a strict Feature-Wise Cross-Covariance Orthogonality.
+    Forces the DxD correlation matrix between the two latent spaces to be strictly zero.
+    """
+    # 1. Cast to float32 to prevent Autocast overflow
+    id_emb = id_emb.float()
+    species_emb = species_emb.float()
+
+    # 2. Zero-mean the features across the batch (Centers the distributions)
+    id_centered = id_emb - id_emb.mean(dim=0, keepdim=True)
+    species_centered = species_emb - species_emb.mean(dim=0, keepdim=True)
+    
+    # 3. SAFE L2 NORM (Protects against NaN gradients if a feature variance is exactly 0)
+    # By adding 1e-8 inside the sqrt, the derivative will never divide by zero.
+    id_std = torch.sqrt(torch.sum(id_centered ** 2, dim=0, keepdim=True) + 1e-8)
+    species_std = torch.sqrt(torch.sum(species_centered ** 2, dim=0, keepdim=True) + 1e-8)
+    
+    id_norm = id_centered / id_std
+    species_norm = species_centered / species_std
+    
+    # 4. Compute the Cross-Correlation Matrix [Dim x Dim]
+    cross_corr = torch.matmul(id_norm.t(), species_norm)
+    
+    # 5. The Loss is the mean of squared correlations
+    loss = torch.mean(cross_corr ** 2)
+    
+    return loss

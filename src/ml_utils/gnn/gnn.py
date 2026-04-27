@@ -18,20 +18,20 @@ from skimage.measure import regionprops
 import math
 from torch_geometric.utils import dropout_edge, dropout_node, subgraph
 
-def image_to_superpixel_graph(img, scale, sigma, min_size, hog_bins, mask=None , hog_signed=False, hog_l2norm=True, features=['color', 'pos', 'hog'], n_hops=1, cae_weights_path=None, cae_latent_dim=64, return_segments=False):   
+def image_to_superpixel_graph(img, scale, sigma, min_size, hog_bins, mask=None, hog_signed=False, hog_l2norm=True, features=['color', 'pos', 'hog'], n_hops=1, cae_weights_path=None, cae_latent_dim=128, return_segments=False):   
     if isinstance(img, Image.Image):
         img = np.array(img)
     
     h, w, _ = img.shape
 
-    #  felzenszwalb 
+    # 1. Segment the Image
     segments = felzenszwalb(img, scale=scale, sigma=sigma, min_size=min_size)
     num_nodes = segments.max() + 1
     seg_flat = torch.tensor(segments, dtype=torch.long).view(-1)
     
     x_list = []
 
-    # CAE SETUP 
+    # 2. CAE SETUP 
     if 'cae' in features:
         if cae_weights_path is None:
             raise ValueError("Requested 'cae' features but no cae_weights_path provided!")
@@ -44,28 +44,7 @@ def image_to_superpixel_graph(img, scale, sigma, min_size, hog_bins, mask=None ,
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
 
-    # ==========================================
-    # --- GRAPH PRUNING (Mask Evaluation DEPRECATED DO NOT USE) ---
-    # ==========================================
-    if mask is not None:
-        mask_flat = torch.tensor(mask, dtype=torch.float).view(-1)
-        node_counts = torch.bincount(seg_flat, minlength=num_nodes).float()
-        
-        node_mask_scores = torch.zeros(num_nodes, dtype=torch.float)
-        node_mask_scores.scatter_add_(0, seg_flat, mask_flat)
-        node_mask_scores = node_mask_scores / (node_counts + 1e-6)
-
-        # Boolean array: True if it's the animal, False if it's background
-        is_valid_node = node_mask_scores > 127.0 
-    else:
-        is_valid_node = torch.ones(num_nodes, dtype=torch.bool)
-
-    # Safety net: If the augmentation cropped pure black and deleted everything
-    if is_valid_node.sum() == 0:
-        is_valid_node = torch.ones(num_nodes, dtype=torch.bool)
-
-
-    # --- 2. Color, Position, HOG, and CAE Loop ---
+    # 3. Extract Node Features
     if any(f in features for f in ['color', 'pos', 'hog', 'cae', 'shape']):
         img_lab = rgb2lab(img)
         if 'hog' in features:
@@ -79,17 +58,6 @@ def image_to_superpixel_graph(img, scale, sigma, min_size, hog_bins, mask=None ,
         colors, positions, hogs, cae_features, shape_features = [], [], [], [], []
 
         for sp in range(num_nodes):
-            # SKIP THE MATH IF IT IS BACKGROUND
-            if not is_valid_node[sp]:
-                # Just append dummy zeros to keep the list lengths intact
-                if 'color' in features: colors.append([0, 0, 0])
-                if 'pos' in features: positions.append([0, 0])
-                if 'hog' in features: hogs.append(np.zeros(hog_bins, dtype=np.float32))
-                if 'shape' in features: shape_features.append(np.zeros(14, dtype=np.float32))
-                if 'cae' in features: cae_features.append(np.zeros(cae_latent_dim, dtype=np.float32))
-                continue
-
-            # Standard Extraction
             mask_sp = (segments == sp)
             coords = np.column_stack(np.nonzero(mask_sp))
             vals = img_lab[mask_sp]
@@ -115,17 +83,13 @@ def image_to_superpixel_graph(img, scale, sigma, min_size, hog_bins, mask=None ,
                 ymin, ymax = coords[:, 0].min(), coords[:, 0].max()
                 xmin, xmax = coords[:, 1].min(), coords[:, 1].max()
                 
-                # 1. Get the raw rectangular crop
-                crop_img = img[ymin:ymax+1, xmin:xmax+1].copy() 
+                # Copy the crop to avoid modifying the original image
+                crop_img = img[ymin:ymax+1, xmin:xmax+1].copy()
                 
-                # 2. Get the boolean mask for just this patch
+                # ZERO-MASK: Black out pixels that don't belong to the superpixel
                 local_mask = mask_sp[ymin:ymax+1, xmin:xmax+1]
+                crop_img[~local_mask] = 0
                 
-                # 3. Apply the ZERO-MASK (Black out everything outside the superpixel)
-                # Expand dims so we can broadcast across RGB channels
-                crop_img[~local_mask] = 0 
-                
-                # 4. Pass to CAE
                 crop_tensor = cae_transform(crop_img).unsqueeze(0)
                 with torch.no_grad():
                     latent_vector = cae_model.encoder(crop_tensor).squeeze(0)
@@ -151,7 +115,6 @@ def image_to_superpixel_graph(img, scale, sigma, min_size, hog_bins, mask=None ,
                 node_shape_vec = [area, perimeter, aspect_ratio, circularity, solidity, extent, eccentricity] + log_hu
                 shape_features.append(node_shape_vec)
 
-        # Append extracted loop features to main list
         if 'color' in features: x_list.append(torch.tensor(np.array(colors), dtype=torch.float))
         if 'pos' in features: x_list.append(torch.tensor(np.array(positions), dtype=torch.float))
         if 'hog' in features: x_list.append(torch.tensor(np.array(hogs), dtype=torch.float))
@@ -161,7 +124,6 @@ def image_to_superpixel_graph(img, scale, sigma, min_size, hog_bins, mask=None ,
             x_shape = F.normalize(x_shape, p=2, dim=0) 
             x_list.append(x_shape)
 
-    # Local Binary Patterns (LBP) Histogram 
     if 'lbp' in features:
         gray = (rgb2gray(img) * 255).astype(np.uint8)
         lbp = local_binary_pattern(gray, P=8, R=1.0, method='uniform')
@@ -172,7 +134,6 @@ def image_to_superpixel_graph(img, scale, sigma, min_size, hog_bins, mask=None ,
         x_lbp = F.normalize(x_lbp, p=1, dim=1) 
         x_list.append(x_lbp)
 
-    # Local Entropy 
     if 'texture' in features:
         gray_uint8 = (rgb2gray(img) * 255).astype(np.uint8)
         ent = entropy(gray_uint8, disk(3))
@@ -183,78 +144,54 @@ def image_to_superpixel_graph(img, scale, sigma, min_size, hog_bins, mask=None ,
         x_ent = x_ent / (node_counts + 1e-6)
         x_list.append(x_ent)
 
-    # Combine all selected features
-    x = torch.cat(x_list, dim=1).to(torch.float32)
+    # 4. Feature Combination & Layer Normalization
+    x_raw = torch.cat(x_list, dim=1).to(torch.float32)
     # Standardize the whole vector so no modality overpowers the others
-    x = F.layer_norm(x, x.shape[1:]) 
-    x = x.to(torch.bfloat16)
-    # APPLY PRUNING: Only keep the valid nodes!
-    x_pruned = x[is_valid_node]
-    old_to_new_ids = torch.full((num_nodes,), -1, dtype=torch.long)
-    old_to_new_ids[is_valid_node] = torch.arange(x_pruned.size(0))
+    x = F.layer_norm(x_raw, x_raw.shape[1:]).to(torch.bfloat16)
 
-    #  Build Pruned Edges 
+    # 5. Build Fast Edges (Cleaned of dead pruning logic)
     edges = set()
     for y in range(h - 1):
         for x_ in range(w - 1):
-            a = segments[y, x_]
-            b = segments[y, x_ + 1]
-            c = segments[y + 1, x_]
+            a, b, c = segments[y, x_], segments[y, x_ + 1], segments[y + 1, x_]
+            if a != b:
+                edges.add((a, b))
+                edges.add((b, a))
+            if a != c:
+                edges.add((a, c))
+                edges.add((c, a))
 
-            if a != b and is_valid_node[a] and is_valid_node[b]:
-                edges.add((old_to_new_ids[a].item(), old_to_new_ids[b].item()))
-                edges.add((old_to_new_ids[b].item(), old_to_new_ids[a].item()))
-                
-            if a != c and is_valid_node[a] and is_valid_node[c]:
-                edges.add((old_to_new_ids[a].item(), old_to_new_ids[c].item()))
-                edges.add((old_to_new_ids[c].item(), old_to_new_ids[a].item()))
-
-    # ---------------------------------------------------------
-    # Build PyG Edge Index Safely (Handle 0-edge graphs)
-    # ---------------------------------------------------------
     if len(edges) > 0:
         edge_index = torch.tensor(list(edges), dtype=torch.long).t().contiguous()
     else:
         edge_index = torch.empty((2, 0), dtype=torch.long)
     
-    # ---------------------------------------------------------
-    # Calculate Local Edge Attributes (Distance and Angle)
-    # ---------------------------------------------------------
+    # 6. Calculate Local Edge Attributes (Distance and Angle)
     edge_attr = None
     if 'pos' in features:
         if edge_index.numel() > 0:
-            # Dynamically find where the 'pos' features are stored in x_pruned
             feature_block_sizes = {'color': 3, 'pos': 2, 'hog': hog_bins, 'shape': 14, 'lbp': 10, 'texture': 1, 'cae': cae_latent_dim}
             extraction_order = ['color', 'pos', 'hog', 'cae', 'shape', 'lbp', 'texture']
             
             pos_start = 0
             for feat in extraction_order:
-                if feat == 'pos':
-                    break
-                if feat in features:
-                    pos_start += feature_block_sizes[feat]
+                if feat == 'pos': break
+                if feat in features: pos_start += feature_block_sizes[feat]
                     
-            # Extract positions and cast to float32 for math functions
-            pos_tensor = x_pruned[:, pos_start : pos_start+2].to(torch.float32)
+            pos_tensor = x[:, pos_start : pos_start+2].to(torch.float32)
             row, col = edge_index
             
-            # Calculate Relative Vector
             rel_pos = pos_tensor[row] - pos_tensor[col]
-            
-            # 1. Distance
             dist = torch.norm(rel_pos, dim=-1, keepdim=True)
-            # 2. Angle (Sine and Cosine)
             angle = torch.atan2(rel_pos[:, 1], rel_pos[:, 0])
             sin_angle = torch.sin(angle).unsqueeze(-1)
             cos_angle = torch.cos(angle).unsqueeze(-1)
             
-            # Concatenate and cast back to bfloat16 to match your network
             edge_attr = torch.cat([dist, sin_angle, cos_angle], dim=-1).to(torch.bfloat16)
         else:
-            # FIX: If there are no edges, supply an empty [0, 3] tensor instead of None!
             edge_attr = torch.empty((0, 3), dtype=torch.bfloat16)
 
-    data = Data(x=x_pruned, edge_index=edge_index, edge_attr=edge_attr)
+    data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
         
     if n_hops > 1:
         actual_nodes = data.x.size(0)

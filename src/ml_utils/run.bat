@@ -39,9 +39,9 @@ set CSV_PATH=C:\Users\sinan\Projects\Wildlife-Re-ID\src\images\reid-10k\metadata
 :: [Persistent directory for CAE models so they aren't lost in timestamped folders
 set SHARED_CAE_DIR=models\cae
 
-set IMG_SIZE=256
-set CAE_LATENT_DIM=32
-set CAE_EPOCHS=150
+set IMG_SIZE=512
+set CAE_LATENT_DIM=64
+set CAE_EPOCHS=75
 set FELZ_SCALE=70.0
 set FELZ_SIGMA=0.65
 set FELZ_MIN_SIZE=300
@@ -57,7 +57,7 @@ set DATASETS=LynxID2025 SalamanderID2025 SeaTurtleID2022 AmvrakikosTurtles ATRW 
 :: NEW DYNAMIC CHECKPOINT NAMING SYSTEM
 :: ========================================================
 :: Manually update this ID for each new experiment
-set RUN_ID=run_021
+set RUN_ID=run_026
 
 set EXPERIMENT_TAG=animal_clef_2026_baseline
 set CHECKPOINT_DIR=runs\!RUN_ID!_!EXPERIMENT_TAG!
@@ -65,7 +65,7 @@ set CHECKPOINT_DIR=runs\!RUN_ID!_!EXPERIMENT_TAG!
 :: Safe formatting for CAE names
 set SAFE_SCALE=%FELZ_SCALE:.=p%
 set SAFE_SIGMA=%FELZ_SIGMA:.=p%
-set CAE_NAME=cae_dim%CAE_LATENT_DIM%_size%IMG_SIZE%_scale%SAFE_SCALE%_sigma%SAFE_SIGMA%_clef_big_v2
+set CAE_NAME=cae_dim%CAE_LATENT_DIM%_size%IMG_SIZE%_scale%SAFE_SCALE%_sigma%SAFE_SIGMA%_clef_big_v6
 
 :: Point the weights path to the persistent shared directory
 set CAE_WEIGHTS_PATH=%SHARED_CAE_DIR%\%CAE_NAME%.pth
@@ -152,7 +152,8 @@ if exist "%CAE_WEIGHTS_PATH%" (
         --save_dir %SHARED_CAE_DIR% ^
         --checkpoint_dir %CHECKPOINT_DIR% ^
         --model_name %CAE_NAME% ^
-        --img_size %IMG_SIZE%
+        --img_size %IMG_SIZE% 
+
         
     if !errorlevel! neq 0 (
         echo %DANGER_RED%[ERROR] CAE Training failed. Aborting pipeline.%RESET%
@@ -188,7 +189,7 @@ echo %FOX_ORANGE%[TRAIN] Initiating GNN Training sequence...%RESET%
 python .\src\ml_utils\train_test_prototype.py ^
     --root_dir %RAW_DIR% ^
     --csv_path %TRAIN_CSV% ^
-    --workers 8 ^
+    --workers 4 ^
     --img_size %IMG_SIZE% ^
     --felz_scale %FELZ_SCALE% ^
     --felz_sigma %FELZ_SIGMA% ^
