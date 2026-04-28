@@ -49,7 +49,7 @@ def debug_cae_reconstruction(img_path, weights_path, latent_dim=24, img_size=256
     img_hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
     
     # Target number of nodes
-    target_superpixels = 300 
+    target_superpixels = 240 
     
     # Initialize SEEDS
     seeds_algo = createSuperpixelSEEDS(
@@ -185,14 +185,14 @@ def debug_cae_reconstruction(img_path, weights_path, latent_dim=24, img_size=256
 if __name__ == "__main__":
     # ---> CHANGE THESE PATHS TO MATCH YOUR LOCAL SETUP <---
     TEST_IMAGE = r"src\ml_utils\gnn\000011.jpg"
-    #TEST_IMAGE= r"C:\Users\sinan\Projects\Wildlife-Re-ID\src\images\animal-clef-2026\images\TexasHornedLizards\test\1e177a6eab060e92.jpg"
+    TEST_IMAGE= r"C:\Users\sinan\Projects\Wildlife-Re-ID\src\images\animal-clef-2026\images\TexasHornedLizards\test\1e177a6eab060e92.jpg"
     ## Point this directly to your newly trained CAE weights
-    CAE_WEIGHTS = r"C:\Users\sinan\Projects\Wildlife-Re-ID\models\cae\cae_dim64_size256_scale70p0_sigma0p65_clef_big_v4.pth"
+    CAE_WEIGHTS = r"C:\Users\sinan\Projects\Wildlife-Re-ID\models\cae\cae_dim90_size512_seeds240_v2.pth"
     
     debug_cae_reconstruction(
         img_path=TEST_IMAGE, 
         weights_path=CAE_WEIGHTS,
-        latent_dim=64,  # Make sure this matches what you pre-trained with
+        latent_dim=90,  # Make sure this matches what you pre-trained with
         img_size=512,   
         patch_size=64   
     )

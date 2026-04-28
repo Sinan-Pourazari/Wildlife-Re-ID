@@ -574,8 +574,9 @@ def main(args):
         shared_dataset = UniversalGraphDataset(
             samples=test_samples, root_dir=args.root_dir, cache_dir=args.cache_dir, mode=args.data_mode, rebuild_cache=False, 
             img_size=args.img_size, n_hops=args.n_hops, features=args.features, cae_version=args.cae_version, 
-            cae_weights_path=args.cae_weights_path, cae_latent_dim=args.cae_latent_dim, felz_scale=args.felz_scale, 
-            felz_sigma=args.felz_sigma, min_size=args.felz_min_size, num_bins=args.num_hog_bins
+            cae_weights_path=args.cae_weights_path, cae_latent_dim=args.cae_latent_dim, 
+            seeds_num_superpixels=args.seeds_num_superpixels, seeds_num_levels=args.seeds_num_levels, 
+            seeds_prior=args.seeds_prior, seeds_histogram_bins=args.seeds_histogram_bins, num_bins=args.num_hog_bins
         )
         shared_loader = DataLoader(shared_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, persistent_workers=True)
 
@@ -670,9 +671,10 @@ if __name__ == "__main__":
     parser.add_argument("--data_mode", type=str, default="auto", choices=["auto", "memory", "lazy"])
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--workers", type=int, default=4)
-    parser.add_argument("--felz_sigma", type=float, default=0.65)
-    parser.add_argument("--felz_scale", type=float, default=70.0)
-    parser.add_argument("--felz_min_size", type=int, default=150)
+    parser.add_argument("--seeds_num_superpixels", type=int, default=300)
+    parser.add_argument("--seeds_num_levels", type=int, default=4)
+    parser.add_argument("--seeds_prior", type=int, default=1)
+    parser.add_argument("--seeds_histogram_bins", type=int, default=4)
     parser.add_argument("--top_k_detailed", type=int, default=5)
     parser.add_argument("--use_existing_csv", action="store_true")
     parser.add_argument("--parallel_workers", type=int, default=4)

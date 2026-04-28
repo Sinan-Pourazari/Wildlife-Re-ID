@@ -82,15 +82,13 @@ def generate_augmented_metadata(train_df, target_K, save_dir):
     return fat_csv_path
 
 
-def process_for_lmdb(filename, root_dir, felz_scale, felz_sigma, min_size, num_bins, features, max_size, n_hops, cae_weights_path, cae_latent_dim):
+def process_for_lmdb(filename, root_dir, seeds_num_superpixels, seeds_num_levels, seeds_prior, seeds_histogram_bins, num_bins, features, max_size, n_hops, cae_weights_path, cae_latent_dim):
     is_aug = '_aug_' in filename
     physical_filename = re.sub(r'_aug_\d+', '', filename) if is_aug else filename
     
-    # root_dir now safely points to RAW images
     img_path = os.path.join(root_dir, physical_filename)
     img = Image.open(img_path).convert("RGB")
 
-    # Pure image augmentations (no mask syncing needed anymore)
     if is_aug:
         import random
         if random.random() > 0.5:
@@ -106,16 +104,20 @@ def process_for_lmdb(filename, root_dir, felz_scale, felz_sigma, min_size, num_b
         ])
         img = color_augmenter(img)
     else:
+        # 1. If it's too big, shrink it down first
         if max(img.size) > max_size:
             img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
             
-    # Pass mask=None to the graph generator TODO remove deprecatd mask behaviour entirely
+        # 2. CRITICAL FIX: Always pad to guarantee the image is exactly max_size x max_size!
+        img = ImageOps.pad(img, (max_size, max_size), color=(0, 0, 0))
+            
     graph = image_to_superpixel_graph(
         img, 
         mask=None, 
-        scale=felz_scale,        
-        sigma=felz_sigma,        
-        min_size=min_size,       
+        seeds_num_superpixels=seeds_num_superpixels,
+        seeds_num_levels=seeds_num_levels,
+        seeds_prior=seeds_prior,
+        seeds_histogram_bins=seeds_histogram_bins,
         hog_bins=num_bins,      
         n_hops=n_hops, 
         features=features, 
@@ -221,14 +223,16 @@ class InMemoryGraphDataset(PyGDataset):
 
 class UniversalGraphDataset(PyGDataset):
     _shared_envs = {}
-    def __init__(self, samples, root_dir, cache_dir, n_hops, felz_scale, felz_sigma, min_size, num_bins, mode='auto', rebuild_cache=False, img_size=1024,
+    def __init__(self, samples, root_dir, cache_dir, n_hops, seeds_num_superpixels, seeds_num_levels, seeds_prior, seeds_histogram_bins, num_bins, mode='auto', rebuild_cache=False, img_size=1024,
                   num_train_classes=None, features=['color', 'pos', 'hog'], cae_version="none", cae_weights_path=None, cae_latent_dim = None):
         super().__init__()
         self.samples = samples
         self.root_dir = root_dir
-        self.cache_dir = os.path.abspath(cache_dir)  # This is now the directory holding data.mdb and lock.mdb
-        self.felz_scale = felz_scale
-        self.felz_sigma = felz_sigma
+        self.cache_dir = os.path.abspath(cache_dir) 
+        self.seeds_num_superpixels = seeds_num_superpixels
+        self.seeds_num_levels = seeds_num_levels
+        self.seeds_prior = seeds_prior
+        self.seeds_histogram_bins = seeds_histogram_bins
         self.img_size = img_size
         self.graphs = []
         self.features = features
@@ -236,7 +240,6 @@ class UniversalGraphDataset(PyGDataset):
         self.cae_version = cae_version
         self.cae_weights_path = cae_weights_path
         self.cae_latent_dim = cae_latent_dim
-        self.min_size = min_size
         self.num_bins = num_bins
         self.base_key_bytes = self._generate_base_key()
         if mode == 'auto':
@@ -305,7 +308,7 @@ class UniversalGraphDataset(PyGDataset):
         if 'hog' in self.features:
             feature_str += f"hogb-{self.num_bins}"    
             
-        base_str = f"res{self.img_size}_felzscale{self.felz_scale}_felzsigma{self.felz_sigma}_{self.min_size}_hops{self.n_hops}_{feature_str}_"
+        base_str = f"res{self.img_size}_SEEDS_N{self.seeds_num_superpixels}_L{self.seeds_num_levels}_P{self.seeds_prior}_H{self.seeds_histogram_bins}_hops{self.n_hops}_{feature_str}_"
         return base_str.encode('utf-8')
 
     def _get_key(self, filename):
@@ -340,22 +343,22 @@ class UniversalGraphDataset(PyGDataset):
         # Inside _warmup_cache in dataloader.py
         def wrapper(task):
             import torch
-            torch.set_num_threads(1)  # <--- STOPS CPU THRASHING
+            torch.set_num_threads(1)
             key, filename = task
             
-                    # Use explicit keywords to prevent positional mismatches!
             success, result = process_for_lmdb(
                 filename=filename, 
                 root_dir=self.root_dir, 
-                felz_scale=self.felz_scale,
-                felz_sigma=self.felz_sigma,
-                min_size=self.min_size,
+                seeds_num_superpixels=self.seeds_num_superpixels,
+                seeds_num_levels=self.seeds_num_levels,
+                seeds_prior=self.seeds_prior,
+                seeds_histogram_bins=self.seeds_histogram_bins,
                 num_bins=self.num_bins,
                 features=self.features,
                 max_size=self.img_size,
                 n_hops=self.n_hops, 
                 cae_weights_path=self.cae_weights_path,
-                cae_latent_dim=self.cae_latent_dim # <--- ADD THIS
+                cae_latent_dim=self.cae_latent_dim 
             )
             return key, success, result
         # return_as="generator" yields results as soon as workers finish them

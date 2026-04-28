@@ -40,24 +40,25 @@ set CSV_PATH=C:\Users\sinan\Projects\Wildlife-Re-ID\src\images\reid-10k\metadata
 set SHARED_CAE_DIR=models\cae
 
 set IMG_SIZE=512
-set CAE_LATENT_DIM=64
-set CAE_EPOCHS=75
-set FELZ_SCALE=70.0
-set FELZ_SIGMA=0.35
-set FELZ_MIN_SIZE=400
+set CAE_LATENT_DIM=90
+set CAE_EPOCHS=150
+set SEEDS_NUM_SUPERPIXELS=240
+set SEEDS_NUM_LEVELS=4
+set SEEDS_PRIOR=1
+set SEEDS_HISTOGRAM_BINS=4
 set NUM_HOG_BINS=9
 set N_HOPS=1
 set EDGE_STRATEGY=hybrid
-set TRAIN_EPOCHS=200
+set TRAIN_EPOCHS=100
 :: Define your target species here! (Leave blank to use the whole dataset)
 :: E.g., set DATASETS=tiger turtle leopard
-set DATASETS=LynxID2025 SalamanderID2025 SeaTurtleID2022 AmvrakikosTurtles ATRW LeopardID2022 SeaStarReID2023
+set DATASETS=LynxID2025 SalamanderID2025 SeaTurtleID2022 AmvrakikosTurtles ATRW LeopardID2022
 
 :: ========================================================
 :: NEW DYNAMIC CHECKPOINT NAMING SYSTEM
 :: ========================================================
 :: Manually update this ID for each new experiment
-set RUN_ID=run_027
+set RUN_ID=run_030
 
 set EXPERIMENT_TAG=animal_clef_2026_baseline
 set CHECKPOINT_DIR=runs\!RUN_ID!_!EXPERIMENT_TAG!
@@ -65,7 +66,7 @@ set CHECKPOINT_DIR=runs\!RUN_ID!_!EXPERIMENT_TAG!
 :: Safe formatting for CAE names
 set SAFE_SCALE=%FELZ_SCALE:.=p%
 set SAFE_SIGMA=%FELZ_SIGMA:.=p%
-set CAE_NAME=cae_dim%CAE_LATENT_DIM%_size%IMG_SIZE%_scale%SAFE_SCALE%_sigma%SAFE_SIGMA%_clef_big_v6
+set CAE_NAME=cae_dim%CAE_LATENT_DIM%_size%IMG_SIZE%_seeds%SEEDS_NUM_SUPERPIXELS%_v2
 
 :: Point the weights path to the persistent shared directory
 set CAE_WEIGHTS_PATH=%SHARED_CAE_DIR%\%CAE_NAME%.pth
@@ -191,9 +192,10 @@ python .\src\ml_utils\train_test_prototype.py ^
     --csv_path %TRAIN_CSV% ^
     --workers 4 ^
     --img_size %IMG_SIZE% ^
-    --felz_scale %FELZ_SCALE% ^
-    --felz_sigma %FELZ_SIGMA% ^
-    --felz_min_size %FELZ_MIN_SIZE% ^
+    --seeds_num_superpixels %SEEDS_NUM_SUPERPIXELS% ^
+    --seeds_num_levels %SEEDS_NUM_LEVELS% ^
+    --seeds_prior %SEEDS_PRIOR% ^
+    --seeds_histogram_bins %SEEDS_HISTOGRAM_BINS% ^
     --num_hog_bins %NUM_HOG_BINS% ^
     --n_hops %N_HOPS% ^
     --epochs %TRAIN_EPOCHS% ^
@@ -222,15 +224,16 @@ python .\src\ml_utils\eval.py ^
     --root_dir %RAW_DIR% ^
     --csv_path %TEST_CSV% ^
     --img_size %IMG_SIZE% ^
-    --felz_scale %FELZ_SCALE% ^
-    --felz_sigma %FELZ_SIGMA% ^
-    --felz_min_size %FELZ_MIN_SIZE% ^
+    --seeds_num_superpixels %SEEDS_NUM_SUPERPIXELS% ^
+    --seeds_num_levels %SEEDS_NUM_LEVELS% ^
+    --seeds_prior %SEEDS_PRIOR% ^
+    --seeds_histogram_bins %SEEDS_HISTOGRAM_BINS% ^
     --num_hog_bins %NUM_HOG_BINS% ^
     --data_mode auto ^
     --workers 4 ^
     --parallel_workers 14 ^
     --checkpoints_dir %CHECKPOINT_DIR% ^
-    --batch_size 1024 ^
+    --batch_size 512 ^
     --features color pos hog shape lbp cae ^
     --cae_weights_path "%CAE_WEIGHTS_PATH%" ^
     --cae_version %CAE_NAME% ^
@@ -245,15 +248,16 @@ python .\src\ml_utils\eval.py ^
     --root_dir %RAW_DIR% ^
     --csv_path %GOLBAL_CSV% ^
     --img_size %IMG_SIZE% ^
-    --felz_scale %FELZ_SCALE% ^
-    --felz_sigma %FELZ_SIGMA% ^
-    --felz_min_size %FELZ_MIN_SIZE% ^
+    --seeds_num_superpixels %SEEDS_NUM_SUPERPIXELS% ^
+    --seeds_num_levels %SEEDS_NUM_LEVELS% ^
+    --seeds_prior %SEEDS_PRIOR% ^
+    --seeds_histogram_bins %SEEDS_HISTOGRAM_BINS% ^
     --num_hog_bins %NUM_HOG_BINS% ^
     --data_mode auto ^
     --workers 4 ^
     --parallel_workers 14 ^
     --checkpoints_dir %CHECKPOINT_DIR% ^
-    --batch_size 1024 ^
+    --batch_size 512 ^
     --features color pos hog shape lbp cae ^
     --cae_weights_path "%CAE_WEIGHTS_PATH%" ^
     --cae_version %CAE_NAME% ^

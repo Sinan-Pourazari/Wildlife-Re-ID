@@ -254,7 +254,7 @@ def train_one_epoch(loader, model, arcface_loss, scaler, optimizer, margin=1.0):
 
     # Weight factor for how hard to push the disentanglement. 
     # 1.0 is standard, but you can tune this up or down.
-    gamma_ortho = 1.0 
+    gamma_ortho = 10.0 
 
     for data in loader:
         data = data.to(device)
@@ -269,8 +269,8 @@ def train_one_epoch(loader, model, arcface_loss, scaler, optimizer, margin=1.0):
             id_emb, id_features, species_emb, species_logits = model(data)
 
             # --- TARGET 1: Identity Branch (Learn Who it is) ---
-            loss_triplet = batch_topk_semi_hard_triplet_loss(id_features, labels, margin=margin, k_neg=8)
-            loss_arc = 0.2 * arcface_loss(id_emb, labels)
+            #loss_triplet = batch_topk_semi_hard_triplet_loss(id_features, labels, margin=margin, k_neg=8)
+            loss_arc = 1 * arcface_loss(id_emb, labels)
             
             # --- TARGET 2: Species Branch (Learn What it is) ---
             # Standard Cross Entropy forces `species_emb` to contain the species data
@@ -284,14 +284,14 @@ def train_one_epoch(loader, model, arcface_loss, scaler, optimizer, margin=1.0):
             #loss_ortho = gamma_ortho * orthogonality_loss(id_emb, species_emb)
             
             # Total Loss
-            loss = loss_triplet + loss_arc + loss_species + loss_ortho
+            loss = loss_arc + loss_species + loss_ortho
             
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
 
         total += float(loss.item())
-        total_triplet += loss_triplet.item()
+        total_triplet += 0# loss_triplet.item()
         total_ce += loss_arc.item()
         total_species += loss_species.item()
         total_ortho += loss_ortho.item()
@@ -554,7 +554,7 @@ def main(args):
     # Generate augmentations
     aug_csv_path = generate_augmented_metadata(
         train_df=train_df, 
-        target_K=8, 
+        target_K=4, 
         save_dir=args.checkpoint_dir
     )  
     aug_train_df = pd.read_csv(aug_csv_path)
@@ -593,12 +593,12 @@ def main(args):
         cae_version=args.cae_version,
         cae_weights_path=args.cae_weights_path,
         cae_latent_dim=args.cae_latent_dim,
-        felz_sigma= args.felz_sigma,
-        felz_scale= args.felz_scale,
-        num_bins= args.num_hog_bins,
-        min_size= args.felz_min_size
-            )
-
+        seeds_num_superpixels=args.seeds_num_superpixels,
+        seeds_num_levels=args.seeds_num_levels,
+        seeds_prior=args.seeds_prior,
+        seeds_histogram_bins=args.seeds_histogram_bins,
+        num_bins= args.num_hog_bins
+    )
     # Look at the very first graph in the dataset to see how wide the features are
     first_graph = train_dataset[0]
     dynamic_in_dim = first_graph.x.shape[1]
@@ -624,10 +624,18 @@ def main(args):
         min_size= args.felz_min_size
         )"""
     # DataLoaders
-    batch_sampler = PKBatchSampler(aug_train_df["global_label"].values, P=30, K=8)
-    train_loader = DataLoader(train_dataset, batch_sampler=batch_sampler, num_workers=args.workers, persistent_workers=True, prefetch_factor=16, pin_memory= True)
+    batch_sampler = PKBatchSampler(aug_train_df["global_label"].values, P=15, K=8)
+    #train_loader = DataLoader(train_dataset, batch_sampler=batch_sampler, num_workers=args.workers, persistent_workers=True, prefetch_factor=2, pin_memory= True)
     #test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=args.workers)
-
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=200, # e.g., 128 or 256
+        shuffle=True, 
+        num_workers=args.workers, 
+        persistent_workers=True, 
+        prefetch_factor=2, 
+        pin_memory=True
+    )
     # Model & Optimizer
     # Look at the first graph to find out the feature width dynamically
     first_graph = train_dataset[0]
@@ -656,7 +664,7 @@ def main(args):
         mode='min',        # We want the loss to minimize
         factor=0.1,        # Multiply current LR by 0.5 when stuck
         patience=10,        # Wait 10 epochs of no improvement
-        threshold=0.1,    # The loss must improve by at least this much to reset the patience
+        threshold=0.01,    # The loss must improve by at least this much to reset the patience
         cooldown= 5,
         min_lr= 0.00001
     )
@@ -723,10 +731,10 @@ if __name__ == "__main__":
     # Graph Structure Settings
     parser.add_argument("--edge_strategy", type=str, default="spatial", choices=["spatial", "attention", "hybrid"], help="How to build GNN edges: 'spatial' (LMDB), 'attention' (GPU KNN), or 'hybrid' (Both).")
     parser.add_argument("--k_neighbors", type=int, default=3, help="Number of dynamic attention edges per node (if using attention or hybrid).")
-    parser.add_argument("--felz_sigma", type=float, default=0.65, help = "")
-    parser.add_argument("--felz_scale", type= float, default = 70, help = "")
-    parser.add_argument("--felz_min_size", type= int, default = 150, help = "")
-    # Hardware settings
+    parser.add_argument("--seeds_num_superpixels", type=int, default=300)
+    parser.add_argument("--seeds_num_levels", type=int, default=4)
+    parser.add_argument("--seeds_prior", type=int, default=1)
+    parser.add_argument("--seeds_histogram_bins", type=int, default=4)
     parser.add_argument("--workers", type=int, default=4, help="Number of CPU workers for DataLoader")
     
     # Holdout settings

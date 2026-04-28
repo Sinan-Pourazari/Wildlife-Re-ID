@@ -1,78 +1,108 @@
 import torch
 import numpy as np
-from skimage.segmentation import slic, felzenszwalb
+import cv2
+import math
+import scipy.sparse as sp
+from scipy.sparse import coo_matrix
 from skimage.color import rgb2lab, rgb2gray
-from skimage.io import imread
 from skimage.feature import local_binary_pattern
 from skimage.filters.rank import entropy
 from skimage.morphology import disk
+from skimage.measure import regionprops
+from PIL import Image
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision import transforms
 from torch_geometric.data import Data
-from torch_geometric.nn import GATv2Conv, global_mean_pool, global_max_pool, knn_graph, SAGEConv
-from PIL import Image
+from torch_geometric.nn import GATv2Conv, global_mean_pool, knn_graph
+from torch_geometric.utils import dropout_edge, dropout_node, from_scipy_sparse_matrix
+
 from helper import per_pixel_hog_bins
 from gnn.cae import TextureEncoder
-from torchvision import transforms
-from skimage.measure import regionprops
-import math
-from torch_geometric.utils import dropout_edge, dropout_node, subgraph
 
-def image_to_superpixel_graph(img, scale, sigma, min_size, hog_bins, mask=None, hog_signed=False, hog_l2norm=True, features=['color', 'pos', 'hog'], n_hops=1, cae_weights_path=None, cae_latent_dim=128, return_segments=False):   
+def image_to_superpixel_graph(img, seeds_num_superpixels=300, seeds_num_levels=4, seeds_prior=1, seeds_histogram_bins=4, hog_bins=9, mask=None, hog_signed=False, hog_l2norm=True, features=['color', 'pos', 'hog'], n_hops=1, cae_weights_path=None, cae_latent_dim=128, return_segments=False):   
     if isinstance(img, Image.Image):
         img = np.array(img)
     
-    h, w, _ = img.shape
+    h, w, c = img.shape
 
-    # 1. Segment the Image
-    segments = felzenszwalb(img, scale=scale, sigma=sigma, min_size=min_size)
-    num_nodes = segments.max() + 1
+    # ==================================================================
+    # 1. Instant Segmentation via SEEDS
+    # ==================================================================
+    img_hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
+    
+    seeds_algo = cv2.ximgproc.createSuperpixelSEEDS(
+        w, h, c, 
+        seeds_num_superpixels, 
+        num_levels=seeds_num_levels, 
+        prior=seeds_prior, 
+        histogram_bins=seeds_histogram_bins
+    )
+    
+    try:
+        seeds_algo.iterate(img_hsv, 4)
+    except cv2.error:
+        # C++ MEMORY CRASH PREVENTER: If image math fails, fallback to 1 level
+        # print(f"[!] SEEDS math failed on shape {img.shape}. Applying safe fallback.")
+        seeds_algo = cv2.ximgproc.createSuperpixelSEEDS(
+            w, h, c, seeds_num_superpixels, num_levels=1, prior=seeds_prior, histogram_bins=seeds_histogram_bins
+        )
+        seeds_algo.iterate(img_hsv, 4)
+        
+    raw_segments = seeds_algo.getLabels()
+    
+    # CRITICAL FIX: Ensure labels are strictly contiguous (SEEDS sometimes skips IDs)
+    unique_labels, segments = np.unique(raw_segments, return_inverse=True)
+    segments = segments.reshape(h, w)
+    
+    num_nodes = len(unique_labels)
     seg_flat = torch.tensor(segments, dtype=torch.long).view(-1)
     
     x_list = []
 
-    # 2. CAE SETUP 
-    if 'cae' in features:
-        if cae_weights_path is None:
-            raise ValueError("Requested 'cae' features but no cae_weights_path provided!")
-        cae_model = get_cae_model(cae_weights_path, cae_latent_dim)
-        
-        cae_transform = transforms.Compose([
-            transforms.ToPILImage(),
-            transforms.Resize((64, 64)), # MUST BE 64 TO MATCH CAE!
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
-
-    # 3. Extract Node Features
+    # ==================================================================
+    # 2. Extract Features (Vectorized + Batched)
+    # ==================================================================
     if any(f in features for f in ['color', 'pos', 'hog', 'cae', 'shape']):
         img_lab = rgb2lab(img)
         if 'hog' in features:
             pix_bin_idx, pix_mag = per_pixel_hog_bins(img, n_bins=hog_bins, signed=hog_signed)
         
-        if 'shape' in features:
-            props = regionprops(segments + 1)
-            total_area = h * w
-            max_perimeter = 2 * (h + w)
+        props = regionprops(segments + 1)
+        total_area = h * w
+        max_perimeter = 2 * (h + w)
             
-        colors, positions, hogs, cae_features, shape_features = [], [], [], [], []
+        colors, positions, hogs, shape_features = [], [], [], []
+        
+        if 'cae' in features:
+            cae_model = get_cae_model(cae_weights_path, cae_latent_dim)
+            cae_transform = transforms.Compose([
+                transforms.ToPILImage(),
+                transforms.Resize((64, 64)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            ])
+            all_crops = [None] * num_nodes 
 
         for sp in range(num_nodes):
-            mask_sp = (segments == sp)
-            coords = np.column_stack(np.nonzero(mask_sp))
-            vals = img_lab[mask_sp]
+            prop = props[sp]
+            min_y, min_x, max_y, max_x = prop.bbox
+            
+            # O(1) Masking
+            local_mask = prop.image 
+            vals = img_lab[min_y:max_y, min_x:max_x][local_mask]
 
             if 'color' in features:
                 L, A, B = vals[:, 0].mean(), vals[:, 1].mean(), vals[:, 2].mean()
                 colors.append([L, A, B])
 
             if 'pos' in features:
-                y, x = coords[:, 0].mean(), coords[:, 1].mean()
+                y, x = prop.centroid
                 positions.append([x / w, y / h])
 
             if 'hog' in features:
-                sp_bins = pix_bin_idx[mask_sp].ravel()
-                sp_w = pix_mag[mask_sp].ravel()
+                sp_bins = pix_bin_idx[min_y:max_y, min_x:max_x][local_mask].ravel()
+                sp_w = pix_mag[min_y:max_y, min_x:max_x][local_mask].ravel()
                 sp_bins = np.clip(sp_bins, 0, hog_bins - 1)
                 hog_hist = np.bincount(sp_bins, weights=sp_w, minlength=hog_bins).astype(np.float32)[:hog_bins]
                 if hog_l2norm:
@@ -80,49 +110,40 @@ def image_to_superpixel_graph(img, scale, sigma, min_size, hog_bins, mask=None, 
                 hogs.append(hog_hist)
                 
             if 'cae' in features:
-                ymin, ymax = coords[:, 0].min(), coords[:, 0].max()
-                xmin, xmax = coords[:, 1].min(), coords[:, 1].max()
+                crop_img = img[min_y:max_y, min_x:max_x].copy()
                 
-                # Copy the crop to avoid modifying the original image
-                crop_img = img[ymin:ymax+1, xmin:xmax+1].copy()
+                # MEAN MASKING
+                if local_mask.any():
+                    mean_color = crop_img[local_mask].mean(axis=0).astype(np.uint8)
+                else:
+                    mean_color = np.array([0, 0, 0], dtype=np.uint8)
+                crop_img[~local_mask] = mean_color
                 
-                # ZERO-MASK: Black out pixels that don't belong to the superpixel
-                local_mask = mask_sp[ymin:ymax+1, xmin:xmax+1]
-                crop_img[~local_mask] = 0
-                
-                crop_tensor = cae_transform(crop_img).unsqueeze(0)
-                with torch.no_grad():
-                    latent_vector = cae_model.encoder(crop_tensor).squeeze(0)
-                cae_features.append(latent_vector.numpy())
+                all_crops[sp] = cae_transform(crop_img)
                 
             if 'shape' in features:
-                prop = props[sp]
                 area = prop.area / total_area
                 perimeter = prop.perimeter / max_perimeter
-                min_y, min_x, max_y, max_x = prop.bbox
                 bb_h = max(max_y - min_y, 1)
                 bb_w = max(max_x - min_x, 1)
-                aspect_ratio = bb_w / bb_h
                 circularity = (4 * math.pi * prop.area) / ((prop.perimeter ** 2) + 1e-6)
-                solidity = prop.solidity
-                extent = prop.extent
-                eccentricity = prop.eccentricity
-                hu_moments = prop.moments_hu
-                log_hu = []
-                for hu in hu_moments:
-                    val = -1 * math.copysign(1.0, hu) * math.log10(abs(hu) + 1e-6)
-                    log_hu.append(val)
-                node_shape_vec = [area, perimeter, aspect_ratio, circularity, solidity, extent, eccentricity] + log_hu
-                shape_features.append(node_shape_vec)
+                log_hu = [-1 * math.copysign(1.0, hu) * math.log10(abs(hu) + 1e-6) for hu in prop.moments_hu]
+                shape_features.append([area, perimeter, bb_w / bb_h, circularity, prop.solidity, prop.extent, prop.eccentricity] + log_hu)
+
+        # Batched CAE Inference
+        if 'cae' in features:
+            batch_tensor = torch.stack(all_crops)
+            cae_device = next(cae_model.parameters()).device
+            with torch.no_grad():
+                cae_features = cae_model.encoder(batch_tensor.to(cae_device)).cpu().numpy()
+            x_list.append(torch.tensor(cae_features, dtype=torch.float))
 
         if 'color' in features: x_list.append(torch.tensor(np.array(colors), dtype=torch.float))
         if 'pos' in features: x_list.append(torch.tensor(np.array(positions), dtype=torch.float))
         if 'hog' in features: x_list.append(torch.tensor(np.array(hogs), dtype=torch.float))
-        if 'cae' in features: x_list.append(torch.tensor(np.array(cae_features), dtype=torch.float))
         if 'shape' in features:
             x_shape = torch.tensor(np.array(shape_features), dtype=torch.float)
-            x_shape = F.normalize(x_shape, p=2, dim=0) 
-            x_list.append(x_shape)
+            x_list.append(F.normalize(x_shape, p=2, dim=0))
 
     if 'lbp' in features:
         gray = (rgb2gray(img) * 255).astype(np.uint8)
@@ -131,8 +152,7 @@ def image_to_superpixel_graph(img, scale, sigma, min_size, hog_bins, mask=None, 
         lbp_one_hot = F.one_hot(lbp_flat, num_classes=10).float()
         x_lbp = torch.zeros((num_nodes, 10), dtype=torch.float)
         x_lbp.scatter_add_(0, seg_flat.unsqueeze(1).expand(-1, 10), lbp_one_hot)
-        x_lbp = F.normalize(x_lbp, p=1, dim=1) 
-        x_list.append(x_lbp)
+        x_list.append(F.normalize(x_lbp, p=1, dim=1))
 
     if 'texture' in features:
         gray_uint8 = (rgb2gray(img) * 255).astype(np.uint8)
@@ -141,32 +161,32 @@ def image_to_superpixel_graph(img, scale, sigma, min_size, hog_bins, mask=None, 
         node_counts = torch.bincount(seg_flat, minlength=num_nodes).view(-1, 1).float()
         x_ent = torch.zeros((num_nodes, 1), dtype=torch.float)
         x_ent.scatter_add_(0, seg_flat.unsqueeze(1), ent_flat)
-        x_ent = x_ent / (node_counts + 1e-6)
-        x_list.append(x_ent)
+        x_list.append(x_ent / (node_counts + 1e-6))
 
-    # 4. Feature Combination & Layer Normalization
     x_raw = torch.cat(x_list, dim=1).to(torch.float32)
-    # Standardize the whole vector so no modality overpowers the others
     x = F.layer_norm(x_raw, x_raw.shape[1:]).to(torch.bfloat16)
 
-    # 5. Build Fast Edges (Cleaned of dead pruning logic)
-    edges = set()
-    for y in range(h - 1):
-        for x_ in range(w - 1):
-            a, b, c = segments[y, x_], segments[y, x_ + 1], segments[y + 1, x_]
-            if a != b:
-                edges.add((a, b))
-                edges.add((b, a))
-            if a != c:
-                edges.add((a, c))
-                edges.add((c, a))
+    # ==================================================================
+    # 3. Vectorized Edge Building
+    # ==================================================================
+    v_edges = np.column_stack((segments[:-1, :].ravel(), segments[1:, :].ravel()))
+    h_edges = np.column_stack((segments[:, :-1].ravel(), segments[:, 1:].ravel()))
+    
+    all_edges = np.vstack((v_edges, h_edges))
+    all_edges = all_edges[all_edges[:, 0] != all_edges[:, 1]]
+    
+    unique_edges = np.unique(all_edges, axis=0)
+    edges_bi = np.vstack((unique_edges, unique_edges[:, [1, 0]]))
+    edges = np.unique(edges_bi, axis=0)
 
     if len(edges) > 0:
-        edge_index = torch.tensor(list(edges), dtype=torch.long).t().contiguous()
+        edge_index = torch.from_numpy(edges).long().t().contiguous()
     else:
         edge_index = torch.empty((2, 0), dtype=torch.long)
     
-    # 6. Calculate Local Edge Attributes (Distance and Angle)
+    # ==================================================================
+    # 4. Local Edge Attributes
+    # ==================================================================
     edge_attr = None
     if 'pos' in features:
         if edge_index.numel() > 0:
@@ -195,13 +215,12 @@ def image_to_superpixel_graph(img, scale, sigma, min_size, hog_bins, mask=None, 
         
     if n_hops > 1:
         actual_nodes = data.x.size(0)
-        adj = torch.zeros((actual_nodes, actual_nodes), dtype=torch.float)
-        adj[data.edge_index[0], data.edge_index[1]] = 1.0
-        adj.fill_diagonal_(1.0)
-        adj_n = torch.matrix_power(adj, n_hops)
-        adj_n.fill_diagonal_(0.0)
-        new_edge_index = (adj_n > 0).nonzero(as_tuple=False).t().contiguous()
-        data.edge_index = new_edge_index
+        adj = coo_matrix((np.ones(edge_index.shape[1]), (edge_index[0].numpy(), edge_index[1].numpy())), shape=(actual_nodes, actual_nodes))
+        adj = adj + sp.eye(actual_nodes)
+        adj_n = adj ** n_hops
+        adj_n.setdiag(0)
+        adj_n.eliminate_zeros()
+        data.edge_index, _ = from_scipy_sparse_matrix(adj_n)
         
     if return_segments:
         return data, segments

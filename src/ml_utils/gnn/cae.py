@@ -13,6 +13,9 @@ import random
 import torchvision.transforms as T
 import subprocess
 
+# --- NEW SSIM IMPORT ---
+from pytorch_msssim import SSIM
+
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
@@ -32,7 +35,7 @@ def get_gpu_power_watts():
 
 # --- RECONSTRUCTION AUGMENTATION ---
 class ReconstructionTransform:
-    """Standardizes patches for MSE reconstruction."""
+    """Standardizes patches for MSE/SSIM reconstruction."""
     def __init__(self):
         self.transform = T.Compose([
             T.RandomHorizontalFlip(p=0.5),
@@ -186,6 +189,14 @@ class SuperpixelPatchDataset(TorchDataset):
         pil_img = Image.fromarray(self.patches[idx])
         return self.transform(pil_img)
 
+# --- NEW HELPER TO UN-NORMALIZE FOR SSIM ---
+def unnormalize_tensor(tensor, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]):
+    """Reverts ImageNet normalization so SSIM can operate on [0,1] values."""
+    device = tensor.device
+    mean = torch.tensor(mean).view(1, 3, 1, 1).to(device)
+    std = torch.tensor(std).view(1, 3, 1, 1).to(device)
+    return tensor * std + mean
+
 def train_and_save_cae(df, args, save_path, device):
     dataset = SuperpixelPatchDataset(
         args, df, root_dir=args.root_dir, 
@@ -208,15 +219,18 @@ def train_and_save_cae(df, args, save_path, device):
     
     model = TextureEncoder(latent_dim=args.cae_latent_dim).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=5e-4)
-    criterion = nn.MSELoss() # Replacing NT-Xent with simple MSE
+    
+    # --- INITIALIZE BOTH LOSS FUNCTIONS ---
+    mse_criterion = nn.MSELoss() 
+    ssim_module = SSIM(data_range=1.0, size_average=True, channel=3).to(device)
     
     metrics_csv_path = os.path.join(args.checkpoint_dir, "cae_training_metrics.csv")
-    headers = ["epoch", "reconstruction_loss", "vram_mb", "gpu_util_percent", "power_watts"]
+    headers = ["epoch", "mixed_loss", "vram_mb", "gpu_util_percent", "power_watts"]
     with open(metrics_csv_path, 'w') as f:
         f.write(",".join(headers) + "\n")
 
     epochs = args.cae_epochs
-    print(f"\n[CAE Phase] Training Convolutional Autoencoder for {epochs} epochs...")
+    print(f"\n[CAE Phase] Training Convolutional Autoencoder (SSIM + MSE) for {epochs} epochs...")
     
     best_loss = float('inf')
     patience = 10
@@ -232,8 +246,16 @@ def train_and_save_cae(df, args, save_path, device):
             # Pass patch through network
             reconstruction, _ = model(view)
             
-            # Calculate MSE against the original view
-            loss = criterion(reconstruction, view)
+            # 1. Un-normalize tensors strictly for the Loss Calculation
+            view_unnorm = unnormalize_tensor(view).clamp(0, 1)
+            recon_unnorm = unnormalize_tensor(reconstruction).clamp(0, 1)
+            
+            # 2. Calculate both losses
+            mse_loss = mse_criterion(recon_unnorm, view_unnorm)
+            ssim_loss = 1.0 - ssim_module(recon_unnorm, view_unnorm)
+            
+            # 3. Mix them (80% SSIM to preserve sharp edges, 20% MSE for basic color structure)
+            loss = (0.8 * ssim_loss) + (0.2 * mse_loss)
             
             optimizer.zero_grad()
             loss.backward()
@@ -252,7 +274,7 @@ def train_and_save_cae(df, args, save_path, device):
                 pass
             power_watts = get_gpu_power_watts()
             
-        print(f"  Epoch {epoch+1}/{epochs} - Reconstruction Loss (MSE): {epoch_loss:.4f} | VRAM: {vram_mb:.0f}MB | GPU: {gpu_util}%")
+        print(f"  Epoch {epoch+1}/{epochs} - Mixed Loss (SSIM+MSE): {epoch_loss:.4f} | VRAM: {vram_mb:.0f}MB | GPU: {gpu_util}%")
         
         row_data = [epoch+1, epoch_loss, vram_mb, gpu_util, power_watts]
         with open(metrics_csv_path, 'a') as f:
@@ -280,7 +302,7 @@ def train_and_save_cae(df, args, save_path, device):
         df_plot = pd.read_csv(metrics_csv_path)
         
         plt.figure(figsize=(10, 6))
-        plt.plot(df_plot['epoch'], df_plot['reconstruction_loss'], label='MSE Loss', color='blue', linewidth=2)
+        plt.plot(df_plot['epoch'], df_plot['mixed_loss'], label='SSIM+MSE Loss', color='purple', linewidth=2)
         plt.title("CAE Reconstruction Training", fontweight='bold')
         plt.xlabel("Epoch")
         plt.ylabel("Loss")
