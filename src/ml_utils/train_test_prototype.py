@@ -254,7 +254,7 @@ def train_one_epoch(loader, model, arcface_loss, scaler, optimizer, margin=1.0):
 
     # Weight factor for how hard to push the disentanglement. 
     # 1.0 is standard, but you can tune this up or down.
-    gamma_ortho = 10.0 
+    gamma_ortho = 1.0 
 
     for data in loader:
         data = data.to(device)
@@ -269,7 +269,7 @@ def train_one_epoch(loader, model, arcface_loss, scaler, optimizer, margin=1.0):
             id_emb, id_features, species_emb, species_logits = model(data)
 
             # --- TARGET 1: Identity Branch (Learn Who it is) ---
-            #loss_triplet = batch_topk_semi_hard_triplet_loss(id_features, labels, margin=margin, k_neg=8)
+            #loss_triplet = 1*batch_topk_semi_hard_triplet_loss(id_emb, labels, margin=margin, k_neg=8)
             loss_arc = 0.5 * arcface_loss(id_emb, labels)
             
             # --- TARGET 2: Species Branch (Learn What it is) ---
@@ -291,7 +291,7 @@ def train_one_epoch(loader, model, arcface_loss, scaler, optimizer, margin=1.0):
         scaler.update()
 
         total += float(loss.item())
-        total_triplet += 0# loss_triplet.item()
+        total_triplet += 0 #loss_triplet.item()
         total_ce += loss_arc.item()
         total_species += loss_species.item()
         total_ortho += loss_ortho.item()
@@ -624,12 +624,12 @@ def main(args):
         min_size= args.felz_min_size
         )"""
     # DataLoaders
-    #batch_sampler = PKBatchSampler(aug_train_df["global_label"].values, P=15, K=8)
+    #batch_sampler = PKBatchSampler(aug_train_df["global_label"].values, P=25, K=8)
     #train_loader = DataLoader(train_dataset, batch_sampler=batch_sampler, num_workers=args.workers, persistent_workers=True, prefetch_factor=2, pin_memory= True)
     #test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=args.workers)
     train_loader = DataLoader(
         train_dataset, 
-        batch_size=200, # e.g., 128 or 256
+        batch_size=512, # e.g., 128 or 256
         shuffle=True, 
         num_workers=args.workers, 
         persistent_workers=True, 
@@ -813,7 +813,7 @@ def reduce_to_nd(
             learning_rate="auto",
             perplexity=perplexity,
             random_state=seed,
-            n_jobs=args.workers
+            n_jobs=-1
         )
         return tsne.fit_transform(Xp)
 

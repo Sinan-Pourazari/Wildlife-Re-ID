@@ -1,4 +1,5 @@
 @echo off
+set HF_TOKEN=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
 :: CRITICAL: This enables the script to catch Python crashes properly
 setlocal EnableDelayedExpansion
 
@@ -28,7 +29,7 @@ set CLEF_CSV=src/images/animal-clef-2026/metadata.csv
 :: Uncomment the dataset you want to use (and comment out the other):
 
 :: Option A: Wildlife ReID-10k Dataset (Active)
-set RAW_DIR=C:\Users\sinan\Projects\Wildlife-Re-ID\src\images\reid-10k
+set RAW_DIR=%COMMON_ROOT%
 set CSV_PATH=C:\Users\sinan\Projects\Wildlife-Re-ID\src\images\reid-10k\metadata.csv
 
 :: Option B: AnimalCLEF 2026 Dataset
@@ -48,9 +49,9 @@ set SEEDS_PRIOR=1
 set SEEDS_HISTOGRAM_BINS=4
 set NUM_HOG_BINS=9
 set N_HOPS=1
-set EDGE_STRATEGY=hybrid
-set TRAIN_EPOCHS=100
-:: Define your target species here! (Leave blank to use the whole dataset)
+set EDGE_STRATEGY=spatial
+set TRAIN_EPOCHS=210
+:: Define target DATASETS here! (Leave blank to use the whole dataset)
 :: E.g., set DATASETS=tiger turtle leopard
 set DATASETS=LynxID2025 SalamanderID2025 SeaTurtleID2022 AmvrakikosTurtles ATRW LeopardID2022
 
@@ -58,7 +59,7 @@ set DATASETS=LynxID2025 SalamanderID2025 SeaTurtleID2022 AmvrakikosTurtles ATRW 
 :: NEW DYNAMIC CHECKPOINT NAMING SYSTEM
 :: ========================================================
 :: Manually update this ID for each new experiment
-set RUN_ID=run_030
+set RUN_ID=run_037_spatial
 
 set EXPERIMENT_TAG=animal_clef_2026_baseline
 set CHECKPOINT_DIR=runs\!RUN_ID!_!EXPERIMENT_TAG!
@@ -103,123 +104,10 @@ echo %DIRT_BROWN%Run Directory:%RESET% %FOX_WHITE%!CHECKPOINT_DIR!%RESET%
 echo %DIRT_BROWN%Target CAE:%RESET% %FOX_WHITE%!CAE_WEIGHTS_PATH!%RESET%
 echo %FOX_ORANGE%========================================================%RESET%
 echo.
-:: ========================================================
-echo %FOX_ORANGE%STEP 0.0: Merging Datasets%RESET%
-:: ========================================================
-set MERGED_CSV=!CHECKPOINT_DIR!\merged_metadata.csv
-
-python .\src\ml_utils\merge_datasets.py ^
-    --reid_csv %REID_CSV% ^
-    --clef_csv %CLEF_CSV% ^
-    --out_csv !MERGED_CSV!
-
-:: Now we tell the rest of the pipeline to use the shared root and the merged CSV
-set RAW_DIR=%COMMON_ROOT%
-set CSV_PATH=!MERGED_CSV!
-
-echo.
-:: ========================================================
-echo %FOX_ORANGE%STEP 0: Initialize Dataset Split %RESET%
-:: ========================================================
-
-:: Build the base arguments
-set "SPLITTER_ARGS=--csv_path "%CSV_PATH%" --save_dir "%CHECKPOINT_DIR%""
-
-:: Safely append the dataset filter if DATASETS is not empty
-if not "%DATASETS%"=="" (
-    set "SPLITTER_ARGS=!SPLITTER_ARGS! --datasets %DATASETS%"
-)
-
-python .\src\ml_utils\dataset_splitter.py !SPLITTER_ARGS!
-
-if !errorlevel! neq 0 (
-    echo %DANGER_RED%[ERROR] Dataset splitting failed. Aborting.%RESET%
-    pause
-    exit /b !errorlevel!
-)
-:: ========================================================
-echo %FOX_ORANGE%STEP 2: Training Texture Autoencoder (CAE)%RESET%
-:: ========================================================
-:: This will now successfully find the CAE if it was trained in a previous run!
-if exist "%CAE_WEIGHTS_PATH%" (
-    echo %FOX_WHITE%[SKIP] Found existing CAE weights at %CAE_WEIGHTS_PATH%. Skipping training.%RESET%
-) else (
-    echo %FOX_ORANGE%[TRAIN] No weights found. Initiating CAE Training...%RESET%
-    python .\src\ml_utils\gnn\cae.py ^
-        --root_dir %RAW_DIR% ^
-        --csv_path %TRAIN_CSV% ^
-        --epochs %CAE_EPOCHS% ^
-        --latent_dim %CAE_LATENT_DIM% ^
-        --save_dir %SHARED_CAE_DIR% ^
-        --checkpoint_dir %CHECKPOINT_DIR% ^
-        --model_name %CAE_NAME% ^
-        --img_size %IMG_SIZE% 
-
-        
-    if !errorlevel! neq 0 (
-        echo %DANGER_RED%[ERROR] CAE Training failed. Aborting pipeline.%RESET%
-        pause
-        exit /b !errorlevel!
-    )
-)
-echo.
 
 :: ========================================================
-echo %FOX_ORANGE%STEP 3: Building LMDB Cache and Training GNN%RESET%
+echo %FOX_ORANGE%STEP 4A: KNOWN DOMAIN Evaluation (GNN Only)%RESET%
 :: ========================================================
-
-:: ---  RESUME LOGIC ---
-set "RESUME_ARG="
-set "LATEST_CHECKPOINT="
-if exist "!CHECKPOINT_DIR!\gnn\*.pth" (
-    :: Sorts files by date (/o-d) and grabs the first one it sees (the newest)
-    for /f "delims=" %%I in ('dir "!CHECKPOINT_DIR!\gnn\*.pth" /b /o-d 2^>nul') do (
-        set "LATEST_CHECKPOINT=%%I"
-        goto :found_ckpt
-    )
-)
-:found_ckpt
-if defined LATEST_CHECKPOINT (
-    echo %SUCCESS_LIME%[INFO] Found existing checkpoint: !LATEST_CHECKPOINT!. Resuming training...%RESET%
-    set "RESUME_ARG=--resume "!CHECKPOINT_DIR!\gnn\!LATEST_CHECKPOINT!""
-) else (
-    echo %FOX_WHITE%[INFO] No existing checkpoints found. Starting GNN training from scratch...%RESET%
-)
-
-echo %FOX_ORANGE%[TRAIN] Initiating GNN Training sequence...%RESET%
-python .\src\ml_utils\train_test_prototype.py ^
-    --root_dir %RAW_DIR% ^
-    --csv_path %TRAIN_CSV% ^
-    --workers 4 ^
-    --img_size %IMG_SIZE% ^
-    --seeds_num_superpixels %SEEDS_NUM_SUPERPIXELS% ^
-    --seeds_num_levels %SEEDS_NUM_LEVELS% ^
-    --seeds_prior %SEEDS_PRIOR% ^
-    --seeds_histogram_bins %SEEDS_HISTOGRAM_BINS% ^
-    --num_hog_bins %NUM_HOG_BINS% ^
-    --n_hops %N_HOPS% ^
-    --epochs %TRAIN_EPOCHS% ^
-    --data_mode auto ^
-    --checkpoint_dir %CHECKPOINT_DIR% ^
-    --features color pos hog shape lbp cae ^
-    --cae_weights_path "%CAE_WEIGHTS_PATH%" ^
-    --cae_version %CAE_NAME% ^
-    --cae_latent_dim %CAE_LATENT_DIM% ^
-    --edge_strategy %EDGE_STRATEGY% ^
-    --margin_arc 28.6 ^
-    !RESUME_ARG!
-
-if !errorlevel! neq 0 (
-    echo %DANGER_RED%[ERROR] GNN Training failed. Aborting pipeline.%RESET%
-    pause
-    exit /b !errorlevel!
-)
-echo.
-::--csv_path %TEST_CSV% ^
-:: ========================================================
-echo %FOX_ORANGE%STEP 4: Running Comprehensive Evaluation%RESET%
-:: ========================================================
-echo %FOX_ORANGE%[EVAL] Running performance metrics...%RESET%
 python .\src\ml_utils\eval.py ^
     --root_dir %RAW_DIR% ^
     --csv_path %TEST_CSV% ^
@@ -237,13 +125,34 @@ python .\src\ml_utils\eval.py ^
     --features color pos hog shape lbp cae ^
     --cae_weights_path "%CAE_WEIGHTS_PATH%" ^
     --cae_version %CAE_NAME% ^
-    --cae_latent_dim %CAE_LATENT_DIM% 
-    ::--holdout_dataset HyenaID2022
+    --cae_latent_dim %CAE_LATENT_DIM%
 
 :: ========================================================
-echo %FOX_ORANGE%STEP 5: Running Comprehensive Evaluation on Holdout Domain%RESET%
+echo %FOX_ORANGE%STEP 4B: KNOWN DOMAIN Evaluation (WildFusion)%RESET%
 :: ========================================================
-echo %FOX_ORANGE%[EVAL] Running performance metrics...%RESET%
+python .\src\ml_utils\eval.py ^
+    --root_dir %RAW_DIR% ^
+    --csv_path %TEST_CSV% ^
+    --img_size %IMG_SIZE% ^
+    --seeds_num_superpixels %SEEDS_NUM_SUPERPIXELS% ^
+    --seeds_num_levels %SEEDS_NUM_LEVELS% ^
+    --seeds_prior %SEEDS_PRIOR% ^
+    --seeds_histogram_bins %SEEDS_HISTOGRAM_BINS% ^
+    --num_hog_bins %NUM_HOG_BINS% ^
+    --data_mode auto ^
+    --workers 4 ^
+    --parallel_workers 7 ^
+    --checkpoints_dir %CHECKPOINT_DIR% ^
+    --batch_size 64 ^
+    --features color pos hog shape lbp cae ^
+    --cae_weights_path "%CAE_WEIGHTS_PATH%" ^
+    --cae_version %CAE_NAME% ^
+    --cae_latent_dim %CAE_LATENT_DIM% ^
+    --enable_wildfusion
+
+:: ========================================================
+echo %FOX_ORANGE%STEP 5A: UNKNOWN DOMAIN Evaluation (GNN Only)%RESET%
+:: ========================================================
 python .\src\ml_utils\eval.py ^
     --root_dir %RAW_DIR% ^
     --csv_path %GOLBAL_CSV% ^
@@ -263,6 +172,80 @@ python .\src\ml_utils\eval.py ^
     --cae_version %CAE_NAME% ^
     --cae_latent_dim %CAE_LATENT_DIM% ^
     --holdout_dataset HyenaID2022
+
+:: ========================================================
+echo %FOX_ORANGE%STEP 5B: UNKNOWN DOMAIN Evaluation (WildFusion)%RESET%
+:: ========================================================
+python .\src\ml_utils\eval.py ^
+    --root_dir %RAW_DIR% ^
+    --csv_path %GOLBAL_CSV% ^
+    --img_size %IMG_SIZE% ^
+    --seeds_num_superpixels %SEEDS_NUM_SUPERPIXELS% ^
+    --seeds_num_levels %SEEDS_NUM_LEVELS% ^
+    --seeds_prior %SEEDS_PRIOR% ^
+    --seeds_histogram_bins %SEEDS_HISTOGRAM_BINS% ^
+    --num_hog_bins %NUM_HOG_BINS% ^
+    --data_mode auto ^
+    --workers 4 ^
+    --parallel_workers 7 ^
+    --checkpoints_dir %CHECKPOINT_DIR% ^
+    --batch_size 64 ^
+    --features color pos hog shape lbp cae ^
+    --cae_weights_path "%CAE_WEIGHTS_PATH%" ^
+    --cae_version %CAE_NAME% ^
+    --cae_latent_dim %CAE_LATENT_DIM% ^
+    --holdout_dataset HyenaID2022 ^
+    --enable_wildfusion
+
+:: ========================================================
+echo %FOX_ORANGE%STEP 6A: MIXED DOMAIN Evaluation (GNN Only)%RESET%
+:: ========================================================
+python .\src\ml_utils\eval.py ^
+    --root_dir %RAW_DIR% ^
+    --csv_path %GOLBAL_CSV% ^
+    --base_test_csv %TEST_CSV% ^
+    --img_size %IMG_SIZE% ^
+    --seeds_num_superpixels %SEEDS_NUM_SUPERPIXELS% ^
+    --seeds_num_levels %SEEDS_NUM_LEVELS% ^
+    --seeds_prior %SEEDS_PRIOR% ^
+    --seeds_histogram_bins %SEEDS_HISTOGRAM_BINS% ^
+    --num_hog_bins %NUM_HOG_BINS% ^
+    --data_mode auto ^
+    --workers 4 ^
+    --parallel_workers 14 ^
+    --checkpoints_dir %CHECKPOINT_DIR% ^
+    --batch_size 512 ^
+    --features color pos hog shape lbp cae ^
+    --cae_weights_path "%CAE_WEIGHTS_PATH%" ^
+    --cae_version %CAE_NAME% ^
+    --cae_latent_dim %CAE_LATENT_DIM% ^
+    --holdout_dataset HyenaID2022
+
+:: ========================================================
+echo %FOX_ORANGE%STEP 6B: MIXED DOMAIN Evaluation (WildFusion)%RESET%
+:: ========================================================
+python .\src\ml_utils\eval.py ^
+    --root_dir %RAW_DIR% ^
+    --csv_path %GOLBAL_CSV% ^
+    --base_test_csv %TEST_CSV% ^
+    --img_size %IMG_SIZE% ^
+    --seeds_num_superpixels %SEEDS_NUM_SUPERPIXELS% ^
+    --seeds_num_levels %SEEDS_NUM_LEVELS% ^
+    --seeds_prior %SEEDS_PRIOR% ^
+    --seeds_histogram_bins %SEEDS_HISTOGRAM_BINS% ^
+    --num_hog_bins %NUM_HOG_BINS% ^
+    --data_mode auto ^
+    --workers 4 ^
+    --parallel_workers 7 ^
+    --checkpoints_dir %CHECKPOINT_DIR% ^
+    --batch_size 64 ^
+    --features color pos hog shape lbp cae ^
+    --cae_weights_path "%CAE_WEIGHTS_PATH%" ^
+    --cae_version %CAE_NAME% ^
+    --cae_latent_dim %CAE_LATENT_DIM% ^
+    --holdout_dataset HyenaID2022 ^
+    --enable_wildfusion
+
 echo %SUCCESS_LIME%========================================================%RESET%
 echo %SUCCESS_LIME%PIPELINE FULLY COMPLETE!%RESET%
 echo %SUCCESS_LIME%========================================================%RESET%

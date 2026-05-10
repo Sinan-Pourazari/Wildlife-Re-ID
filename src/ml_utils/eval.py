@@ -1,11 +1,9 @@
 import os
 import glob
 import argparse
-import multiprocessing as mp
-from concurrent.futures import ProcessPoolExecutor, as_completed
 import warnings
 import re
-
+warnings.filterwarnings("ignore", message=".*copying from a non-meta parameter.*")
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -15,46 +13,120 @@ from matplotlib import patheffects
 import seaborn as sns
 from tqdm import tqdm
 import plotly.express as px
-import timm 
-import torchvision.transforms as T 
-from PIL import Image 
-
+from wildlife_tools.features import DeepFeatures
+from wildlife_tools.similarity import CosineSimilarity
 # Scikit-Learn & Scipy
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, adjusted_rand_score, normalized_mutual_info_score
 from sklearn.decomposition import PCA
-
+from transformers import AutoModel
 # Graph Clustering
 import hdbscan
-
+from wildlife_tools.similarity.wildfusion import SimilarityPipeline, WildFusion
 # Custom Modules
 from train_test_prototype import ReIDModel, reduce_to_nd
 from dataloader import UniversalGraphDataset
 from torch_geometric.loader import DataLoader
-
-# --- Official wildlife_tools Imports ---
-try:
-    from wildlife_tools.data import WildlifeDataset
-    from wildlife_tools.features import DeepFeatures
-    from wildlife_tools.similarity import CosineSimilarity
-    from wildlife_tools.similarity.wildfusion import SimilarityPipeline, WildFusion
-except ImportError:
-    raise ImportError("Please install the official package: pip install wildlife-tools")
-
+import timm
+import torchvision.transforms as T
+import pandas as pd 
+from types import SimpleNamespace
 # =====================================================================
 # 1. FEATURE EXTRACTION & DATA UTILS
 # =====================================================================
-class PrecomputedPipeline:
-    def __init__(self, sim_matrix):
-        self.sim_matrix = sim_matrix
-        
-    def __call__(self, *args, **kwargs):
-        # Ignores dataset inputs and returns the precomputed similarity matrix
-        return self.sim_matrix
+from PIL import Image
+from torch.utils.data import Dataset
+
+class WildlifePathDataset(Dataset):
+    """Wraps a list of image paths into a format wildlife_tools can process."""
+    def __init__(self, paths, root_dir):
+        self.paths = paths
+        self.root_dir = root_dir
+        self.root = root_dir
+        self.transform = None
+        self.metadata = pd.DataFrame({'image_id': paths, 'label': [0] * len(paths)})   
+        self.col_label = 'label'
+        self.col_image = 'image'
+        self.image_size = None
+        self.label_to_idx = {}
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, idx):
+        full_path = os.path.join(self.root_dir, self.paths[idx])
+        img = Image.open(full_path).convert('RGB')
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, 0
+    
+class WS():
+    def __init__(self, root_dir, gnn_feats=None, path_to_idx=None, mega_cache_path = None):
+        self.root_dir = root_dir
+        device = 'cuda'
+        batch_size = 32
+
+        if mega_cache_path:
+            os.makedirs(mega_cache_path, exist_ok=True)
+        # MegaDescriptor pipeline (always present)
+        self.pipeline_mega = SimilarityPipeline(
+            matcher = CosineSimilarity(),
+            extractor = DeepFeatures(
+                model = timm.create_model("hf-hub:BVRA/MegaDescriptor-L-384", pretrained=True).eval(),
+                device=device,
+                batch_size=batch_size,
+                cache_path=mega_cache_path
+            ),
+            transform = T.Compose([
+                T.Resize(size=(384, 384)),
+                T.ToTensor(),
+                T.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+            ]),
+            calibration = None
+        )
+
+        # Start pipelines list with Mega only
+        self.pipelines = [self.pipeline_mega]
+
+        # Add the current GNN pipeline if features are provided
+        if gnn_feats is not None and path_to_idx is not None:
+            pipeline_gnn = SimilarityPipeline(
+                extractor = PrecomputedExtractor(gnn_feats, path_to_idx),
+                matcher = CosineSimilarity(),
+                transform = None,
+                calibration = None
+            )
+            self.pipelines.append(pipeline_gnn)
+
+    def apply_ws(self, path_list):
+        B = min(1000, len(path_list))
+        dataset = WildlifePathDataset(path_list, self.root_dir)
+        wildfusion = WildFusion(calibrated_pipelines=self.pipelines, priority_pipeline=self.pipeline_mega)
+        similarity = wildfusion(dataset, dataset, B=B)
+        return similarity.astype(np.float64)
+
+
+class PrecomputedExtractor:
+    """
+    Wraps a pre‑extracted feature tensor (N, D) and a dict mapping path → row index.
+    Implements the interface expected by SimilarityPipeline.extractor.
+    """
+    def __init__(self, features_tensor, path_to_index):
+        self.features = features_tensor          
+        self.path_to_index = path_to_index
+
+    def __call__(self, dataset):
+        # Extract the raw paths from the custom dataset wrapper
+        paths = dataset.paths
+        indices = [self.path_to_index[p] for p in paths]
+        feats = self.features[indices].numpy()
+        # Return an object that has a .features attribute
+        return SimpleNamespace(features=feats)
 
 def get_test_samples(args):
     test_df = pd.read_csv(args.csv_path, low_memory=False)
     print(f"--> Initial CSV loaded. Total rows: {len(test_df)}")
 
+    # --- holdout filters ---
     if args.holdout_dataset:
         if 'dataset' in test_df.columns:
             safe_target = args.holdout_dataset.strip().lower()
@@ -70,40 +142,68 @@ def get_test_samples(args):
             test_df['species_safe'] = test_df['species'].astype(str).str.strip().str.lower()
             test_df = test_df[test_df['species_safe'] == safe_target].reset_index(drop=True)
 
+    # --- merge with base test CSV if provided (mixed domain) ---
     if getattr(args, 'base_test_csv', None) and os.path.exists(args.base_test_csv):
         base_df = pd.read_csv(args.base_test_csv, low_memory=False)
         test_df = pd.concat([test_df, base_df], ignore_index=True)
         test_df = test_df.drop_duplicates(subset=['path']).reset_index(drop=True)
         print(f"--> Mixed Test Set Size: {len(test_df)} rows.")
 
-    if getattr(args, 'generate_submission', False):
-        if 'identity' not in test_df.columns:
-            test_df['identity'] = "unknown"
-        test_df['identity'] = test_df['identity'].fillna("unknown")
-    else:
-        if 'identity' not in test_df.columns and 'animal_id' in test_df.columns:
+    # --- Safe identity handling ---
+    # Ensure identity column exists
+    if 'identity' not in test_df.columns:
+        if 'animal_id' in test_df.columns:
             test_df['identity'] = test_df['animal_id'].astype(str)
-        if len(test_df) == 0:
-            raise ValueError("All images were dropped.")
+        else:
+            test_df['identity'] = 'unknown'
 
+    # Fill any NaN that might have slipped through (should not happen, but safety)
+    test_df['identity'] = test_df['identity'].fillna('unknown').astype(str)
+
+    # --- Encode labels ---
     from sklearn.preprocessing import LabelEncoder
+
+    # Global label (re-encode from scratch to guarantee integer labels)
     test_df['global_label'] = LabelEncoder().fit_transform(test_df['identity'])
-        
+
+    # Species label (if species column exists)
     if 'species' in test_df.columns:
-        test_df['species_label'] = LabelEncoder().fit_transform(test_df['species'].astype(str))
+        # Convert NaN species to "unknown" so they get a valid label
+        test_df['species'] = test_df['species'].fillna('unknown').astype(str)
+        test_df['species_label'] = LabelEncoder().fit_transform(test_df['species'])
     else:
         test_df['species_label'] = 0
 
+    # --- Optional subsampling ---
     if hasattr(args, 'max_images_per_id') and args.max_images_per_id is not None:
         test_df = test_df.groupby('global_label', group_keys=False).apply(
             lambda x: x.sample(min(len(x), args.max_images_per_id), random_state=42)
         ).reset_index(drop=True)
 
+    # If after all filtering the dataframe is empty, raise error
+    if len(test_df) == 0:
+        raise ValueError("All images were dropped during filtering.")
+
     return test_df
+
+def get_dataloader(df, args):
+    samples = list(zip(df["path"], df["global_label"], df["species_label"]))
+    ds = UniversalGraphDataset(
+        samples=samples, root_dir=args.root_dir, cache_dir=args.cache_dir, 
+        mode=args.data_mode, rebuild_cache=False, 
+        img_size=args.img_size, n_hops=args.n_hops, features=args.features, 
+        cae_version=args.cae_version, cae_weights_path=args.cae_weights_path, 
+        cae_latent_dim=args.cae_latent_dim, seeds_num_superpixels=args.seeds_num_superpixels, 
+        seeds_num_levels=args.seeds_num_levels, seeds_prior=args.seeds_prior, 
+        seeds_histogram_bins=args.seeds_histogram_bins, num_bins=args.num_hog_bins
+    )
+    return DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers)
 
 def extract_features(model, dataloader, device):
     model.eval()
     all_emb, all_labels, all_species_preds, all_species_labels = [], [], [], []
+    
+    
     
     with torch.no_grad():
         for data in tqdm(dataloader, desc="Extracting Features (GNN)", leave=False):
@@ -112,7 +212,7 @@ def extract_features(model, dataloader, device):
             labels = y_stacked[:, 0]
             species_labels = y_stacked[:, 1]
             
-            with torch.amp.autocast(device_type="cuda"):
+            with torch.amp.autocast(device_type="cuda" if device.type == "cuda" else "cpu"):
                 out = model(data)
                 
             if isinstance(out, tuple):
@@ -153,11 +253,9 @@ def calculate_baus(y_true: np.ndarray, y_pred: np.ndarray, known_classes: set, u
 
     return float(np.mean(class_rejection_rates))
 
-def compute_reid_metrics(features, labels, known_classes, device='cpu', sim_thresh=1.5):
-    features = features.to(device)
+def compute_reid_metrics(sim_matrix, labels, known_classes, device='cpu', sim_thresh=0.4):
+    sim_matrix = sim_matrix.to(device)
     labels = labels.to(device)
-    features = F.normalize(features, p=2, dim=1)
-    sim_matrix = torch.mm(features, features.t())
     
     mask = torch.eye(sim_matrix.size(0), dtype=torch.bool, device=device)
     sim_matrix.masked_fill_(mask, -float('inf'))
@@ -168,7 +266,7 @@ def compute_reid_metrics(features, labels, known_classes, device='cpu', sim_thre
     top1_sims = sim_matrix.max(dim=1).values
     top1_labels = sorted_labels[:, 0]
     
-    y_pred = top1_labels.clone()
+    y_pred = top1_labels.detach().clone()
     y_pred[top1_sims < sim_thresh] = -1 
     
     y_true_np, y_pred_np = labels.cpu().numpy(), y_pred.cpu().numpy()
@@ -198,13 +296,44 @@ def compute_reid_metrics(features, labels, known_classes, device='cpu', sim_thre
     return (cmc_1/valid_queries)*100, (cmc_5/valid_queries)*100, (cmc_10/valid_queries)*100, mAP, baks, baus
 
 # =====================================================================
-# 3. GRAPH CLUSTERING (Official HDBSCAN Formula)
+# 3. GRAPH CLUSTERING (HDBSCAN + Jaccard Reranking)
 # =====================================================================
-def run_hdbscan(similarity_matrix):
+def k_reciprocal_rerank(sim_matrix, k1=20, lambda_value=0.3):
+    if isinstance(sim_matrix, np.ndarray):
+        sim_matrix = torch.tensor(sim_matrix, dtype=torch.float32)
+        
+    device = sim_matrix.device
+    N = sim_matrix.size(0)
+    
+    _, topk_indices = torch.topk(sim_matrix, k=k1, dim=1)
+    knn_matrix = torch.zeros((N, N), dtype=torch.bool, device=device)
+    knn_matrix.scatter_(1, topk_indices, True)
+    
+    mutual_matrix = knn_matrix & knn_matrix.t()
+    mutual_float = mutual_matrix.float()
+    
+    intersection = torch.mm(mutual_float, mutual_float.t())
+    sizes = mutual_float.sum(dim=1)
+    union = sizes.unsqueeze(1) + sizes.unsqueeze(0) - intersection
+    union[union == 0] = 1e-9
+    
+    jaccard_sim = intersection / union
+    
+    final_sim = (1 - lambda_value) * sim_matrix + lambda_value * jaccard_sim
+    return final_sim.numpy()
+
+def run_hdbscan(similarity_matrix, epsilon=0.50, min_cluster_size=2):
+    similarity_matrix[similarity_matrix < 0.15] = 0.0
+
     distance = (np.max(similarity_matrix) - np.maximum(similarity_matrix, 0)) / (np.max(similarity_matrix) + 1e-8)
     distance = distance.astype(np.float64) 
     
-    clustering = hdbscan.HDBSCAN(min_cluster_size=2, metric='precomputed')
+    clustering = hdbscan.HDBSCAN(
+        min_cluster_size=min_cluster_size, 
+        min_samples=2, 
+        cluster_selection_epsilon=epsilon, 
+        metric='precomputed'
+    )
     clusters = clustering.fit(distance)
     
     labels = clusters.labels_.copy()
@@ -288,46 +417,37 @@ def plot_interactive_3d_tsne(xyz, labels, title, save_path):
     fig.write_html(save_path)
 
 # =====================================================================
-# 5. PARALLEL WORKERS
+# 5. METRICS WORKERS
 # =====================================================================
-def evaluate_metrics_worker(ckpt_key, feats_np, labels_np, species_preds_np, mega_sim_matrix, known_classes, args, species_labels_np):
+def evaluate_metrics_worker(ckpt_key, fused_sim, labels_np, known_classes, species_preds_np, species_labels_np, args):
     warnings.filterwarnings("ignore", message="y_pred contains classes not in y_true")
-    
-    r1, r5, r10, map_val, baks, baus = compute_reid_metrics(torch.from_numpy(feats_np), torch.from_numpy(labels_np), known_classes, device='cpu', sim_thresh=0.4)
-    
-    gnn_feats = torch.tensor(feats_np, dtype=torch.float32)
-    gnn_feats = F.normalize(gnn_feats, p=2, dim=1)
-    gnn_sim_matrix = torch.mm(gnn_feats, gnn_feats.t()).numpy()
-    
-    # Official WildFusion logic using precomputed matrices to avoid memory crashes
-    if mega_sim_matrix is not None:
-        pipeline_gnn = PrecomputedPipeline(gnn_sim_matrix)
-        pipeline_mega = PrecomputedPipeline(mega_sim_matrix)
-        
-        ensemble = WildFusion(calibrated_pipelines=[pipeline_mega, pipeline_gnn], priority_pipeline=pipeline_mega)
-        
-        # FIX: Pass positional None, None instead of named kwargs
-        fused_matrix = ensemble(None, None)
-        predicted_ids = run_hdbscan(fused_matrix)
-    else:
-        predicted_ids = run_hdbscan(gnn_sim_matrix)
-        
+
+    # fused_sim is already an (N,N) similarity matrix as float64 array
+    raw_gnn_matrix = torch.tensor(fused_sim, dtype=torch.float32)
+
+    # Rerank and cluster
+    reranked_matrix = k_reciprocal_rerank(raw_gnn_matrix, k1=args.leiden_k1, lambda_value=args.leiden_lambda)
+    predicted_ids = run_hdbscan(reranked_matrix, epsilon=0.50)
+    r1, r5, r10, map_val, baks, baus = compute_reid_metrics(
+        raw_gnn_matrix, torch.from_numpy(labels_np), known_classes,
+        device='cpu', sim_thresh=0.4
+    )
+
     ari = adjusted_rand_score(labels_np, predicted_ids)
     nmi = normalized_mutual_info_score(labels_np, predicted_ids)
     discovered_ids = len(set(predicted_ids))
-    
+
     match = re.search(r'ep(\d+)', ckpt_key)
     sort_val = int(match.group(1)) if match else 0
 
     return {
-        'Model Name': ckpt_key,
-        'Epoch': sort_val, 
+        'Model Name': ckpt_key, 'Epoch': sort_val,
         'Rank-1 (%)': r1, 'Rank-5 (%)': r5, 'Rank-10 (%)': r10, 'mAP (%)': map_val,
-        'BaKS': baks, 'BAUS': baus, 'H-Score': np.sqrt(baks * baus), 
+        'BaKS': baks, 'BAUS': baus, 'H-Score': np.sqrt(baks * baus),
         'Baseline ARI': ari, 'Baseline NMI': nmi, 'Baseline IDs': discovered_ids,
-        'Species Acc (%)': accuracy_score(species_labels_np, species_preds_np) * 100,    
-        'Species BAcc (%)': balanced_accuracy_score(species_labels_np, species_preds_np) * 100,  
-        'ckpt_path': ckpt_key 
+        'Species Acc (%)': accuracy_score(species_labels_np, species_preds_np) * 100,
+        'Species BAcc (%)': balanced_accuracy_score(species_labels_np, species_preds_np) * 100,
+        'ckpt_path': ckpt_key
     }
 
 def generate_tsne_worker(ckpt_key, feats_np, labels_np, args, eval_out_dir):
@@ -357,84 +477,58 @@ def generate_submission_csv(image_ids, predicted_ids, species_preds, species_idx
 
 def main(args):
     main_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"[{main_device.type.upper()}] Starting Asynchronous Pipeline...")
-    
+    print(f"[{main_device.type.upper()}] Starting Pipeline...")
+    mega_cache_path = os.path.join(args.checkpoints_dir, "feature_cache", "mega")
+
     args.checkpoints_dir = args.checkpoints_dir.strip()
     args.root_dir = args.root_dir.strip()
     args.csv_path = args.csv_path.strip()
     if args.base_test_csv: args.base_test_csv = args.base_test_csv.strip()
     if args.checkpoint_path: args.checkpoint_path = args.checkpoint_path.strip()
     
+    mode_suffix = "_wildfusion" if args.enable_wildfusion else "_gnn_only"
+    if args.competition:
+        mode_suffix += "_competition"
+        
     if getattr(args, 'base_test_csv', None) and args.holdout_dataset != None:
-        eval_out_dir = os.path.join(args.checkpoints_dir, "evaluation_results_mixed_holdout")
+        eval_out_dir = os.path.join(args.checkpoints_dir, f"evaluation_results_mixed_holdout{mode_suffix}")
     elif args.holdout_dataset != None:
-        eval_out_dir = os.path.join(args.checkpoints_dir, "evaluation_results_dataset_holdout")
+        eval_out_dir = os.path.join(args.checkpoints_dir, f"evaluation_results_dataset_holdout{mode_suffix}")
     else:
-        eval_out_dir = os.path.join(args.checkpoints_dir, "evaluation_results")
+        eval_out_dir = os.path.join(args.checkpoints_dir, f"evaluation_results{mode_suffix}")
         
     csv_path = os.path.join(eval_out_dir, 'benchmark_stats.csv')
     os.makedirs(eval_out_dir, exist_ok=True)
     
     test_df = get_test_samples(args)
-    test_samples = list(zip(test_df["path"], test_df["global_label"], test_df["species_label"]))
-    print(f"Evaluated Test Set Size: {len(test_samples)} images | TRUE Unique Identities: {len(set(l for _, l, _ in test_samples))}")
 
     # ====================================================================
     # --- ROUTE 1 - GENERATE ANIMALCLEF SUBMISSION ---
     # ====================================================================
     if args.generate_submission and args.checkpoint_path:
         print(f"\n[ SUBMISSION MODE ] Generating CSV using: {os.path.basename(args.checkpoint_path)}")
-        mapping_df = pd.read_csv(os.path.join(args.checkpoints_dir, "pipeline_metadata.csv"), low_memory=False)
+        mapping_path = os.path.join(args.checkpoints_dir, "pipeline_metadata.csv")
+        mapping_df = pd.read_csv(mapping_path, low_memory=False) if os.path.exists(mapping_path) else pd.DataFrame()
         species_idx_to_name = mapping_df.set_index('species_label')['dataset'].to_dict() if 'dataset' in mapping_df.columns else {}
         
         model_gnn, _ = ReIDModel.load(args.checkpoint_path, args=args, device=main_device)
-        test_dataset_gnn = UniversalGraphDataset(
-            samples=test_samples, root_dir=args.root_dir, cache_dir=args.cache_dir, mode=args.data_mode, rebuild_cache=False, 
-            img_size=args.img_size, n_hops=args.n_hops, features=args.features, cae_version=args.cae_version, 
-            cae_weights_path=args.cae_weights_path, cae_latent_dim=args.cae_latent_dim, seeds_num_superpixels=args.seeds_num_superpixels, 
-            seeds_num_levels=args.seeds_num_levels, seeds_prior=args.seeds_prior, seeds_histogram_bins=args.seeds_histogram_bins, num_bins=args.num_hog_bins
-        )
-        loader_gnn = DataLoader(test_dataset_gnn, batch_size=args.batch_size, shuffle=False, num_workers=args.workers)
-        feats_gnn, _, species_preds, _ = extract_features(model_gnn, loader_gnn, main_device)
-
-        gnn_feats = F.normalize(torch.tensor(feats_gnn.cpu().numpy(), dtype=torch.float32), p=2, dim=1)
-        gnn_sim_matrix = torch.mm(gnn_feats, gnn_feats.t()).numpy()
-
-        if args.enable_wildfusion:
-            print("--> [WILDFUSION ENABLED] Engaging official wildlife_tools Pipeline...")
-            wt_dataset = WildlifeDataset(test_df, args.root_dir)
-            pipeline_mega = SimilarityPipeline(
-                matcher = CosineSimilarity(),
-                extractor = DeepFeatures(
-                    model = timm.create_model("hf-hub:BVRA/MegaDescriptor-L-384", pretrained=True).eval(),
-                    device=main_device,
-                    batch_size=args.batch_size,
-                    cache_path=os.path.join(args.checkpoints_dir, "mega_cache") 
-                ),
-                transform = T.Compose([
-                    T.Resize(size=(384, 384)),
-                    T.ToTensor(),
-                    T.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)), 
-                ]),
-                calibration = None
-            )
-            
-            pipeline_gnn = PrecomputedPipeline(gnn_sim_matrix)
-            
-            print("\n--> Running WildFusion Score Calibration & HDBSCAN Clustering...")
-            ensemble = WildFusion(calibrated_pipelines=[pipeline_mega, pipeline_gnn], priority_pipeline=pipeline_mega)
-            fused_matrix = ensemble(wt_dataset, wt_dataset)
-            predicted_ids = run_hdbscan(fused_matrix)
-        else:
-            print("--> [WILDFUSION DISABLED] Running Standard GNN HDBSCAN Clustering...")
-            predicted_ids = run_hdbscan(gnn_sim_matrix)
+        test_loader = get_dataloader(test_df, args)
+        
+        print("--> Running Standard GNN Feature Extraction...")
+        gnn_feats, _, species_preds, _ = extract_features(model_gnn, test_loader, main_device)
+        
+        print("--> Running Similarity & HDBSCAN Clustering...")
+        gnn_sim_matrix = torch.mm(gnn_feats, gnn_feats.t())
+        reranked_matrix = k_reciprocal_rerank(gnn_sim_matrix, k1=args.leiden_k1, lambda_value=args.leiden_lambda)
+        
+        predicted_ids = run_hdbscan(reranked_matrix, epsilon=0.50, min_cluster_size=4)
             
         true_datasets = test_df['dataset'].tolist() if 'dataset' in test_df.columns else None
         generate_submission_csv(
-            image_ids=test_df['image_id'].tolist(), predicted_ids=predicted_ids, species_preds=species_preds.cpu().numpy(), 
+            image_ids=test_df['image_id'].tolist(), predicted_ids=predicted_ids, species_preds=species_preds.numpy(), 
             species_idx_to_name=species_idx_to_name, output_path=os.path.join(args.checkpoints_dir, "submission.csv"), true_datasets=true_datasets
         )
-        return 
+        return
 
     # ====================================================================
     # --- ROUTE 2 - METRICS EVALUATION ---
@@ -444,69 +538,75 @@ def main(args):
     if not pth_files: return print(f"No .pth files found in {gnn_dir}")
 
     extracted_data = {}
-    mega_sim_matrix = None
-
+    
     if args.use_existing_csv and os.path.exists(csv_path):
         print(f"\n[ PHASE 1 SKIPPED: Using existing benchmark results ]")
         df = pd.read_csv(csv_path)
     else:
         print(f"\n--- PHASE 1: SEQUENTIAL GPU FEATURE EXTRACTION ---")
-        shared_dataset = UniversalGraphDataset(
-            samples=test_samples, root_dir=args.root_dir, cache_dir=args.cache_dir, mode=args.data_mode, rebuild_cache=False, 
-            img_size=args.img_size, n_hops=args.n_hops, features=args.features, cae_version=args.cae_version, 
-            cae_weights_path=args.cae_weights_path, cae_latent_dim=args.cae_latent_dim, 
-            seeds_num_superpixels=args.seeds_num_superpixels, seeds_num_levels=args.seeds_num_levels, 
-            seeds_prior=args.seeds_prior, seeds_histogram_bins=args.seeds_histogram_bins, num_bins=args.num_hog_bins
-        )
-        shared_loader = DataLoader(shared_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, persistent_workers=True)
-
-        if args.enable_wildfusion:
-            print("\n--> [WILDFUSION ENABLED] Engaging wildlife_tools Baseline Extraction...")
-            wt_dataset = WildlifeDataset(test_df, args.root_dir)
-            pipeline_mega = SimilarityPipeline(
-                matcher=CosineSimilarity(),
-                extractor=DeepFeatures(
-                    model=timm.create_model("hf-hub:BVRA/MegaDescriptor-L-384", pretrained=True).eval(),
-                    device=main_device,
-                    batch_size=args.batch_size,
-                    cache_path=os.path.join(args.checkpoints_dir, "mega_cache")
-                ),
-                transform=T.Compose([
-                    T.Resize(size=(384, 384)),
-                    T.ToTensor(),
-                    T.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-                ]),
-                calibration=None
-            )
-            mega_sim_matrix = pipeline_mega(wt_dataset, wt_dataset)
-            del pipeline_mega
-            torch.cuda.empty_cache()
+        test_loader = get_dataloader(test_df, args)
 
         for ckpt in sorted(pth_files):
             print(f"\nProcessing Checkpoint: {os.path.basename(ckpt)}")
             try:
                 model, train_classes = ReIDModel.load(ckpt, args=args, device=main_device)
-                clean_name = os.path.basename(ckpt).replace('.pth', '')
-                f_base, l_base, sp_base, sl_base = extract_features(model, shared_loader, main_device)
                 
-                dict_key = clean_name + "_WildFusion" if args.enable_wildfusion else clean_name
-                extracted_data[dict_key] = (
-                    f_base.cpu().numpy(), l_base.cpu().numpy(), sp_base.cpu().numpy(), sl_base.cpu().numpy(), 
-                    set(train_classes) if train_classes is not None else set()
-                )
+
+                gnn_query_feats, _, species_preds, species_labels = extract_features(model, test_loader, main_device)
+                # Build a stable mapping from path to its index in the feature matrix
+                path_list = test_df['path'].tolist()
+                path_to_idx = {p: i for i, p in enumerate(path_list)}
+                dict_key = os.path.basename(ckpt).replace('.pth', '')
+                
+                extracted_data[dict_key] = {
+                    'gnn_query': gnn_query_feats,
+                    'train_classes': set(train_classes) if train_classes is not None else set(),
+                    'species_preds': species_preds.numpy(),
+                    'species_labels': species_labels.numpy(),
+                    'path_to_idx': path_to_idx, 
+                }
                 del model
                 torch.cuda.empty_cache()
             except Exception as e:
                 print(f"Failed to infer {os.path.basename(ckpt)}: {e}")
 
-        # --- PHASE 2: PARALLEL CPU BASELINE METRICS ---
-        print(f"\n--- PHASE 2: PARALLEL METRICS CALCULATION ({args.parallel_workers} Workers) ---")
-        spawn_context = mp.get_context('spawn')
-        with ProcessPoolExecutor(max_workers=args.parallel_workers, mp_context=spawn_context) as executor:
-            futures = []
-            for k, (f, l, sp, sl, cls) in extracted_data.items():
-                futures.append(executor.submit(evaluate_metrics_worker, k, f, l, sp, mega_sim_matrix, cls, args, sl))
-            results = [future.result() for future in tqdm(as_completed(futures), total=len(futures), desc="Computing Baseline Metrics")]
+        # --- PHASE 2: SEQUENTIAL CPU BASELINE METRICS ---
+        print(f"\n--- PHASE 2: SEQUENTIAL METRICS CALCULATION ---")
+        
+        if not extracted_data:
+            print("[CRITICAL ERROR] No models were successfully processed in Phase 1!")
+            print("Scroll up to see the 'Failed to infer' error messages.")
+            return
+        
+        path_list = test_df['path'].tolist()
+        base_path_to_idx = {p: i for i, p in enumerate(path_list)}
+
+        results = []
+        for k, model_data in tqdm(extracted_data.items(), desc="Computing Baseline Metrics"):
+            gnn_feats = model_data['gnn_query']
+
+            if args.enable_wildfusion:
+                # Fuse Mega + GNN via WildFusion
+                ws = WS(root_dir=args.root_dir,
+                        gnn_feats=gnn_feats,
+                        path_to_idx=base_path_to_idx,
+                        mega_cache_path=mega_cache_path)
+                fused_sim = ws.apply_ws(path_list)
+            else:
+                # GNN‑only: use cosine similarity directly
+                gnn_sim = torch.mm(gnn_feats, gnn_feats.t())
+                fused_sim = gnn_sim.numpy().astype(np.float64)
+
+            res = evaluate_metrics_worker(
+                ckpt_key=k,
+                fused_sim=fused_sim,
+                labels_np=test_df['global_label'].values,
+                known_classes=model_data['train_classes'],
+                species_preds_np=model_data['species_preds'],
+                species_labels_np=model_data['species_labels'],
+                args=args
+            )
+            results.append(res)
                     
         df = pd.DataFrame(results)
         
@@ -522,66 +622,22 @@ def main(args):
         plot_benchmark_results(df, eval_out_dir)
         df.to_csv(csv_path, index=False)
 
-        # --- PHASE 3: PARALLEL TOP-K VISUALIZATION ---
+        # --- PHASE 3: SEQUENTIAL TOP-K VISUALIZATION ---
         if args.top_k_detailed > 0:
             top_k = min(args.top_k_detailed, len(df))
-            print(f"\n--- PHASE 3: PARALLEL t-SNE GENERATION (Top {top_k} Models) ---")
+            print(f"\n--- PHASE 3: SEQUENTIAL t-SNE GENERATION (Top {top_k} Models) ---")
             
             top_models = df.sort_values(by='Baseline ARI', ascending=False).head(top_k)
-            
-            if args.use_existing_csv and not extracted_data:
-                print("Re-extracting features sequentially for Top-K models...")
-                for _, row in top_models.iterrows():
-                    model_name = row['Model Name']
-                    clean_path = model_name.replace("_WildFusion", "") + ".pth"
-                    if not os.path.exists(clean_path):
-                        clean_path = os.path.join(gnn_dir, clean_path)
-
-                    model, train_classes = ReIDModel.load(clean_path, args=args, device=main_device)
-                    f_val, l_val, sp_val, sl_val = extract_features(model, shared_loader, main_device)
-                    final_feats = f_val.cpu().numpy()
-
-                    if "_WildFusion" in model_name:
-                        wt_dataset_local = WildlifeDataset(test_df, args.root_dir)
-                        pipeline_mega_local = SimilarityPipeline(
-                            matcher=CosineSimilarity(),
-                            extractor=DeepFeatures(
-                                model=timm.create_model("hf-hub:BVRA/MegaDescriptor-L-384", pretrained=True).eval(),
-                                device=main_device, batch_size=args.batch_size, cache_path=os.path.join(args.checkpoints_dir, "mega_cache")
-                            ),
-                            transform=T.Compose([
-                                T.Resize(size=(384, 384)), T.ToTensor(), T.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-                            ]), calibration=None
-                        )
-                        mega_sim = pipeline_mega_local(wt_dataset_local, wt_dataset_local)
-                        
-                        gnn_feats = torch.tensor(final_feats, dtype=torch.float32)
-                        gnn_feats = F.normalize(gnn_feats, p=2, dim=1)
-                        gnn_sim = torch.mm(gnn_feats, gnn_feats.t()).numpy()
-                        
-                        ensemble = WildFusion(calibrated_pipelines=[PrecomputedPipeline(mega_sim), PrecomputedPipeline(gnn_sim)], priority_pipeline=PrecomputedPipeline(mega_sim))
-                        
-                        # FIX: Pass positional None, None instead of named kwargs
-                        final_feats = ensemble(None, None) 
-                        torch.cuda.empty_cache()
-
-                    extracted_data[model_name] = (final_feats, l_val.cpu().numpy(), sp_val.cpu().numpy(), sl_val.cpu().numpy(), set(train_classes) if train_classes is not None else set())
-                    del model
-                    torch.cuda.empty_cache()
-
-            spawn_context = mp.get_context('spawn')
-            with ProcessPoolExecutor(max_workers=args.parallel_workers, mp_context=spawn_context) as executor:
-                tsne_futures = []
-                for _, row in top_models.iterrows():
-                    m_name = row['Model Name']
-                    tsne_futures.append(executor.submit(generate_tsne_worker, m_name, extracted_data[m_name][0], extracted_data[m_name][1], args, eval_out_dir))
-                for future in tqdm(as_completed(tsne_futures), total=len(tsne_futures), desc="Generating Plots"):
-                    future.result()
+            for _, row in tqdm(top_models.iterrows(), total=len(top_models), desc="Generating Plots"):
+                m_name = row['Model Name']
+                final_feats = extracted_data[m_name]['gnn_query'].numpy()
+                labels_np = test_df['global_label'].values
+                generate_tsne_worker(m_name, final_feats, labels_np, args, eval_out_dir)
 
     print(f"\n--> All evaluations complete. Outputs saved to: {eval_out_dir}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Wildlife Re-ID Comprehensive Evaluator")
+    parser = argparse.ArgumentParser(description="Wildlife Re-ID Comprehensive Evaluator (GNN Only)")
     parser.add_argument("--checkpoints_dir", type=str, default="checkpoints_long_run_v2")
     parser.add_argument("--csv_path", type=str, default="src/images/reid-10k/metadata.csv")
     parser.add_argument("--root_dir", type=str, default="src/images/reid-10k")
@@ -592,7 +648,7 @@ if __name__ == "__main__":
     parser.add_argument("--segments", type=int, default=300)
     parser.add_argument("--data_mode", type=str, default="auto", choices=["auto", "memory", "lazy"])
     parser.add_argument("--batch_size", type=int, default=128)
-    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--seeds_num_superpixels", type=int, default=300)
     parser.add_argument("--seeds_num_levels", type=int, default=4)
     parser.add_argument("--seeds_prior", type=int, default=1)
@@ -612,10 +668,14 @@ if __name__ == "__main__":
     parser.add_argument("--generate_submission", action="store_true")
     
     parser.add_argument("--leiden_thresh", type=float, default=0.58)
-    parser.add_argument("--leiden_k1", type=int, default=20)
+    parser.add_argument("--leiden_k1", type=int, default=12)
     parser.add_argument("--leiden_lambda", type=float, default=0.2)
     
     parser.add_argument("--base_test_csv", type=str, default=None)
-    parser.add_argument("--enable_wildfusion", action="store_true")
+
+    parser.add_argument("--enable_wildfusion", action="store_true",
+                    help="Fuse MegaDescriptor with GNN instead of GNN‑only")
+    parser.add_argument("--competition", action="store_true",
+                    help="Evaluate on competition test set (separate output folder)")
     args = parser.parse_args()
     main(args)

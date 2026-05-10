@@ -5,68 +5,89 @@ import torch
 import torch.nn.functional as F
 import torch.nn as nn
 
+import random
+import numpy as np
+import torch
+from collections import defaultdict
+from torch.utils.data.sampler import Sampler
+
+import random
+import numpy as np
+import torch
+from collections import defaultdict
+from torch.utils.data.sampler import Sampler
+
 class PKBatchSampler(Sampler):
-    def __init__(self, labels, P=6, K=4, drop_last=True, alpha = 0.5):
+    def __init__(self, labels, P=6, K=4, drop_last=True, alpha=0.5):
         self.labels = np.asarray(labels)
         self.P = P
         self.K = K
         self.drop_last = drop_last
-        # alpha = penalty factor for IDs with many occurancess
         self.alpha = alpha
 
-        self.label_to_indices = {}
+        self.label_to_indices = defaultdict(list)
         for i, y in enumerate(self.labels):
-            self.label_to_indices.setdefault(int(y), []).append(i)
+            self.label_to_indices[int(y)].append(i)
 
         self.unique_labels = list(self.label_to_indices.keys())
 
         # --- WEIGHT CALCULATION ---
-        # Count the number of images each identity has
         counts = np.array([len(self.label_to_indices[y]) for y in self.unique_labels])
-
-        # Apply the penalty: 1 / (count^alpha)
-        # use a small epsilon to prevent any theoretical division by zero
         weights = 1.0 / ((counts ** self.alpha) + 1e-8)
+        probabilities = weights / weights.sum()
 
-        # Normalize weights so they sum to 1.0 (creating a valid probability distribution)
-        self.probabilities = weights / weights.sum()
+        self.probabilities_tensor = torch.tensor(probabilities, dtype=torch.float32)
+        self.replace_ids = len(self.unique_labels) < self.P
 
     def __iter__(self):
         n_batches = len(self)
-        for _ in range(n_batches):
-            # Sample P identities using our calculated probability distribution
-            if len(self.unique_labels) >= self.P:
-                chosen = np.random.choice(
-                    self.unique_labels, 
-                    size=self.P, 
-                    replace=False, 
-                    p=self.probabilities
-                )
-            else:
-                chosen = np.random.choice(
-                    self.unique_labels, 
-                    size=self.P, 
-                    replace=True, 
-                    p=self.probabilities
-                )
 
+        # 1. Bulk sample identities for the entire epoch
+        prob_matrix = self.probabilities_tensor.expand(n_batches, -1)
+        chosen_indices_matrix = torch.multinomial(
+            prob_matrix, 
+            num_samples=self.P, 
+            replacement=self.replace_ids
+        ).tolist()
+
+        # 2. PRE-SHUFFLE & SETUP POINTERS (The new optimization!)
+        shuffled_dict = {}
+        pointers = {}
+        for y, idxs in self.label_to_indices.items():
+            shuffled = list(idxs)
+            random.shuffle(shuffled)
+            shuffled_dict[y] = shuffled
+            pointers[y] = 0
+
+        # 3. YIELD BATCHES
+        for batch_row in chosen_indices_matrix:
             batch = []
-            for y in chosen:
-                idxs = self.label_to_indices[y]
-                # sample K examples per identity (with replacement if needed if k is unsatisfiable naturally)
-                if len(idxs) >= self.K:
-                    batch.extend(random.sample(idxs, self.K))
+            for idx in batch_row:
+                y = self.unique_labels[idx]
+                available = len(shuffled_dict[y])
+                p = pointers[y]
+                
+                # Fast path: We have enough unique items
+                if available >= self.K:
+                    # If pointer exceeds list length, reshuffle and reset pointer
+                    if p + self.K > available:
+                        random.shuffle(shuffled_dict[y])
+                        p = 0
+                    
+                    # Instantaneous C-level list slicing!
+                    batch.extend(shuffled_dict[y][p : p + self.K])
+                    pointers[y] = p + self.K
+                
+                # Slow path (Edge Case): The identity has fewer than K images in total
                 else:
-                    batch.extend(random.choices(idxs, k=self.K))
+                    batch.extend(random.choices(shuffled_dict[y], k=self.K))
 
             yield batch
             
     def __len__(self):
-        # rough epoch length; 
         n = len(self.labels)
         b = self.P * self.K
         return n // b if self.drop_last else (n + b - 1) // b
-
 def pairwise_dist(x):
     # x: (B, D), normalized embeddings recommended
     # squared euclidean distances
