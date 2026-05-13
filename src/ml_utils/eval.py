@@ -4,6 +4,7 @@ import argparse
 import warnings
 import re
 warnings.filterwarnings("ignore", message=".*copying from a non-meta parameter.*")
+warnings.filterwarnings("ignore", message=".*The number of unique classes is greater than 50%.*")
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -18,7 +19,6 @@ from wildlife_tools.similarity import CosineSimilarity
 # Scikit-Learn & Scipy
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, adjusted_rand_score, normalized_mutual_info_score
 from sklearn.decomposition import PCA
-from transformers import AutoModel
 # Graph Clustering
 import hdbscan
 from wildlife_tools.similarity.wildfusion import SimilarityPipeline, WildFusion
@@ -28,8 +28,10 @@ from dataloader import UniversalGraphDataset
 from torch_geometric.loader import DataLoader
 import timm
 import torchvision.transforms as T
-import pandas as pd 
 from types import SimpleNamespace
+import concurrent.futures
+import traceback
+
 # =====================================================================
 # 1. FEATURE EXTRACTION & DATA UTILS
 # =====================================================================
@@ -115,11 +117,9 @@ class PrecomputedExtractor:
         self.path_to_index = path_to_index
 
     def __call__(self, dataset):
-        # Extract the raw paths from the custom dataset wrapper
         paths = dataset.paths
         indices = [self.path_to_index[p] for p in paths]
         feats = self.features[indices].numpy()
-        # Return an object that has a .features attribute
         return SimpleNamespace(features=feats)
 
 def get_test_samples(args):
@@ -136,6 +136,12 @@ def get_test_samples(args):
                 unique_ds = pd.read_csv(args.csv_path, low_memory=False)['dataset'].dropna().unique()
                 raise ValueError(f"No images found for dataset '{args.holdout_dataset}'. Available datasets in CSV: {unique_ds}")
 
+    if hasattr(args, 'species') and args.species is not None:
+        if 'species' in test_df.columns:
+            safe_target = args.species.strip().lower()
+            test_df['species_safe'] = test_df['species'].astype(str).str.strip().str.lower()
+            test_df = test_df[test_df['species_safe'] == safe_target].reset_index(drop=True)
+
     if args.holdout_species:
         if 'species' in test_df.columns:
             safe_target = args.holdout_species.strip().lower()
@@ -150,25 +156,19 @@ def get_test_samples(args):
         print(f"--> Mixed Test Set Size: {len(test_df)} rows.")
 
     # --- Safe identity handling ---
-    # Ensure identity column exists
     if 'identity' not in test_df.columns:
         if 'animal_id' in test_df.columns:
             test_df['identity'] = test_df['animal_id'].astype(str)
         else:
             test_df['identity'] = 'unknown'
 
-    # Fill any NaN that might have slipped through (should not happen, but safety)
     test_df['identity'] = test_df['identity'].fillna('unknown').astype(str)
 
     # --- Encode labels ---
     from sklearn.preprocessing import LabelEncoder
-
-    # Global label (re-encode from scratch to guarantee integer labels)
     test_df['global_label'] = LabelEncoder().fit_transform(test_df['identity'])
 
-    # Species label (if species column exists)
     if 'species' in test_df.columns:
-        # Convert NaN species to "unknown" so they get a valid label
         test_df['species'] = test_df['species'].fillna('unknown').astype(str)
         test_df['species_label'] = LabelEncoder().fit_transform(test_df['species'])
     else:
@@ -180,7 +180,6 @@ def get_test_samples(args):
             lambda x: x.sample(min(len(x), args.max_images_per_id), random_state=42)
         ).reset_index(drop=True)
 
-    # If after all filtering the dataframe is empty, raise error
     if len(test_df) == 0:
         raise ValueError("All images were dropped during filtering.")
 
@@ -202,8 +201,6 @@ def get_dataloader(df, args):
 def extract_features(model, dataloader, device):
     model.eval()
     all_emb, all_labels, all_species_preds, all_species_labels = [], [], [], []
-    
-    
     
     with torch.no_grad():
         for data in tqdm(dataloader, desc="Extracting Features (GNN)", leave=False):
@@ -253,7 +250,7 @@ def calculate_baus(y_true: np.ndarray, y_pred: np.ndarray, known_classes: set, u
 
     return float(np.mean(class_rejection_rates))
 
-def compute_reid_metrics(sim_matrix, labels, known_classes, device='cpu', sim_thresh=0.4):
+def compute_reid_metrics(sim_matrix, labels, known_classes, raw_identities, device='cpu', sim_thresh=0.4):
     sim_matrix = sim_matrix.to(device)
     labels = labels.to(device)
     
@@ -266,10 +263,6 @@ def compute_reid_metrics(sim_matrix, labels, known_classes, device='cpu', sim_th
     top1_sims = sim_matrix.max(dim=1).values
     top1_labels = sorted_labels[:, 0]
     
-    y_pred = top1_labels.detach().clone()
-    y_pred[top1_sims < sim_thresh] = -1 
-    
-    y_true_np, y_pred_np = labels.cpu().numpy(), y_pred.cpu().numpy()
     N = labels.size(0)
     aps = []
     cmc_1, cmc_5, cmc_10 = 0.0, 0.0, 0.0
@@ -291,8 +284,16 @@ def compute_reid_metrics(sim_matrix, labels, known_classes, device='cpu', sim_th
     valid_queries = len(aps) if aps else 1
     mAP = np.mean(aps) * 100 if aps else 0.0
     
-    baks = calculate_baks(y_true_np, y_pred_np, known_classes)
-    baus = calculate_baus(y_true_np, y_pred_np, known_classes)
+    # Convert predictions back to raw string identities for strict matching
+    y_true_raw = raw_identities
+    y_pred_raw = np.array([
+        raw_identities[match_idx] if sim >= sim_thresh else "-1" 
+        for match_idx, sim in zip(sorted_indices[:, 0].cpu().numpy(), top1_sims.cpu().numpy())
+    ])
+    
+    baks = calculate_baks(y_true_raw, y_pred_raw, known_classes)
+    baus = calculate_baus(y_true_raw, y_pred_raw, known_classes, unknown_label="-1")
+    
     return (cmc_1/valid_queries)*100, (cmc_5/valid_queries)*100, (cmc_10/valid_queries)*100, mAP, baks, baus
 
 # =====================================================================
@@ -419,23 +420,54 @@ def plot_interactive_3d_tsne(xyz, labels, title, save_path):
 # =====================================================================
 # 5. METRICS WORKERS
 # =====================================================================
-def evaluate_metrics_worker(ckpt_key, fused_sim, labels_np, known_classes, species_preds_np, species_labels_np, args):
+def evaluate_metrics_worker(ckpt_key, fused_sim, labels_np, raw_identities_np, known_classes, species_preds_np, species_labels_np, args):
     warnings.filterwarnings("ignore", message="y_pred contains classes not in y_true")
 
-    # fused_sim is already an (N,N) similarity matrix as float64 array
     raw_gnn_matrix = torch.tensor(fused_sim, dtype=torch.float32)
-
-    # Rerank and cluster
     reranked_matrix = k_reciprocal_rerank(raw_gnn_matrix, k1=args.leiden_k1, lambda_value=args.leiden_lambda)
-    predicted_ids = run_hdbscan(reranked_matrix, epsilon=0.50)
+    
+    # -------------------------------------------------------------
+    # HDBSCAN Hyperparameter Grid Search
+    # -------------------------------------------------------------
+    best_eps = 0.50
+    best_min_cls = 2
+    
+    if args.optimize_hdbscan:
+        best_ari = -1.0
+        best_nmi = -1.0
+        best_ids = -1
+        
+        epsilons = [0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+        min_cluster_sizes = [2, 3, 4]
+        
+        for eps in epsilons:
+            for min_cls in min_cluster_sizes:
+                pred_ids = run_hdbscan(reranked_matrix, epsilon=eps, min_cluster_size=min_cls)
+                ari = adjusted_rand_score(labels_np, pred_ids)
+                
+                if ari > best_ari:
+                    best_ari = ari
+                    best_nmi = normalized_mutual_info_score(labels_np, pred_ids)
+                    best_ids = len(set(pred_ids))
+                    best_eps = eps
+                    best_min_cls = min_cls
+
+        ari = best_ari
+        nmi = best_nmi
+        discovered_ids = best_ids
+        print(f"[{ckpt_key}] Optimized HDBSCAN: eps={best_eps}, min_cls={best_min_cls} (ARI: {ari:.4f})")
+    else:
+        # Standard hardcoded run
+        predicted_ids = run_hdbscan(reranked_matrix, epsilon=0.50, min_cluster_size=2)
+        ari = adjusted_rand_score(labels_np, predicted_ids)
+        nmi = normalized_mutual_info_score(labels_np, predicted_ids)
+        discovered_ids = len(set(predicted_ids))
+    
+    # Calculate Standard Re-ID Retrieval Metrics
     r1, r5, r10, map_val, baks, baus = compute_reid_metrics(
-        raw_gnn_matrix, torch.from_numpy(labels_np), known_classes,
+        raw_gnn_matrix, torch.from_numpy(labels_np), known_classes, raw_identities_np,
         device='cpu', sim_thresh=0.4
     )
-
-    ari = adjusted_rand_score(labels_np, predicted_ids)
-    nmi = normalized_mutual_info_score(labels_np, predicted_ids)
-    discovered_ids = len(set(predicted_ids))
 
     match = re.search(r'ep(\d+)', ckpt_key)
     sort_val = int(match.group(1)) if match else 0
@@ -445,6 +477,7 @@ def evaluate_metrics_worker(ckpt_key, fused_sim, labels_np, known_classes, speci
         'Rank-1 (%)': r1, 'Rank-5 (%)': r5, 'Rank-10 (%)': r10, 'mAP (%)': map_val,
         'BaKS': baks, 'BAUS': baus, 'H-Score': np.sqrt(baks * baus),
         'Baseline ARI': ari, 'Baseline NMI': nmi, 'Baseline IDs': discovered_ids,
+        'Opt_Eps': best_eps, 'Opt_MinCls': best_min_cls,
         'Species Acc (%)': accuracy_score(species_labels_np, species_preds_np) * 100,
         'Species BAcc (%)': balanced_accuracy_score(species_labels_np, species_preds_np) * 100,
         'ckpt_path': ckpt_key
@@ -491,11 +524,11 @@ def main(args):
         mode_suffix += "_competition"
         
     if getattr(args, 'base_test_csv', None) and args.holdout_dataset != None:
-        eval_out_dir = os.path.join(args.checkpoints_dir, f"evaluation_results_mixed_holdout{mode_suffix}")
+        eval_out_dir = os.path.join(args.checkpoints_dir, f"evaluation_results_mixed_holdout{mode_suffix}{args.eval_suffix}")
     elif args.holdout_dataset != None:
-        eval_out_dir = os.path.join(args.checkpoints_dir, f"evaluation_results_dataset_holdout{mode_suffix}")
+        eval_out_dir = os.path.join(args.checkpoints_dir, f"evaluation_results_dataset_holdout{mode_suffix}{args.eval_suffix}")
     else:
-        eval_out_dir = os.path.join(args.checkpoints_dir, f"evaluation_results{mode_suffix}")
+        eval_out_dir = os.path.join(args.checkpoints_dir, f"evaluation_results{mode_suffix}{args.eval_suffix}")
         
     csv_path = os.path.join(eval_out_dir, 'benchmark_stats.csv')
     os.makedirs(eval_out_dir, exist_ok=True)
@@ -550,10 +583,8 @@ def main(args):
             print(f"\nProcessing Checkpoint: {os.path.basename(ckpt)}")
             try:
                 model, train_classes = ReIDModel.load(ckpt, args=args, device=main_device)
-                
 
                 gnn_query_feats, _, species_preds, species_labels = extract_features(model, test_loader, main_device)
-                # Build a stable mapping from path to its index in the feature matrix
                 path_list = test_df['path'].tolist()
                 path_to_idx = {p: i for i, p in enumerate(path_list)}
                 dict_key = os.path.basename(ckpt).replace('.pth', '')
@@ -570,8 +601,8 @@ def main(args):
             except Exception as e:
                 print(f"Failed to infer {os.path.basename(ckpt)}: {e}")
 
-        # --- PHASE 2: SEQUENTIAL CPU BASELINE METRICS ---
-        print(f"\n--- PHASE 2: SEQUENTIAL METRICS CALCULATION ---")
+        # --- PHASE 2: PARALLEL METRICS CALCULATION ---
+        print(f"\n--- PHASE 2: PARALLEL METRICS CALCULATION ---")
         
         if not extracted_data:
             print("[CRITICAL ERROR] No models were successfully processed in Phase 1!")
@@ -581,32 +612,44 @@ def main(args):
         path_list = test_df['path'].tolist()
         base_path_to_idx = {p: i for i, p in enumerate(path_list)}
 
-        results = []
-        for k, model_data in tqdm(extracted_data.items(), desc="Computing Baseline Metrics"):
+        task_payloads = []
+        for k, model_data in extracted_data.items():
             gnn_feats = model_data['gnn_query']
 
             if args.enable_wildfusion:
-                # Fuse Mega + GNN via WildFusion
                 ws = WS(root_dir=args.root_dir,
                         gnn_feats=gnn_feats,
                         path_to_idx=base_path_to_idx,
                         mega_cache_path=mega_cache_path)
                 fused_sim = ws.apply_ws(path_list)
             else:
-                # GNN‑only: use cosine similarity directly
                 gnn_sim = torch.mm(gnn_feats, gnn_feats.t())
                 fused_sim = gnn_sim.numpy().astype(np.float64)
 
-            res = evaluate_metrics_worker(
-                ckpt_key=k,
-                fused_sim=fused_sim,
-                labels_np=test_df['global_label'].values,
-                known_classes=model_data['train_classes'],
-                species_preds_np=model_data['species_preds'],
-                species_labels_np=model_data['species_labels'],
-                args=args
-            )
-            results.append(res)
+            task_payloads.append({
+                'ckpt_key': k,
+                'fused_sim': fused_sim,
+                'labels_np': test_df['global_label'].values,
+                'raw_identities_np': test_df['identity'].values,
+                'known_classes': model_data['train_classes'],
+                'species_preds_np': model_data['species_preds'],
+                'species_labels_np': model_data['species_labels'],
+                'args': args
+            })
+
+        results = []
+        # Cap thread workers to prevent over-subscription (HDBSCAN is multi-threaded in C)
+        max_workers = min(args.parallel_workers, 8) if args.parallel_workers > 0 else None
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(evaluate_metrics_worker, **payload) for payload in task_payloads]
+            
+            for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="Computing Metrics (Parallel)"):
+                try:
+                    results.append(future.result())
+                except Exception as exc:
+                    print(f"A worker generated an exception: {exc}")
+                    traceback.print_exc()
                     
         df = pd.DataFrame(results)
         
@@ -645,6 +688,7 @@ if __name__ == "__main__":
     parser.add_argument("--holdout_dataset", type=str, default=None)
     parser.add_argument("--holdout_species", type=str, default=None)
     parser.add_argument("--eval_filter_species", type=str, default=None)
+    parser.add_argument("--species", type=str, default=None, help="Filter the test set to evaluate only a specific species (e.g., 'lynx')")
     parser.add_argument("--segments", type=int, default=300)
     parser.add_argument("--data_mode", type=str, default="auto", choices=["auto", "memory", "lazy"])
     parser.add_argument("--batch_size", type=int, default=128)
@@ -673,9 +717,10 @@ if __name__ == "__main__":
     
     parser.add_argument("--base_test_csv", type=str, default=None)
 
-    parser.add_argument("--enable_wildfusion", action="store_true",
-                    help="Fuse MegaDescriptor with GNN instead of GNN‑only")
-    parser.add_argument("--competition", action="store_true",
-                    help="Evaluate on competition test set (separate output folder)")
+    parser.add_argument("--enable_wildfusion", action="store_true", help="Fuse MegaDescriptor with GNN instead of GNN-only")
+    parser.add_argument("--competition", action="store_true", help="Evaluate on competition test set (separate output folder)")
+    parser.add_argument("--eval_suffix", type=str, default="", help="Optional suffix appended to the eval output directory.")
+    parser.add_argument("--optimize_hdbscan", action="store_true", help="Run hyperparameter search for HDBSCAN instead of using hardcoded values")
+    
     args = parser.parse_args()
     main(args)

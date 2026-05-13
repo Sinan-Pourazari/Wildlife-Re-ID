@@ -14,11 +14,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import transforms
 from torch_geometric.data import Data
-from torch_geometric.nn import GATv2Conv, global_mean_pool, knn_graph
 from torch_geometric.utils import dropout_edge, dropout_node, from_scipy_sparse_matrix
-
 from helper import per_pixel_hog_bins
 from gnn.cae import TextureEncoder
+from torch_geometric.nn import GATv2Conv, GCNConv, global_mean_pool, knn_graph, global_max_pool
 
 def image_to_superpixel_graph(img, seeds_num_superpixels=300, seeds_num_levels=4, seeds_prior=1, seeds_histogram_bins=4, hog_bins=9, mask=None, hog_signed=False, hog_l2norm=True, features=['color', 'pos', 'hog'], n_hops=1, cae_weights_path=None, cae_latent_dim=128, return_segments=False):   
     if isinstance(img, Image.Image):
@@ -84,8 +83,8 @@ def image_to_superpixel_graph(img, seeds_num_superpixels=300, seeds_num_levels=4
             ])
             all_crops = [None] * num_nodes 
 
-        for sp in range(num_nodes):
-            prop = props[sp]
+        for sp_idx in range(num_nodes):
+            prop = props[sp_idx]
             min_y, min_x, max_y, max_x = prop.bbox
             
             # O(1) Masking
@@ -119,7 +118,7 @@ def image_to_superpixel_graph(img, seeds_num_superpixels=300, seeds_num_levels=4
                     mean_color = np.array([0, 0, 0], dtype=np.uint8)
                 crop_img[~local_mask] = mean_color
                 
-                all_crops[sp] = cae_transform(crop_img)
+                all_crops[sp_idx] = cae_transform(crop_img)
                 
             if 'shape' in features:
                 area = prop.area / total_area
@@ -229,119 +228,149 @@ def image_to_superpixel_graph(img, seeds_num_superpixels=300, seeds_num_levels=4
 
     
 class GNNEncoder(nn.Module):
-    def __init__(self, features, cae_latent_dim , num_hog_bins,in_dim=14, hidden_dim=512, out_dim=512, edge_strategy="spatial", k_neighbors=5):
+    def __init__(self, features, cae_latent_dim, num_hog_bins, in_dim=14, hidden_dim=512, out_dim=512, 
+                 edge_strategy="spatial", k_neighbors=5, gnn_layers=3, gnn_type="gatv2", 
+                 use_jk=True, jk_mode="attention", pooling_type="gem", drop_node=0.10, drop_edge=0.15, drop_modality=0.0):
         super().__init__()
-        # The number of attention-based semantic edges to create per node
         self.k_neighbors = k_neighbors
         self.edge_strategy = edge_strategy
         self.features = features
         self.cae_latent_dim = cae_latent_dim
         self.num_hog_bins = num_hog_bins
-        #self.pruner = BackgroundPruner(in_dim=in_dim)
-        # Learned Attention Projection
-        # Projects raw features into a specific "Edge Similarity" space.
-        # This acts like the Query/Key transformations in standard Transformers.
+        self.gnn_layers = gnn_layers
+        self.gnn_type = gnn_type
+        self.use_jk = use_jk
+        self.jk_mode = jk_mode
+        self.drop_node = drop_node
+        self.drop_edge = drop_edge
+        self.drop_modality = drop_modality
+        
         if self.edge_strategy in ["attention", "hybrid"]:
             self.edge_proj = nn.Sequential(
-                nn.Linear(in_dim, hidden_dim // 2),
-                nn.LayerNorm(hidden_dim // 2),
-                nn.ReLU(),
-                nn.Linear(hidden_dim // 2, hidden_dim // 2)
+                nn.Linear(in_dim, hidden_dim // 2), nn.LayerNorm(hidden_dim // 2),
+                nn.ReLU(), nn.Linear(hidden_dim // 2, hidden_dim // 2)
             )
         self.edge_dim = 3 if 'pos' in features else None
         
-        # Pass edge_dim into the GATv2Conv layers
-        self.conv1 = GATv2Conv(in_dim, hidden_dim//8, heads=8, edge_dim=self.edge_dim)
-        self.norm1 = nn.LayerNorm(hidden_dim)
-
-        self.conv2 = GATv2Conv(hidden_dim, hidden_dim // 8, heads=8, edge_dim=self.edge_dim)
-        self.norm2 = nn.LayerNorm(hidden_dim)
-
-        self.conv3 = GATv2Conv(hidden_dim, hidden_dim // 8, heads=8, edge_dim=self.edge_dim)
-        self.norm3 = nn.LayerNorm(hidden_dim)
+        # --- DYNAMIC LAYER BUILDING ---
+        self.convs = nn.ModuleList()
+        self.norms = nn.ModuleList()
         
-        
-        # Scores the 512-dim feature vectors to decide which layer is most useful
-        self.layer_scorer = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 4),
-            nn.GELU(),
-            nn.Linear(hidden_dim // 4, 1)
-        )
+        current_in_dim = in_dim
+        for i in range(self.gnn_layers):
+            if self.gnn_type == "gatv2":
+                self.convs.append(GATv2Conv(current_in_dim, hidden_dim // 8, heads=8, edge_dim=self.edge_dim))
+                current_in_dim = hidden_dim # 8 heads * (hidden//8) = hidden_dim
+            elif self.gnn_type == "gcn":
+                self.convs.append(GCNConv(current_in_dim, hidden_dim))
+                current_in_dim = hidden_dim
 
-        # Initialize the GeM Pooling layer here
-        self.gem_pool = GeMPooling(p=1.5)
+            self.norms.append(nn.LayerNorm(hidden_dim))
 
-    def forward(self, data):
-        x, spatial_edge_index, batch = data.x, data.edge_index, data.batch
-        
-        # Safely extract edge_attr if it exists
-        edge_attr = getattr(data, 'edge_attr', None) 
+        # Only create JK scorer if requested, >1 layer, AND using attention
+        if self.use_jk and self.gnn_layers > 1 and self.jk_mode == "attention":
+            self.layer_scorer = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim // 4),
+                nn.GELU(),
+                nn.Linear(hidden_dim // 4, 1)
+            )
 
-        if self.training:
-            x = self.apply_modality_dropout(x, p=0.2)
-        
-        if self.edge_strategy == "spatial":
-            final_edge_index = spatial_edge_index
-            final_edge_attr = edge_attr # Keep spatial edge attributes
-            
+        # --- DYNAMIC POOLING (MUST BE IN INIT) ---
+        self.pooling_type = pooling_type
+        if self.pooling_type == "gem":
+            self.pool = GeMPooling(p=1.5)
+        elif self.pooling_type == "mean":
+            self.pool = global_mean_pool
+        elif self.pooling_type == "max":
+            self.pool = global_max_pool
         else:
-            queries_keys = self.edge_proj(x)
-            semantic_edge_index = knn_graph(x=queries_keys, k=self.k_neighbors, batch=batch, loop=False, cosine=True)
+            raise ValueError(f"Unknown pooling type: {self.pooling_type}")
 
-            if self.edge_strategy == "attention":
-                final_edge_index = semantic_edge_index
-                final_edge_attr = None # Attention edges don't have spatial attributes
 
-            elif self.edge_strategy == "hybrid":
-                final_edge_index = torch.cat([spatial_edge_index, semantic_edge_index], dim=1)
-                final_edge_attr = None # Cannot mix spatial and non-spatial attributes
+    def forward(self, x, edge_index, edge_attr=None, batch=None):
+        
+        # Safety fallback
+        if batch is None:
+            batch = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
 
-       # Graph augmentations
+        # ==========================================
+        # EDGE STRATEGY ROUTING
+        # ==========================================
+        if self.edge_strategy == "attention":
+            # 1. Project features into latent edge space
+            proj_x = self.edge_proj(x)
+            # 2. Generate edges based purely on feature similarity
+            final_edge_index = knn_graph(proj_x, k=self.k_neighbors, batch=batch, loop=True)
+            final_edge_attr = None
+
+        elif self.edge_strategy == "hybrid":
+            # 1. Generate kNN edges
+            proj_x = self.edge_proj(x)
+            knn_edges = knn_graph(proj_x, k=self.k_neighbors, batch=batch, loop=True)
+            # 2. Concatenate them with the spatial edges
+            final_edge_index = torch.cat([edge_index, knn_edges], dim=1)
+            final_edge_attr = None
+
+        else: # "spatial"
+            # 1. Keep the exact edges generated by the SEEDS algorithm
+            final_edge_index = edge_index
+            final_edge_attr = edge_attr
+
+        # --- SAFETY FALLBACK FOR GATv2 ---
+        if self.edge_dim is not None and final_edge_attr is None:
+            final_edge_attr = torch.zeros((final_edge_index.size(1), self.edge_dim), dtype=x.dtype, device=x.device)
+        if not hasattr(self, '_printed_edge_stats'):
+            print(f"\n[RUNTIME VERIFY] Strategy: {self.edge_strategy.upper()}")
+            print(f"--> Nodes in batch: {x.size(0)}")
+            print(f"--> Original (Spatial) Edges: {edge_index.size(1)}")
+            print(f"--> Active (Final) Edges: {final_edge_index.size(1)}")
+            self._printed_edge_stats = True
+        # ==========================================
+        # GRAPH AUGMENTATIONS
+        # ==========================================
         if self.training:
-            final_edge_index, _, _ = dropout_node(
-                final_edge_index, 
-                p=0.10, 
-                num_nodes=x.size(0)
-            )
+            # 1. Modality Dropout 
+            curr_x = self.apply_modality_dropout(x, self.drop_modality)
             
-            # Extract the edge_mask so we can drop the corresponding edge attributes!
-            final_edge_index, edge_mask = dropout_edge(
-                final_edge_index, 
-                p=0.15, 
-                force_undirected=True
-            )
-            # Sync edge attributes with the dropped edges
+            # 2. Structural Dropout
+            final_edge_index, _, _ = dropout_node(final_edge_index, p=self.drop_node, num_nodes=curr_x.size(0))
+            final_edge_index, edge_mask = dropout_edge(final_edge_index, p=self.drop_edge, force_undirected=True)
             if final_edge_attr is not None:
                 final_edge_attr = final_edge_attr[edge_mask]
+        else:
+            curr_x = x
         
-        # Layer 1 (Pass final_edge_attr)
-        x1 = self.norm1(F.elu(self.conv1(x, final_edge_index, edge_attr=final_edge_attr)))
+        # --- DYNAMIC FORWARD PASS ---
+        xs = []
+        for i in range(self.gnn_layers):
+            if self.gnn_type == "gatv2":
+                curr_x = self.convs[i](curr_x, final_edge_index, edge_attr=final_edge_attr)
+            else: # GCN baseline
+                curr_x = self.convs[i](curr_x, final_edge_index)
+                
+            curr_x = F.elu(self.norms[i](curr_x))
+            
+            # Residual skip connections for deeper layers
+            if i > 0: 
+                curr_x = curr_x + xs[-1]
+            xs.append(curr_x)
+
+        # --- DYNAMIC JUMPING KNOWLEDGE ---
+        if self.use_jk and self.gnn_layers > 1:
+            x_stacked = torch.stack(xs, dim=1)
+            
+            if self.jk_mode == "attention":
+                scores = self.layer_scorer(x_stacked)
+                score_weights = F.softmin(scores, dim=1)
+                x_dynamic = (x_stacked * score_weights).sum(dim=1)
+            elif self.jk_mode == "mean":
+                x_dynamic = x_stacked.mean(dim=1)
+        else:
+            x_dynamic = xs[-1]
+
+        # --- DYNAMIC POOLING PASS ---
+        pooled = self.pool(x_dynamic, batch)
         
-        # Layer 2 (with Residual Skip Connection)
-        x2 = self.norm2(F.elu(self.conv2(x1, final_edge_index, edge_attr=final_edge_attr)))
-        x2 = x2 + x1
-
-        # Layer 3
-        x3 = self.norm3(F.elu(self.conv3(x2, final_edge_index, edge_attr=final_edge_attr)))
-        x3 = F.softplus(x3)
-
-        # ==============================================================
-        # RESTORED: Dynamic Jumping Knowledge (Layer Attention)
-        # ==============================================================
-        # reshape to [Num_Nodes, 3, 512]
-        x_stacked = torch.stack([x1, x2, x3], dim=1)
-        scores = self.layer_scorer(x_stacked)
-
-        # convert to percentage
-        score_weights = F.softmin(scores, dim=1)
-
-        # Multiply and sum to get the final custom blend per node
-        x_dynamic = (x_stacked * score_weights).sum(dim=1)
-
-        # ==============================================================
-        # RESTORED: Pooling and Return
-        # ==============================================================
-        pooled = self.gem_pool(x_dynamic, batch)
         return pooled
 
     def apply_modality_dropout(self, x, p):
@@ -355,7 +384,6 @@ class GNNEncoder(nn.Module):
         x_dropped = x.clone()
         num_nodes = x.size(0) 
 
-        # 1. Define the sizes of each block
         feature_block_sizes = {
             'color': 3,
             'pos':   2,
@@ -365,32 +393,22 @@ class GNNEncoder(nn.Module):
             'texture': 1
         }
         
-        # Dynamically pull the CAE size  if it exists, otherwise default to 16
         feature_block_sizes['cae'] = self.cae_latent_dim
-
-        # 2. strict order they are appended in image_to_superpixel_graph
         extraction_order = ['color', 'pos', 'hog', 'cae', 'shape', 'lbp', 'texture']
         
         feature_blocks = {}
         curr_indx = 0
         
-        # 3. Build the dynamic index map based ONLY on what is active
         for feat in extraction_order:
             if feat in self.features:
                 size = feature_block_sizes[feat]
-                # Map the feature to its start and end indices
                 feature_blocks[feat] = (curr_indx, curr_indx + size)
                 curr_indx += size
                 
-        # 4. Apply the Dropout
         for name, (start, end) in feature_blocks.items():
-            # True = Drop this modality for this node
             drop_mask = torch.rand(num_nodes, 1, device=x.device) < p
-            
-            # Fill the selected feature columns with 0.0 where the mask is True
             x_dropped[:, start:end].masked_fill_(drop_mask, 0.0)
 
-        # Missing in previous code: you must return the modified tensor!
         return x_dropped
     
 
