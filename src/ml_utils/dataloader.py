@@ -315,23 +315,30 @@ class UniversalGraphDataset(PyGDataset):
         """fast byte concatenation for rappid itteration."""
         return self.base_key_bytes + filename.encode('utf-8')
     def _warmup_cache(self, rebuild):
-
         print(f"\n[ CACHE WARMUP ] Checking {len(self.samples)} samples against LMDB...")
-        # If texture is requested, bake the CAE version right into the key!
-        # 100GB map size. (This is virtual memory, it won't actually consume 100GB of disk space)
         env = self._init_db(write=True)
 
-        # Gather existing keys to avoid redundant work
-        with env.begin() as txn:
-            existing_keys = set(txn.cursor().iternext(values=False))
-
-        # Filter down to tasks that actually need processing
         tasks = []
-        for filename, _, _ in self.samples:
-            key = self._get_key(filename)
-            if not rebuild and key in existing_keys:
-                continue
-            tasks.append((key, filename))
+        
+        # =========================================================
+        # SPEEDUP OPTIMIZATION: Sort the keys before looking them up!
+        # LMDB B-Trees are lightning fast if you query them sequentially.
+        # Random access causes massive disk-thrashing/page-faults.
+        # =========================================================
+        print("--> Pre-calculating and sorting keys for sequential read...")
+        search_queue = [(self._get_key(filename), filename) for filename, _, _ in self.samples]
+        search_queue.sort(key=lambda x: x[0]) # Sort by byte-key
+
+        # Use an explicit read-only transaction for the check phase
+        with env.begin(write=False) as txn:
+            cursor = txn.cursor()
+            
+            # Wrapped in a tqdm so you can see exactly how fast it is moving now
+            for key, filename in tqdm(search_queue, desc="Scanning DB", leave=False):
+                # Because the queue is sorted, set_key never has to seek backwards
+                if not rebuild and cursor.set_key(key):
+                    continue
+                tasks.append((key, filename))
 
         if not tasks:
             print("--> All graphs present in LMDB. Skipping generation.")
@@ -340,7 +347,6 @@ class UniversalGraphDataset(PyGDataset):
         print(f"--> Launching Parallel Warmup for {len(tasks)} missing graphs...")
         
         # Helper to wrap the task for Joblib
-        # Inside _warmup_cache in dataloader.py
         def wrapper(task):
             import torch
             torch.set_num_threads(1)
@@ -361,6 +367,7 @@ class UniversalGraphDataset(PyGDataset):
                 cae_latent_dim=self.cae_latent_dim 
             )
             return key, success, result
+
         # return_as="generator" yields results as soon as workers finish them
         results_gen = Parallel(
             n_jobs=-1, 

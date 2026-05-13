@@ -319,12 +319,12 @@ class GNNEncoder(nn.Module):
         # --- SAFETY FALLBACK FOR GATv2 ---
         if self.edge_dim is not None and final_edge_attr is None:
             final_edge_attr = torch.zeros((final_edge_index.size(1), self.edge_dim), dtype=x.dtype, device=x.device)
-        if not hasattr(self, '_printed_edge_stats'):
-            print(f"\n[RUNTIME VERIFY] Strategy: {self.edge_strategy.upper()}")
-            print(f"--> Nodes in batch: {x.size(0)}")
-            print(f"--> Original (Spatial) Edges: {edge_index.size(1)}")
-            print(f"--> Active (Final) Edges: {final_edge_index.size(1)}")
-            self._printed_edge_stats = True
+        #if not hasattr(self, '_printed_edge_stats'):
+         #   print(f"\n[RUNTIME VERIFY] Strategy: {self.edge_strategy.upper()}")
+          #  print(f"--> Nodes in batch: {x.size(0)}")
+           # print(f"--> Original (Spatial) Edges: {edge_index.size(1)}")
+            #print(f"--> Active (Final) Edges: {final_edge_index.size(1)}")
+            #self._printed_edge_stats = True
         # ==========================================
         # GRAPH AUGMENTATIONS
         # ==========================================

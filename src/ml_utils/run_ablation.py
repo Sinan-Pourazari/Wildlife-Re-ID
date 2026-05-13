@@ -33,6 +33,11 @@ STEPS_TO_RUN = {
     "5A_EVAL_UNSEEN_GNN_OPT": 1,
     "6A_EVAL_MIXED_GNN_OPT": 1,
     "8_CROSS_EVAL_MATRIX_OPT": 1,
+
+    # --- POST-PROCESSING ABLATION (PURE GNN POWER) ---
+    "4A_EVAL_KNOWN_NO_RERANK": 1,
+    "4C_EVAL_KNOWN_PER_SPECIES_NO_RERANK": 1, 
+    "5A_EVAL_UNSEEN_GNN_NO_RERANK": 1, 
 }
 
 # ========================================================
@@ -211,7 +216,7 @@ ABLATIONS = [
         "seeds_num_superpixels": 500, "batch_size": 128  # Lower batch size to prevent OOM
     }},
 
-    # HYPOTHESIS 3: The  Amphibian Fix
+    # HYPOTHESIS 3: The Ultimate Amphibian Fix
     # Combines H1 and H2. If this yields the highest ARI, you have proven that 
     # Amphibian Re-ID requires BOTH micro-textural resolution and flexible topology.
     {"name": "Exp9_H3_Salamander_Hybrid_Micro", "args": {
@@ -430,6 +435,33 @@ def main():
 
             if STEPS_TO_RUN.get("6A_EVAL_MIXED_GNN_OPT"):
                 run_cmd(f"[{run_name}] STEP 6A (OPT): Mixed Domain GNN", base_eval_cmd + ["--csv_path", merged_csv, "--base_test_csv", test_csv, "--holdout_dataset", HOLDOUT_DATASET, "--batch_size", eval_batch_gnn, "--parallel_workers", 14, "--optimize_hdbscan", "--eval_suffix", "_opt"], ckpt_dir, "6A_EVAL_MIXED_GNN_OPT")
+
+            # ==================================================
+            # POST-PROCESSING ABLATION (PURE GNN POWER)
+            # ==================================================
+            if STEPS_TO_RUN.get("4A_EVAL_KNOWN_NO_RERANK"):
+                run_cmd(f"[{run_name}] STEP 4A (Raw): No Reranking", 
+                        base_eval_cmd + ["--csv_path", test_csv, "--batch_size", eval_batch_gnn, 
+                                         "--parallel_workers", 14, "--disable_reranking", 
+                                         "--eval_suffix", "_raw_cosine"], 
+                        ckpt_dir, "4A_EVAL_KNOWN_NO_RERANK")
+
+            if STEPS_TO_RUN.get("4C_EVAL_KNOWN_PER_SPECIES_NO_RERANK"):
+                for species_dataset, species_tag in CLEF_SPECIES:
+                    run_cmd(
+                        f"[{run_name}] STEP 4C (Raw): No Reranking [{species_tag}]",
+                        base_eval_cmd + ["--csv_path", test_csv, "--batch_size", eval_batch_gnn, 
+                                         "--parallel_workers", 14, "--holdout_dataset", species_dataset, 
+                                         "--disable_reranking", "--eval_suffix", f"_raw_cosine_species_{species_tag}"],
+                        ckpt_dir, f"4C_EVAL_KNOWN_GNN_{species_tag}_NO_RERANK"
+                    )
+
+            if STEPS_TO_RUN.get("5A_EVAL_UNSEEN_GNN_NO_RERANK"):
+                run_cmd(f"[{run_name}] STEP 5A (Raw): Unseen Domain No Reranking", 
+                        base_eval_cmd + ["--csv_path", merged_csv, "--holdout_dataset", HOLDOUT_DATASET, 
+                                         "--batch_size", eval_batch_gnn, "--parallel_workers", 14, 
+                                         "--disable_reranking", "--eval_suffix", "_raw_cosine"], 
+                        ckpt_dir, "5A_EVAL_UNSEEN_GNN_NO_RERANK")
 
         except Exception as e:
             failed_runs.append(run_name)

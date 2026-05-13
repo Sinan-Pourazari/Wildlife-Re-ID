@@ -5,6 +5,7 @@ import warnings
 import re
 warnings.filterwarnings("ignore", message=".*copying from a non-meta parameter.*")
 warnings.filterwarnings("ignore", message=".*The number of unique classes is greater than 50%.*")
+warnings.filterwarnings("ignore", message=".*A single label was found in.*")
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -424,7 +425,12 @@ def evaluate_metrics_worker(ckpt_key, fused_sim, labels_np, raw_identities_np, k
     warnings.filterwarnings("ignore", message="y_pred contains classes not in y_true")
 
     raw_gnn_matrix = torch.tensor(fused_sim, dtype=torch.float32)
-    reranked_matrix = k_reciprocal_rerank(raw_gnn_matrix, k1=args.leiden_k1, lambda_value=args.leiden_lambda)
+    
+    # --- NEW: RERANKING TOGGLE ---
+    if getattr(args, 'disable_reranking', False):
+        reranked_matrix = fused_sim # Bypass Jaccard, pass raw cosine directly to HDBSCAN
+    else:
+        reranked_matrix = k_reciprocal_rerank(raw_gnn_matrix, k1=args.leiden_k1, lambda_value=args.leiden_lambda)
     
     # -------------------------------------------------------------
     # HDBSCAN Hyperparameter Grid Search
@@ -721,6 +727,6 @@ if __name__ == "__main__":
     parser.add_argument("--competition", action="store_true", help="Evaluate on competition test set (separate output folder)")
     parser.add_argument("--eval_suffix", type=str, default="", help="Optional suffix appended to the eval output directory.")
     parser.add_argument("--optimize_hdbscan", action="store_true", help="Run hyperparameter search for HDBSCAN instead of using hardcoded values")
-    
+    parser.add_argument("--disable_reranking", action="store_true", help="Skip Jaccard k-reciprocal reranking and use raw cosine similarity")
     args = parser.parse_args()
     main(args)
