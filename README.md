@@ -1,5 +1,5 @@
 # ST-VGANN: Spatial-Topological Vision Graph Attention Neural Network
-[![License: AGPL v3](https://img.shields.io/badge/License-AGPLv3-orange.svg)](https://www.gnu.org/licenses/agpl-3.0) [![Python 3.12](https://img.shields.io/badge/Python-3.12-44cc11.svg)](https://www.python.org/downloads/)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPLv3-orange.svg)](https://www.gnu.org/licenses/agpl-3.0) [![Python 3.12](https://img.shields.io/badge/Python-3.12-44cc11.svg)](https://www.python.org/downloads/) [![PyTorch](https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?style=flat&logo=PyTorch&logoColor=white)](https://pytorch.org/) [![PyG](https://img.shields.io/badge/PyG-%23EE4C2C.svg?style=flat&logo=pytorch&logoColor=white)](https://pyg.org/) [![Maintenance](https://img.shields.io/badge/Maintained%3F-yes-brightgreen.svg)](https://github.com/Sinan-Pourazari/Wildlife-Re-ID/graphs/commit-activity)
 &#x20;&#x20;
 
 **Official Repository for:**\
@@ -185,6 +185,10 @@ After evaluation is complete, the repository can automatically generate the tabl
 python src/visualization/main.py
 ```
 
+### Generating Training Time Overview Table
+```bash
+python src/visualization/train_time.py
+```
 ### Output
 
 This script:
@@ -241,6 +245,7 @@ Wildlife-Re-ID/
         ├── data.py
         ├── main.py
         ├── plots.py
+        ├── train_time.py
         └── tables.py
 ```
 
