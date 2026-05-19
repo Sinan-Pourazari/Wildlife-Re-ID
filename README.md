@@ -3,12 +3,11 @@
 &#x20;&#x20;
 
 **Official Repository for:**\
-*Exploration of Unsupervised Segmentation as a Foundation for Vision Graph Neural Networks in Individual Animal Re-identification*\
+*Exploration of Unsupervised Segmentation as a Foundation for Vision Graph Neural Networks in Individual Animal Re-identification*
 
 ---
 
 ## Overview
-
 This repository contains the complete source code, ablation framework, and orchestration logic required to reproduce the **ST-VGANN** proof-of-concept architecture.
 
 ST-VGANN models animal morphology as an irregular topological manifold by extracting superpixel-based texture primitives through an unsupervised Convolutional Autoencoder (CAE) and routing them through Graph Attention Networks (GATv2) for parameter-efficient wildlife re-identification.
@@ -37,12 +36,13 @@ All experiments were validated on a consumer workstation.
 
 ## Validated Hardware
 
-| Component | Specification                 |
-| --------- | ----------------------------- |
-| OS        | Windows 11 / Ubuntu 22.04 LTS |
-| GPU       | NVIDIA RTX 5070 (12 GB VRAM)  |
-| RAM       | 32 GB DDR5                    |
-
+| Component | Specification                  |
+| --------- | -----------------------------  |
+| OS        | Windows 11 / Ubuntu 22.04 LTS  |
+| GPU       | NVIDIA RTX 5070 (12 GB VRAM)   |
+| RAM       | 32 GB DDR5                     |
+| CPU       | AMD Ryzen 7 7800x3d            |
+|Storage    | Samsung 970 EVO Plus (M.2 gen.3)|
 ---
 
 #  Installation
@@ -50,7 +50,7 @@ All experiments were validated on a consumer workstation.
 ## 1. Clone the Repository
 
 ```bash
-git clone 
+git clone https://github.com/Sinan-Pourazari/Wildlife-Re-ID.git
 cd Wildlife-Re-ID
 ```
 
@@ -182,6 +182,10 @@ After evaluation is complete, the repository can automatically generate the tabl
 python src/visualization/main.py
 ```
 
+### Generating Training Time Overview Table
+```bash
+python src/visualization/train_time.py
+```
 ### Output
 
 This script:
@@ -191,35 +195,11 @@ This script:
 - Generates publication-ready plots and tables
 - Creates comparison plots matching the paper visualizations
 
-Artifacts are written to:
+Outputs are written to:
 
 ```text
 runs/ablations/analysis_reports/
 ```
-
----
-
-### Generate the Appendix Ablation Table
-
-```bash
-python generate_appendix.py
-```
-
-### Output
-
-Produces:
-
-```text
-appendix_table_populated.tex
-```
-
-The generated LaTeX table contains:
-
-- Native ARI scores
-- Jaccard-reranked ARI scores
-- Optimized evaluation metrics
-- All 43 configurations
-- All evaluation domains
 
 ---
 
@@ -237,7 +217,6 @@ python test_cae.py
 ```text
 Wildlife-Re-ID/
 └── src/
-    ├── bg_tools.py
     ├── main.py
     ├── ml_utils/
     │   ├── ablate_err.py
@@ -261,9 +240,9 @@ Wildlife-Re-ID/
     └── visualization/
         ├── config.py
         ├── data.py
-        ├── latex_export.py
         ├── main.py
         ├── plots.py
+        ├── train_time.py
         └── tables.py
 ```
 
