@@ -3,11 +3,13 @@
 &#x20;&#x20;
 
 **Official Repository for:**\
-*Exploration of Unsupervised Segmentation as a Foundation for Vision Graph Neural Networks in Individual Animal Re-identification*\
+*Exploration of Unsupervised Segmentation as a Foundation for Vision Graph Neural Networks in Individual Animal Re-identification*
 
 ---
 
 ## Overview
+> [!IMPORTANT]  
+> **Archive Branch** > This branch contains the exact frozen codebase utilized for the **ST-VGANN AnimalCLEF 2026** submission and experiments. It is maintained strictly for reproducibility and historical reference. For the most up-to-date framework, ongoing development, and active support, please switch to the [main branch](https://github.com/Sinan-Pourazari/Wildlife-Re-ID).
 
 This repository contains the complete source code, ablation framework, and orchestration logic required to reproduce the **ST-VGANN** proof-of-concept architecture.
 
@@ -50,7 +52,7 @@ All experiments were validated on a consumer workstation.
 ## 1. Clone the Repository
 
 ```bash
-git clone 
+git clone https://github.com/Sinan-Pourazari/Wildlife-Re-ID.git
 cd Wildlife-Re-ID
 ```
 
