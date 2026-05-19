@@ -7,10 +7,10 @@ import sys
 # 1. STEP SELECTION: Toggle True/False to skip/run steps
 # ========================================================
 STEPS_TO_RUN = {
-    "0.0_MERGE":         0,
-    "0_SPLIT":            0,
-    "2_TRAIN_CAE":        0,
-    "3_TRAIN_GNN":        0,
+    "0.0_MERGE":         1,
+    "0_SPLIT":            1,
+    "2_TRAIN_CAE":        1,
+    "3_TRAIN_GNN":        1,
     "4A_EVAL_KNOWN_GNN":  1,
     "4B_EVAL_KNOWN_WF":   1,
     "5A_EVAL_UNSEEN_GNN": 1,
@@ -22,7 +22,7 @@ STEPS_TO_RUN = {
 }
 
 # ========================================================
-# 2. COLOR CONFIGURATION (Fox Style)
+# 2. COLOR CONFIGURATION 
 # ========================================================
 FOX_ORANGE   = "\033[38;5;202m"
 FOX_WHITE    = "\033[38;5;255m"
@@ -38,8 +38,7 @@ COMMON_ROOT = "src/images"
 REID_CSV = os.path.join(COMMON_ROOT, "reid-10k/metadata.csv")
 CLEF_CSV = os.path.join(COMMON_ROOT, "animal-clef-2026/metadata.csv")
 SHARED_CAE_DIR = "models/cae"
-HOLDOUT_DATASET = "BalearicLizards"  # your original holdout (change to "NewtsKent" or "BalearicLizard" if needed)
-
+HOLDOUT_DATASET = "BalearicLizards"  
 # Hyperparameters
 IMG_SIZE = 512
 CAE_LATENT_DIM = 90
@@ -88,7 +87,7 @@ def get_latest_checkpoint(directory):
 # ========================================================
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 os.makedirs(SHARED_CAE_DIR, exist_ok=True)
-os.environ["HF_TOKEN"] = "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"
+os.environ["HF_TOKEN"] = "YOUR TOKEN HERE"
 
 print(f"{FOX_ORANGE}========================================================{RESET}")
 print(f"{FOX_ORANGE}STARTING WILDLIFE RE-ID PIPELINE {RESET}")

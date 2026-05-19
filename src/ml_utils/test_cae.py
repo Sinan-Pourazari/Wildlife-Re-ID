@@ -7,66 +7,126 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib import patheffects
 from PIL import Image, ImageOps
-from skimage.segmentation import felzenszwalb, mark_boundaries, quickshift, slic
+from skimage.segmentation import mark_boundaries
 from skimage.measure import regionprops
 import torchvision.transforms as T
 import warnings
 from gnn.cae import TextureEncoder
-import cv2  # <-- Added cv2 import
+import cv2
 from cv2.ximgproc import createSuperpixelSEEDS
 
 warnings.filterwarnings("ignore")
 
-def debug_cae_reconstruction(img_path, weights_path, latent_dim=24, img_size=256, patch_size=64):
-    #device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    device = torch.device('cpu')
-    print(f"--> Loading CAE from {weights_path} onto {device}")
-    
-    # 1. Load Model 
-    model = TextureEncoder(latent_dim=latent_dim).to(device)
-    try:
-        model.load_state_dict(torch.load(weights_path, map_location=device), strict=False)
-        print("--> Weights loaded successfully.")
-    except FileNotFoundError:
-        print("[!] Weights not found. Visualizing with random untrained weights to test pipeline.")
-    model.eval()
+def color_average_segments(image, segments):
+    """Return an image where each superpixel is replaced by its mean colour."""
+    h, w, c = image.shape
+    avg_img = np.zeros_like(image, dtype=np.uint8)
+    for region in regionprops(segments + 1):
+        label = region.label - 1
+        mask = (segments == label)
+        if mask.any():
+            mean_color = image[mask].mean(axis=0).astype(np.uint8)
+            avg_img[mask] = mean_color
+    return avg_img
 
-    # 2. Load & Pad Image (matching your pipeline exactly)
-    print(f"--> Processing Image: {img_path}")
-    img_pil = Image.open(img_path).convert("RGB")
+def compute_adjacency_and_centroids(segments):
+    """Return adjacency list (list of (i,j) tuples) and centroids (list of (x,y))."""
+    h, w = segments.shape
+    labels = np.unique(segments)
+    n = len(labels)
+    label_to_idx = {label: idx for idx, label in enumerate(labels)}
+    centroids = [None] * n
+    for region in regionprops(segments + 1):
+        label = region.label - 1
+        idx = label_to_idx[label]
+        centroids[idx] = (region.centroid[1], region.centroid[0])   # (x, y) for plotting
+    # Build adjacency set
+    adj = set()
+    for y in range(h - 1):
+        for x in range(w - 1):
+            l = segments[y, x]
+            r = segments[y, x+1]
+            if l != r:
+                adj.add(tuple(sorted((label_to_idx[l], label_to_idx[r]))))
+            d = segments[y+1, x]
+            if l != d:
+                adj.add(tuple(sorted((label_to_idx[l], label_to_idx[d]))))
+    return list(adj), centroids
+
+def process_image(img_path, output_name, model, device, img_size=512, patch_size=64, skip_graph=False, save_this=False, root_folder_name="graph_outputs"):
+    """Process a single image.
     
-    # Resize first if the image is massive, then pad to perfect square
-    img_pil.thumbnail((img_size, img_size)) 
+    Args:
+        skip_graph: If True, do not draw edges and nodes.
+        save_this: If True, save the graph overview; otherwise skip saving.
+        root_folder_name: Folder inside root where to save (only if save_this=True).
+    """
+    print(f"\n--- Processing: {img_path} -> {output_name} (skip_graph={skip_graph}, save_this={save_this}) ---")
+    
+    # Load and pad image
+    img_pil = Image.open(img_path).convert("RGB")
+    img_pil.thumbnail((img_size, img_size))
     img_pil = ImageOps.pad(img_pil, (img_size, img_size), color=(0, 0, 0))
     img_np = np.array(img_pil)
 
-    # ==========================================
-    # 3. SEGMENT THE IMAGE (SEEDS IMPLEMENTATION)
-    # ==========================================
+    # SEEDS superpixel segmentation
     h, w, c = img_np.shape
-    
-    # Convert to HSV for better histogram energy calculation
     img_hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
-    
-    # Target number of nodes
-    target_superpixels = 240 
-    
-    # Initialize SEEDS
-    seeds_algo = createSuperpixelSEEDS(
-        w, h, c, 
-        target_superpixels, 
-        num_levels=4, 
-        prior=1, 
-        histogram_bins=4
-    )
-    
-    # Run optimization and get segments
+    target_superpixels = 240
+    seeds_algo = createSuperpixelSEEDS(w, h, c, target_superpixels, num_levels=4, prior=1, histogram_bins=4)
     seeds_algo.iterate(img_hsv, 4)
     segments = seeds_algo.getLabels()
-
-    regions = regionprops(segments + 1) # Note: skimage regions expects 1-indexed labels
+    regions = list(regionprops(segments + 1))
     print(f"--> Found {len(regions)} superpixel segments")
 
+    # Build colour‑averaged image and graph
+    avg_img = color_average_segments(img_np, segments)
+    if not skip_graph:
+        edges, centroids = compute_adjacency_and_centroids(segments)
+    else:
+        edges, centroids = [], []
+
+    # ========== FIGURE 1: Two‑panel overview ==========
+    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+    axes[0].imshow(img_np)
+    axes[0].set_title("Original (padded)", fontsize=12, fontweight='bold')
+    axes[0].axis('off')
+
+    # Colour‑averaged + superpixel outlines
+    avg_with_boundaries = mark_boundaries(avg_img, segments, color=(1, 1, 0), mode='thick')
+    axes[1].imshow(avg_with_boundaries)
+    
+    # Draw graph connections only if not skipped
+    if not skip_graph:
+        for (i, j) in edges:
+            xi, yi = centroids[i]
+            xj, yj = centroids[j]
+            axes[1].plot([xi, xj], [yi, yj], 'w-', linewidth=2.5, alpha=0.95, solid_capstyle='round')
+        for idx, (cx, cy) in enumerate(centroids):
+            area = regions[idx].area
+            size = max(12, min(80, int(area / 80)))
+            axes[1].scatter(cx, cy, s=size, c='#00ccff', edgecolor='white', linewidth=1.5, alpha=0.95, zorder=10)
+    
+    title = "Colour‑averaged + superpixel outlines" + ("" if skip_graph else " + graph")
+    axes[1].set_title(title, fontsize=12, fontweight='bold')
+    axes[1].axis('off')
+
+    plt.tight_layout(pad=0.5)
+    
+    # Only save if save_this is True
+    if save_this:
+        root_dir = os.getcwd()
+        output_folder = os.path.join(root_dir, root_folder_name)
+        os.makedirs(output_folder, exist_ok=True)
+        output_path = os.path.join(output_folder, f"{output_name}_graph_overview.png")
+        plt.savefig(output_path, dpi=200, bbox_inches='tight', facecolor='white')
+        print(f"--> Saved graph overview to {output_path}")
+    else:
+        print(f"--> Skipping save for {output_name}")
+    
+    plt.close(fig)
+
+    # ========== FIGURE 2: CAE patch reconstruction grid (always shown) ==========
     model_transform = T.Compose([
         T.ToTensor(),
         T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
@@ -74,125 +134,88 @@ def debug_cae_reconstruction(img_path, weights_path, latent_dim=24, img_size=256
 
     patches_for_model = []
     patch_images_for_plot = []
-    
-    # 4. Extract patches based on Tight Bounding Boxes
+
     for props in regions:
         min_row, min_col, max_row, max_col = props.bbox
-        
-        # We need the exact ID of this segment to build the mask
-        segment_id = props.label - 1 
+        segment_id = props.label - 1
         mask_sp = (segments == segment_id)
-        
-        # 1. Get the raw rectangular crop as a numpy array
         crop_np = img_np[min_row:max_row, min_col:max_col].copy()
-        
-        # 2. Get the boolean mask for just this patch
         local_mask = mask_sp[min_row:max_row, min_col:max_col]
-        
-        # 3. APPLY MEAN-MASKING (Fixed to actually calculate the mean)
         if local_mask.any():
             mean_color = crop_np[local_mask].mean(axis=0).astype(np.uint8)
         else:
             mean_color = np.array([0, 0, 0], dtype=np.uint8)
-            
-        # Fill the background with the mean color instead of pure black
         crop_np[~local_mask] = mean_color
-        
-        # Convert back to PIL for resizing
         patch_crop = Image.fromarray(crop_np)
-        
-        # Resize that tight crop to the 64x64 size
         patch_resized = patch_crop.resize((patch_size, patch_size), Image.BILINEAR)
-        
-        # Save the masked, un-normalized image for the "Orig" row in the plot
         patch_images_for_plot.append(patch_resized)
-        
-        # Normalize the tensor for the model's forward pass
         patches_for_model.append(model_transform(patch_resized).unsqueeze(0))
 
     if not patches_for_model:
         print("[!] No patches extracted.")
         return
 
-    # 5. Pass all patches through the full CAE
     batch_tensor = torch.cat(patches_for_model, dim=0).to(device)
     with torch.no_grad():
         reconstructed_tensors, embeddings = model(batch_tensor)
-
     print(f"--> Extracted {embeddings.shape[0]} embeddings.")
 
-    # ==========================================
-    # 6. VISUALIZATION
-    # ==========================================
-    
-    # Plot 1: The Segmentation Map
-    fig, axes = plt.subplots(1, 2, figsize=(10, 5))
-    axes[0].imshow(img_np)
-    axes[0].set_title("Original Padded Image")
-    axes[0].axis('off')
-    
-    axes[1].imshow(mark_boundaries(img_np, segments))
-    axes[1].set_title(f"SEEDS Superpixels (N={len(regions)})")
-    axes[1].axis('off')
-    plt.tight_layout()
-    plt.show()
-
-    # Plot 2: High-Density Grid Reconstruction Comparison
-    cols = 8  # How many patches to show side-by-side
-    num_to_show = min(48, len(patch_images_for_plot)) 
+    # Plot reconstruction grid
+    cols = 8
+    num_to_show = min(48, len(patch_images_for_plot))
     patch_rows = int(np.ceil(num_to_show / cols))
-    
-    # Create the grid: every row of patches needs 2 rows of subplots (Orig + Recon)
-    fig, axes = plt.subplots(patch_rows * 2, cols, figsize=(cols * 1.5, patch_rows * 2 * 1.5))
-    axes = np.atleast_2d(axes) # Ensure safe 2D indexing
-    
+    fig2, axes2 = plt.subplots(patch_rows * 2, cols, figsize=(cols * 1.5, patch_rows * 2 * 1.5))
+    axes2 = np.atleast_2d(axes2)
     for i in range(patch_rows * cols):
-        r = (i // cols) * 2  # The math to alternate rows (0, 2, 4...)
+        r = (i // cols) * 2
         c = i % cols
-        
-        # Turn off axis ticks for everything
-        axes[r, c].axis('off')
-        axes[r+1, c].axis('off')
-        
+        axes2[r, c].axis('off')
+        axes2[r+1, c].axis('off')
         if i < num_to_show:
-            # Top Row: Masked Original Patch
-            axes[r, c].imshow(patch_images_for_plot[i])
-            
-            # Bottom Row: CAE Reconstruction
+            axes2[r, c].imshow(patch_images_for_plot[i])
             recon_tensor = reconstructed_tensors[i].cpu()
-            
-            # 1. Denormalize using the exact inverse of your training stats
             mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
             std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
             recon_tensor = (recon_tensor * std) + mean
-            
-            # 2. Clamp strictly to [0, 1] to make Matplotlib happy, then permute to HWC
             recon_img = recon_tensor.clamp(0, 1).permute(1, 2, 0).numpy()
-            
-            axes[r+1, c].imshow(recon_img)
-            
-            # Add clean labels only to the far-left column
+            axes2[r+1, c].imshow(recon_img)
             if c == 0:
-                axes[r, c].text(-0.15, 0.5, 'Masked Orig', va='center', ha='right', transform=axes[r, c].transAxes, fontsize=12, fontweight='bold', color='black')
-                axes[r+1, c].text(-0.15, 0.5, 'CAE', va='center', ha='right', transform=axes[r+1, c].transAxes, fontsize=12, fontweight='bold', color='purple')
-
-    plt.suptitle(f"CAE Masked Texture Reconstructions (Showing {num_to_show} patches)", fontsize=16, fontweight='bold')
-    
-    # Squeeze the grid tightly together to maximize screen real estate
+                axes2[r, c].text(-0.15, 0.5, 'Masked Orig', va='center', ha='right', transform=axes2[r, c].transAxes, fontsize=12, fontweight='bold')
+                axes2[r+1, c].text(-0.15, 0.5, 'CAE', va='center', ha='right', transform=axes2[r+1, c].transAxes, fontsize=12, fontweight='bold', color='purple')
+    plt.suptitle(f"CAE Masked Texture Reconstructions ({num_to_show} patches)", fontsize=16, fontweight='bold')
     plt.subplots_adjust(top=0.90, bottom=0.05, left=0.1, right=0.95, wspace=0.05, hspace=0.1)
     plt.show()
+    plt.close(fig2)
+
+def main():
+    CAE_WEIGHTS = r"C:\Users\sinan\Projects\Wildlife-Re-ID\models\cae\cae_dim90_size512_seeds240_v2.pth"
+    latent_dim = 90
+    img_size = 512
+    patch_size = 64
+
+    device = torch.device('cpu')
+    model = TextureEncoder(latent_dim=latent_dim).to(device)
+    try:
+        model.load_state_dict(torch.load(CAE_WEIGHTS, map_location=device), strict=False)
+        print("--> CAE weights loaded successfully.")
+    except FileNotFoundError:
+        print("[!] Weights not found. Using random untrained weights.")
+    model.eval()
+
+    # List of (image_path, output_name, skip_graph, save_this)
+    # Only salamander will save the graph overview (skip_graph=True, save_this=True)
+    images = [
+        (r"C:\Users\sinan\Projects\Wildlife-Re-ID\src\images\animal-clef-2026\images\LynxID2025\test\2f2432eb73762a67711508c2a92e2004f091f23d03888fccabeffd132083f51e.jpg", "lynx", True, True),
+        (r"C:\Users\sinan\Projects\Wildlife-Re-ID\src\images\animal-clef-2026\images\SalamanderID2025\test\0bb7bedeb8123132_95.jpg", "salamander", True, True),
+        (r"C:\Users\sinan\Projects\Wildlife-Re-ID\src\images\animal-clef-2026\images\SeaTurtleID2022\test\0d942316aeb78978_23.JPG", "turtle", True, True),
+        (r"C:\Users\sinan\Projects\Wildlife-Re-ID\src\images\animal-clef-2026\images\TexasHornedLizards\test\1e177a6eab060e92.jpg", "texas_lizard", True, True)
+    ]
+
+    for img_path, out_name, skip_graph, save_this in images:
+        if not os.path.exists(img_path):
+            print(f"[!] File not found: {img_path}")
+            continue
+        process_image(img_path, out_name, model, device, img_size, patch_size, skip_graph, save_this)
 
 if __name__ == "__main__":
-    # ---> CHANGE THESE PATHS TO MATCH YOUR LOCAL SETUP <---
-    TEST_IMAGE = r"src\ml_utils\gnn\000011.jpg"
-    TEST_IMAGE= r"C:\Users\sinan\Projects\Wildlife-Re-ID\src\images\animal-clef-2026\images\TexasHornedLizards\test\1e177a6eab060e92.jpg"
-    ## Point this directly to your newly trained CAE weights
-    CAE_WEIGHTS = r"C:\Users\sinan\Projects\Wildlife-Re-ID\models\cae\cae_dim90_size512_seeds240_v2.pth"
-    
-    debug_cae_reconstruction(
-        img_path=TEST_IMAGE, 
-        weights_path=CAE_WEIGHTS,
-        latent_dim=90,  # Make sure this matches what you pre-trained with
-        img_size=512,   
-        patch_size=64   
-    )
+    main()

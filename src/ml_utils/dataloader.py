@@ -108,7 +108,6 @@ def process_for_lmdb(filename, root_dir, seeds_num_superpixels, seeds_num_levels
         if max(img.size) > max_size:
             img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
             
-        # 2. CRITICAL FIX: Always pad to guarantee the image is exactly max_size x max_size!
         img = ImageOps.pad(img, (max_size, max_size), color=(0, 0, 0))
             
     graph = image_to_superpixel_graph(
@@ -224,7 +223,7 @@ class InMemoryGraphDataset(PyGDataset):
 class UniversalGraphDataset(PyGDataset):
     _shared_envs = {}
     def __init__(self, samples, root_dir, cache_dir, n_hops, seeds_num_superpixels, seeds_num_levels, seeds_prior, seeds_histogram_bins, num_bins, mode='auto', rebuild_cache=False, img_size=1024,
-                  num_train_classes=None, features=['color', 'pos', 'hog'], cae_version="none", cae_weights_path=None, cae_latent_dim = None):
+                  num_train_classes=None, features=['color', 'pos', 'hog'], cae_version="none", cae_weights_path=None, cae_latent_dim = None, use_cutouts=False):
         super().__init__()
         self.samples = samples
         self.root_dir = root_dir
@@ -242,6 +241,7 @@ class UniversalGraphDataset(PyGDataset):
         self.cae_latent_dim = cae_latent_dim
         self.num_bins = num_bins
         self.base_key_bytes = self._generate_base_key()
+        self.use_cutouts = use_cutouts
         if mode == 'auto':
             self.mode = 'memory' if len(samples) <= 8000 else 'lazy'
         else:
@@ -309,11 +309,18 @@ class UniversalGraphDataset(PyGDataset):
             feature_str += f"hogb-{self.num_bins}"    
             
         base_str = f"res{self.img_size}_SEEDS_N{self.seeds_num_superpixels}_L{self.seeds_num_levels}_P{self.seeds_prior}_H{self.seeds_histogram_bins}_hops{self.n_hops}_{feature_str}_"
+        
+        
+        if getattr(self, 'use_cutouts', False):
+            base_str += "u2net_cutout_"
+            
         return base_str.encode('utf-8')
 
     def _get_key(self, filename):
-        """fast byte concatenation for rappid itteration."""
+        """Fast byte concatenation for rapid iteration."""
+        # No more if-statements needed here! Blazing fast.
         return self.base_key_bytes + filename.encode('utf-8')
+    
     def _warmup_cache(self, rebuild):
         print(f"\n[ CACHE WARMUP ] Checking {len(self.samples)} samples against LMDB...")
         env = self._init_db(write=True)

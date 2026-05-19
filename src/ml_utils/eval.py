@@ -32,7 +32,7 @@ import torchvision.transforms as T
 from types import SimpleNamespace
 import concurrent.futures
 import traceback
-
+from gnn.generate_cutouts import generate_offline_cutouts
 # =====================================================================
 # 1. FEATURE EXTRACTION & DATA UTILS
 # =====================================================================
@@ -195,7 +195,8 @@ def get_dataloader(df, args):
         cae_version=args.cae_version, cae_weights_path=args.cae_weights_path, 
         cae_latent_dim=args.cae_latent_dim, seeds_num_superpixels=args.seeds_num_superpixels, 
         seeds_num_levels=args.seeds_num_levels, seeds_prior=args.seeds_prior, 
-        seeds_histogram_bins=args.seeds_histogram_bins, num_bins=args.num_hog_bins
+        seeds_histogram_bins=args.seeds_histogram_bins, num_bins=args.num_hog_bins,
+        use_cutouts=getattr(args, 'use_cutouts', False)
     )
     return DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers)
 
@@ -515,6 +516,12 @@ def generate_submission_csv(image_ids, predicted_ids, species_preds, species_idx
     print(f"--> Successfully saved AnimalCLEF submission to: {output_path}")
 
 def main(args):
+    if getattr(args, 'use_cutouts', False):
+        args.img_root = args.root_dir
+        args.cutout_root = args.root_dir + "-cutouts"
+        args.root_dir = args.cutout_root
+        print(f"--> [DATA SHIFT] Using Cutout Dataset for Eval: {args.root_dir}")
+
     main_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"[{main_device.type.upper()}] Starting Pipeline...")
     mega_cache_path = os.path.join(args.checkpoints_dir, "feature_cache", "mega")
@@ -540,6 +547,38 @@ def main(args):
     os.makedirs(eval_out_dir, exist_ok=True)
     
     test_df = get_test_samples(args)
+
+    # ====================================================================
+    # --- ROUTE 3 - T-SNE ONLY MODE ---
+    # ====================================================================
+    if getattr(args, 'tsne_only', False):
+        if not os.path.exists(csv_path):
+            return print(f"[!] Cannot generate t-SNE: '{csv_path}' not found. Run evaluation first.")
+            
+        df = pd.read_csv(csv_path)
+        top_k = min(args.top_k_detailed, len(df))
+        print(f"\n[ TSNE ONLY MODE ] Generating plots for Top {top_k} models based on ARI...")
+        
+        # Sort to find the best models, and load the dataloader
+        top_models = df.sort_values(by='Baseline ARI', ascending=False).head(top_k)
+        test_loader = get_dataloader(test_df, args)
+        
+        for _, row in top_models.iterrows():
+            m_name = row['Model Name']
+            ckpt_path = next((p for p in pth_files if os.path.basename(p).replace('.pth', '') == m_name), None)
+            
+            if ckpt_path:
+                print(f"--> Extracting & Plotting: {m_name}")
+                model, _ = ReIDModel.load(ckpt_path, args=args, device=main_device)
+                gnn_feats, _, _, _ = extract_features(model, test_loader, main_device)
+                generate_tsne_worker(m_name, gnn_feats.numpy(), test_df['global_label'].values, args, eval_out_dir)
+                del model
+                torch.cuda.empty_cache()
+        return
+    
+    if getattr(args, 'use_cutouts', False):
+        print(f"\n[ CUTOUT PHASE ] Ensuring evaluation cutouts exist in {args.cutout_root}...")
+        generate_offline_cutouts(args, test_df)
 
     # ====================================================================
     # --- ROUTE 1 - GENERATE ANIMALCLEF SUBMISSION ---
@@ -672,7 +711,7 @@ def main(args):
         df.to_csv(csv_path, index=False)
 
         # --- PHASE 3: SEQUENTIAL TOP-K VISUALIZATION ---
-        if args.top_k_detailed > 0:
+        if getattr(args, 'generate_tsne', False) and args.top_k_detailed > 0:
             top_k = min(args.top_k_detailed, len(df))
             print(f"\n--- PHASE 3: SEQUENTIAL t-SNE GENERATION (Top {top_k} Models) ---")
             
@@ -682,7 +721,7 @@ def main(args):
                 final_feats = extracted_data[m_name]['gnn_query'].numpy()
                 labels_np = test_df['global_label'].values
                 generate_tsne_worker(m_name, final_feats, labels_np, args, eval_out_dir)
-
+    
     print(f"\n--> All evaluations complete. Outputs saved to: {eval_out_dir}")
 
 if __name__ == "__main__":
@@ -699,7 +738,7 @@ if __name__ == "__main__":
     parser.add_argument("--data_mode", type=str, default="auto", choices=["auto", "memory", "lazy"])
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--workers", type=int, default=0)
-    parser.add_argument("--seeds_num_superpixels", type=int, default=300)
+    parser.add_argument("--seeds_num_superpixels", type=int, default=240)
     parser.add_argument("--seeds_num_levels", type=int, default=4)
     parser.add_argument("--seeds_prior", type=int, default=1)
     parser.add_argument("--seeds_histogram_bins", type=int, default=4)
@@ -728,5 +767,19 @@ if __name__ == "__main__":
     parser.add_argument("--eval_suffix", type=str, default="", help="Optional suffix appended to the eval output directory.")
     parser.add_argument("--optimize_hdbscan", action="store_true", help="Run hyperparameter search for HDBSCAN instead of using hardcoded values")
     parser.add_argument("--disable_reranking", action="store_true", help="Skip Jaccard k-reciprocal reranking and use raw cosine similarity")
+    parser.add_argument("--use_cutouts", action="store_true", help="Use U2-Net segmented backgrounds") 
+    parser.add_argument("--generate_tsne", action="store_true", help="Run t-SNE at the end of a normal eval")
+    parser.add_argument("--tsne_only", action="store_true", help="FAST MODE: Only generate t-SNEs from existing CSVs")
     args = parser.parse_args()
-    main(args)
+
+    try:
+        main(args)
+    except Exception as e:
+        import traceback
+        import datetime
+        crash_log = os.path.join(args.checkpoints_dir, "crash_report.txt")
+        with open(crash_log, "a") as f:
+            f.write(f"\n[{datetime.datetime.now().strftime('%a %b %d %H:%M:%S %Y')}] CHILD SCRIPT EXCEPTION (Evaluation):\n")
+            f.write(traceback.format_exc() + "\n")
+            f.write("-" * 50 + "\n")
+        raise e

@@ -1,99 +1,287 @@
-# 🐾 Wildlife-Re-ID
+# ST-VGANN: Spatial-Topological Vision Graph Attention Neural Network
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPLv3-orange.svg)](https://www.gnu.org/licenses/agpl-3.0) [![Python 3.12](https://img.shields.io/badge/Python-3.12-44cc11.svg)](https://www.python.org/downloads/)
+&#x20;&#x20;
 
-**Status:** 🚧 In active Development since 01.07.2025
-This repository is the starting point for an open-source system for wildlife re-identification (Re-ID). It is currently under active development and will be continuously expanded and improved.
-
----
-
-## 🎯 Project Goal
-
-The goal of this project is to develop a system capable of identifying individual animals in both **images** and **video streams**. It aims to:
-
-- Assign consistent IDs to known individuals  
-- Detect and assign new IDs to previously unseen animals  
-- Provide a **user-friendly interface** for managing and editing IDs (e.g., assigning names)  
-- Operate reliably in **real-world conditions**, including low-resolution footage, color distortion, and limited-quality data
-
-This tool is intended as a lightweight, open-source platform for wildlife monitoring and research. It aims to make individual animal tracking more accessible—even on limited hardware and in challenging field conditions.
+**Official Repository for:**\
+*Exploration of Unsupervised Segmentation as a Foundation for Vision Graph Neural Networks in Individual Animal Re-identification*\
 
 ---
 
-## 🛠️ Technologies Used
+## Overview
 
-> _To be added as development progresses._  
-Frameworks, libraries, and tools will be listed here once selected.
+This repository contains the complete source code, ablation framework, and orchestration logic required to reproduce the **ST-VGANN** proof-of-concept architecture.
 
----
-
-## 🚀 Quick Start
-
-> _Instructions coming soon._  
-Setup, installation, and usage documentation will be added as the first prototype is developed.
+ST-VGANN models animal morphology as an irregular topological manifold by extracting superpixel-based texture primitives through an unsupervised Convolutional Autoencoder (CAE) and routing them through Graph Attention Networks (GATv2) for parameter-efficient wildlife re-identification.
 
 ---
 
-## 📌 Roadmap
+#  Features
 
-> _Note: This roadmap is subject to change as the project evolves._
+- **Topological Feature Extraction**\
+  Replaces rigid grid patches with adaptive SEEDS superpixels to better preserve biological contours and local structures.
 
-- [x] Define the overall architecture  
-- [ ] Select and evaluate baseline detection & Re-ID models  
-- [ ] Develop an initial prototype for image-based re-identification
-- [ ] start with only one species  
-- [ ] Extend functionality to support video streams  
-- [ ] Implement a GUI for editing IDs and assigning names
-- [ ] expand to ID multiple species  
-- [ ] Optimize performance for low-quality and real-world input
+- **Lightweight Architecture**\
+  Approximately 11.4M parameters, designed to train on consumer-grade GPUs such as the NVIDIA RTX 5070 (12 GB).
 
----
----
+- **Dual-Headed Disentanglement**\
+  Combines SubCenter ArcFace identity clustering with orthogonal regularization against species-level taxonomic leakage.
 
-## Underlying Architecture
-
-The Re-ID system is designed as a multi-layer pipeline that processes video frames in real-time or near real-time. Here's an overview of the planned architecture:
-
-### 🔹 Layer 1: Motion Detection  
-- Use **frame differencing** to detect motion between consecutive frames.
-- Trigger analysis only when significant motion is detected to reduce unnecessary computation.
-
-### 🔹 Layer 2: Region Proposal  
-- Generate **bounding boxes** around areas with detected motion.
-- Filter out regions that are too small to be relevant (e.g. noise, lighting flickers).
-
-### 🔹 Layer 3: Animal Detection  
-- **Crop** each motion region.
-- Apply **pattern recognition** or a lightweight classifier to distinguish animals from false positives (e.g. swaying branches, shadows).
-- If no animal is detected:
-  - Discard the frame from further processing.
-  - If the scene has remained stable for several frames (i.e. no significant motion or animal presence),
-    **update the background reference** by using the current frame to replace the **oldest frame** in the background consensus group.
-  - This helps reduce noise caused by large time differences between background frames and incoming motion, improving motion detection stability.
-
-
-### 🔹 Layer 4: Re-Identification  
-- If the region contains a valid animal:
-  - Attempt to **match** it to previously seen individuals using a pattern-based feature extractor.
-  - If a match is found:
-    - Add the new image to that animal's dataset.
-    - Retrain the Re-ID model incrementally, giving more weight to newer images to account for **seasonal changes** or **aging**.
-  - If no match is found:
-    - Register a **new animal ID** and store its pattern data for future matching.
+- **Extensive Ablation Suite**\
+  Includes a fully automated, idempotent orchestration framework capable of reproducing 48 architectural and topological configurations.
 
 ---
 
-This modular architecture ensures the system is lightweight, adaptive, and usable in real-world conditions where background, lighting, and image quality can vary significantly.
+# Hardware Requirements & Environment Setup
 
+All experiments were validated on a consumer workstation. 
 
+## Validated Hardware
+
+| Component | Specification                 |
+| --------- | ----------------------------- |
+| OS        | Windows 11 / Ubuntu 22.04 LTS |
+| GPU       | NVIDIA RTX 5070 (12 GB VRAM)  |
+| RAM       | 32 GB DDR5                    |
 
 ---
 
-## 🤝 Contributing
+#  Installation
 
-Contributions are welcome! Guidelines, issue templates, and a project board will be added soon to help onboard collaborators.
+## 1. Clone the Repository
+
+```bash
+git clone 
+cd Wildlife-Re-ID
+```
+
+## 2. Create a Virtual Environment
+
+Python 3.12+ is recommended.
+
+### Windows
+
+```bash
+python -m venv .venv
+.venv\Scripts\activate
+```
+
+### Linux / macOS
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+```
+
+## 3. Install Dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+> **Note:** Ensure that the installed PyTorch version matches your local CUDA toolkit configuration.
 
 ---
 
-## 📄 License
+# Reproducing the Paper Results
 
-> _To be determined._  
-A suitable open-source license will be chosen later in development.
+This repository is designed for full reproducibility of the ST-VGANN ablation study and AnimalCLEF 2026 competition results.
+
+All training, evaluation, caching, and artifact generation are automated through Python orchestration scripts.
+
+---
+
+## Step 1 — Dataset Preparation
+
+Download the official datasets provided by the AnimalCLEF 2026 organizers, including:
+
+- LynxID2025
+- SeaTurtleID2022
+- SalamanderID2025
+- WildlifeReID-10k
+
+### WildlifeReID-10k Repository
+
+[https://github.com/WildMeOrg/wildlife-datasets](https://github.com/WildMeOrg/wildlife-datasets)
+
+Place the extracted image folders and metadata CSV files into:
+
+```text
+Wildlife-Re-ID/src/images/
+├── animal-clef-2026/
+└── reid-10k/
+```
+
+---
+
+## Step 2 — Running a Single Training Run (`run_single.py`)
+
+The specific parameters, datasets, and training configuration can be adjusted directly inside `run_single.py`.
+
+### Run a Single Experiment
+
+```bash
+python src/ml_utils/run_single.py
+```
+
+---
+
+## Step 3 — Reproducing the Full Ablation Study (`run_ablation.py`)
+
+The ablation framework automatically reproduces the architectural and topological configurations used in the paper.
+
+### Run the Ablation Pipeline
+
+```bash
+python src/ml_utils/run_ablation.py
+```
+
+### Before Execution
+
+1. Open `run_single.py` or `run_ablation.py`
+2. Configure the dataset and training parameters
+3. Enable or disable the required pipeline stages
+
+### Pipeline Responsibilities
+
+The framework automatically handles:
+
+- Dataset stratification
+- Superpixel extraction
+- LMDB graph caching
+- GNN training
+- Embedding generation
+- Evaluation
+- Metric logging
+- Ablation orchestration
+
+### Output
+
+Single runs are written to:
+
+```text
+runs/run_name/
+```
+
+Ablation outputs are written to:
+
+```text
+runs/ablations/
+```
+
+The first execution additionally generates persistent LMDB graph caches to accelerate future epochs and reruns.
+
+---
+
+## Step 4: Generating Paper figures
+
+After evaluation is complete, the repository can automatically generate the tables and figures used in the paper.
+
+### Generate Analysis Reports
+
+```bash
+python src/visualization/main.py
+```
+
+### Output
+
+This script:
+
+- Parses all evaluation directories
+- Extracts peak ARI scores
+- Generates publication-ready plots and tables
+- Creates comparison plots matching the paper visualizations
+
+Artifacts are written to:
+
+```text
+runs/ablations/analysis_reports/
+```
+
+---
+
+### Generate the Appendix Ablation Table
+
+```bash
+python generate_appendix.py
+```
+
+### Output
+
+Produces:
+
+```text
+appendix_table_populated.tex
+```
+
+The generated LaTeX table contains:
+
+- Native ARI scores
+- Jaccard-reranked ARI scores
+- Optimized evaluation metrics
+- All 43 configurations
+- All evaluation domains
+
+---
+
+## Step 5 — Generating Methodology Visualizations
+
+To reproduce the geometric and topological methodology figures used in the paper:
+
+```bash
+python test_cae.py
+```
+---
+
+# Repository Structure
+
+```text
+Wildlife-Re-ID/
+└── src/
+    ├── bg_tools.py
+    ├── main.py
+    ├── ml_utils/
+    │   ├── ablate_err.py
+    │   ├── clear_err_ablate.py
+    │   ├── dataloader.py
+    │   ├── dataset_splitter.py
+    │   ├── embedding_clusterings.py
+    │   ├── eval.py
+    │   ├── extract_embeddings.py
+    │   ├── gnn/
+    │   │   ├── cae.py
+    │   │   ├── generate_cutouts.py
+    │   │   └── gnn.py
+    │   ├── helper.py
+    │   ├── loss_mining_tools.py
+    │   ├── merge_datasets.py
+    │   ├── run_ablation.py
+    │   ├── run_single.py
+    │   ├── test_cae.py
+    │   └── train_test_prototype.py
+    └── visualization/
+        ├── config.py
+        ├── data.py
+        ├── latex_export.py
+        ├── main.py
+        ├── plots.py
+        └── tables.py
+```
+
+---
+
+# Citation
+
+*Citation details will be made available upon acceptance and publication of the workshop proceedings.*
+
+# Acknowledgments
+
+- This work builds upon evaluation methodologies provided by the WildlifeDatasets Toolkit.
+- Data was provided through the LifeCLEF 2026 / AnimalCLEF challenge organizers.
+
+---
+
+## License
+
+This project is licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)**. This means that the full source code for any modified versions or expansions of this network—including those hosted on backend cloud systems, web platforms, or remote APIs—must be made entirely open and available to the public. See the [LICENSE](LICENSE) file for the complete legal text.
+
+> *“This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General Public License as published by the Free Software Foundation...”*
