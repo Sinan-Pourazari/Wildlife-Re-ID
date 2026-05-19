@@ -28,7 +28,7 @@
 /tree.tx
 __temp_pipreqsnb_folder/
 /runs/*
-.venv_wildlife
+.venv_wildlife/
 *temp*
 run.bat
 /images*/
