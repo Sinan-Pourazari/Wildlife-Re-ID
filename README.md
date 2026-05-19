@@ -194,35 +194,11 @@ This script:
 - Generates publication-ready plots and tables
 - Creates comparison plots matching the paper visualizations
 
-Artifacts are written to:
+Outputs are written to:
 
 ```text
 runs/ablations/analysis_reports/
 ```
-
----
-
-### Generate the Appendix Ablation Table
-
-```bash
-python generate_appendix.py
-```
-
-### Output
-
-Produces:
-
-```text
-appendix_table_populated.tex
-```
-
-The generated LaTeX table contains:
-
-- Native ARI scores
-- Jaccard-reranked ARI scores
-- Optimized evaluation metrics
-- All 43 configurations
-- All evaluation domains
 
 ---
 
@@ -240,7 +216,6 @@ python test_cae.py
 ```text
 Wildlife-Re-ID/
 └── src/
-    ├── bg_tools.py
     ├── main.py
     ├── ml_utils/
     │   ├── ablate_err.py
@@ -264,7 +239,6 @@ Wildlife-Re-ID/
     └── visualization/
         ├── config.py
         ├── data.py
-        ├── latex_export.py
         ├── main.py
         ├── plots.py
         └── tables.py
