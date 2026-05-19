@@ -39,12 +39,13 @@ All experiments were validated on a consumer workstation.
 
 ## Validated Hardware
 
-| Component | Specification                 |
-| --------- | ----------------------------- |
-| OS        | Windows 11 / Ubuntu 22.04 LTS |
-| GPU       | NVIDIA RTX 5070 (12 GB VRAM)  |
-| RAM       | 32 GB DDR5                    |
-
+| Component | Specification                  |
+| --------- | -----------------------------  |
+| OS        | Windows 11 / Ubuntu 22.04 LTS  |
+| GPU       | NVIDIA RTX 5070 (12 GB VRAM)   |
+| RAM       | 32 GB DDR5                     |
+| CPU       | AMD Ryzen 7 7800x3d            |
+|Storage    | Samsung 970 EVO Plus (M.2 gen.3)|
 ---
 
 #  Installation
