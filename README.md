@@ -20,7 +20,7 @@ ST-VGANN models animal morphology as an irregular topological manifold by extrac
   Replaces rigid grid patches with adaptive SEEDS superpixels to better preserve biological contours and local structures.
 
 - **Lightweight Architecture**\
-  Approximately 11.4M parameters, designed to train on consumer-grade GPUs such as the NVIDIA RTX 5070 (12 GB).
+  Approximately 1.75M parameters, designed to train on consumer-grade GPUs such as the NVIDIA RTX 5070 (12 GB).
 
 - **Dual-Headed Disentanglement**\
   Combines SubCenter ArcFace identity clustering with orthogonal regularization against species-level taxonomic leakage.
