@@ -9,7 +9,7 @@
 
 ## Overview
 > [!IMPORTANT]  
-> **Archive Branch** > This branch contains the exact frozen codebase utilized for the **ST-VGANN AnimalCLEF 2026** submission and experiments. It is maintained strictly for reproducibility and historical reference. For the most up-to-date framework, ongoing development, and active support, please switch to the [main branch](https://github.com/Sinan-Pourazari/Wildlife-Re-ID).
+> **Archive Branch** > This branch contains the codebase utilized for the **ST-VGANN AnimalCLEF 2026** submission and experiments. It is maintained strictly for reproducibility and historical reference. For the most up-to-date framework, ongoing development, and active support, please switch to the [main branch](https://github.com/Sinan-Pourazari/Wildlife-Re-ID).
 
 This repository contains the complete source code, ablation framework, and orchestration logic required to reproduce the **ST-VGANN** proof-of-concept architecture.
 
