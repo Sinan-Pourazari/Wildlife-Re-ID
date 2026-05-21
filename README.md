@@ -104,7 +104,7 @@ Download the official datasets provided by the AnimalCLEF 2026 organizers, inclu
 
 ### WildlifeReID-10k Repository
 
-[https://github.com/WildMeOrg/wildlife-datasets](https://github.com/WildMeOrg/wildlife-datasets)
+[https://github.com/WildlifeDatasets/wildlife-datasets](https://github.com/WildlifeDatasets/wildlife-datasets)
 
 Place the extracted image folders and metadata CSV files into:
 
